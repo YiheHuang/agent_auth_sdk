@@ -1,0 +1,71 @@
+智能体身份认证SDK实现
+
+## 2 智能体身份
+
+### 2.1 智能体域名系统的实现意义（哪些地方能用上）
+
+- 身份认证时的信任
+    - 防山寨
+- A2A场景下的agent发现（类似备案/DNS？
+    - 知道想调用的agent的endpoint
+    - 及其公钥
+    - 所属组织
+    - 额外的可以增加支持的能力
+- 审计追溯
+- 定位：Agent Identity Resolver and Verification SDK，支持基于 Web 域名和`.well-known` metadata 的 Agent 身份发布、发现和抗伪造验证，并可兼容 MCP / A2A / OpenAI Agents SDK
+
+
+
+### 2.2 实现方案
+
+- 可以基于`.well-known`来做
+
+    - 介绍
+
+      `.well-known`是 IETF 标准化的一类 URI 路径前缀。RFC 8615 定义了`/.well-known/` 这个路径，用来让网站在固定位置公开某类站点级元数据。
+
+      例如，一个网站可以发布：
+
+```Markdown
+https://example.com/.well-known/openid-configuration
+https://example.com/.well-known/security.txt
+https://example.com/.well-known/webfinger
+```
+
+      它的作用是：
+
+```Markdown
+别人不需要猜你的接口在哪里；
+只要访问固定路径，就能发现你的服务元数据。
+```
+
+      OpenID Connect Discovery 就是典型例子。OpenID Provider 会在`.well-known/openid-configuration` 发布 issuer、authorization endpoint、token endpoint、jwks_uri 等元数据，让客户端自动发现如何和该身份提供方交互。
+
+      WebFinger 也是类似思想，用标准 HTTP 方法发现互联网上某个 URI 标识的人或实体的信息。
+
+      所以`.well-known`本质上不是新协议，而是一种**低成本、Web 原生的元数据发现机制**。
+
+    - 直接利用已有设施基础，通过`.well-known/agent.json`来定义相关内容
+- 我们自己实现通用域名系统不太现实，需厂商采用背书，只能提供一个SDK让各厂商能够低成本集成该功能
+
+    - 包括发布、调用、验证三个主要环节：
+      - 发布
+          1. 为每个 Agent 生成身份  
+          2. 为每个 Agent 生成公私钥  
+          3. 发布 Agent metadata  
+          4. 发布 Agent public key  
+          5. 支持密钥轮换和撤销
+      - 调用
+          1. 加载 Agent 私钥  
+          2. 在请求中声明 agent_id  
+          3. 对请求内容签名  
+          4. 附带 nonce / timestamp 防重放
+      - 验证
+          1. 读取请求中的 agent_id  
+          2. 解析 agent_id 对应的 domain  
+          3. 拉取 .well-known/agent.json  
+          4. 获取 Agent 公钥  
+          5. 验证请求签名  
+          6. 检查 nonce / timestamp  
+- 实现
+    - 可以利用KMS密钥管理系统

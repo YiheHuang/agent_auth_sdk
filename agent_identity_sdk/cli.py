@@ -13,11 +13,11 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
 
-from .config import TEST_PROFILE, VerificationConfig, get_runtime_profile
+from .config import MetadataResolverConfig, VerificationConfig, get_runtime_profile
 from .crypto import LocalPemSigner, generate_ed25519_keypair, public_key_to_base64url
 from .metadata import resolve_agent
-from .models import AgentAuditConfig, AgentKey
-from .publish import export_well_known, render_agent_metadata
+from .models import AgentKey, AgentMetadata
+from .publish import export_well_known, publish_to_registry, render_agent_metadata
 from .signing import sign_http_request
 from .stores import FileMetadataCache, InMemoryNonceStore
 from .verification import verify_http_request
@@ -58,7 +58,7 @@ def render_metadata_command(
         name=agent_name,
         organization=organization,
         endpoint=endpoint,
-        capabilities=["agent-auth", "llm-gateway"],
+        capabilities=["agent-auth"],
         keys=[
             AgentKey(
                 kid=kid,
@@ -70,7 +70,6 @@ def render_metadata_command(
         environment=profile,
         signing_policy={"canonical_request": "v1"},
         verification_policy={"profile": profile},
-        audit=AgentAuditConfig(mode="sqlite", destination=str(output_dir / "audit.sqlite3")),
     )
     target = export_well_known(metadata, output_dir)
     typer.echo(str(target))
@@ -80,6 +79,7 @@ def render_metadata_command(
 def inspect_metadata(
     agent_id: str = typer.Argument(...),
     profile: str = typer.Option("test"),
+    registry_url: str | None = typer.Option(None, help="中心注册表 `/.well-known/agent.json` 地址"),
 ) -> None:
     async def _run() -> None:
         async with httpx.AsyncClient() as client:
@@ -88,6 +88,10 @@ def inspect_metadata(
                 profile=get_runtime_profile(profile),
                 http_client=client,
                 cache=FileMetadataCache("runtime/metadata_cache.sqlite3"),
+                config=MetadataResolverConfig(
+                    profile=get_runtime_profile(profile),
+                    registry_url=registry_url,
+                ),
             )
             typer.echo(result.metadata.model_dump_json(indent=2))
 
@@ -124,6 +128,7 @@ def verify_request_command(
     headers_path: Path = typer.Option(..., exists=True),
     body: str = typer.Option("{}"),
     profile: str = typer.Option("test"),
+    registry_url: str | None = typer.Option(None, help="中心注册表 `/.well-known/agent.json` 地址"),
 ) -> None:
     async def _run() -> None:
         headers = json.loads(headers_path.read_text(encoding="utf-8"))
@@ -137,6 +142,10 @@ def verify_request_command(
                 http_client=client,
                 cache=FileMetadataCache("runtime/metadata_cache.sqlite3"),
                 config=VerificationConfig(profile=get_runtime_profile(profile)),
+                resolver_config=MetadataResolverConfig(
+                    profile=get_runtime_profile(profile),
+                    registry_url=registry_url,
+                ),
             )
             payload = {
                 "ok": result.ok,
@@ -167,6 +176,29 @@ def serve_well_known(
         return JSONResponse(json.loads(agent_json_path.read_text(encoding="utf-8")))
 
     uvicorn.run(app_, host=host, port=port)
+
+
+@app.command("publish-to-registry")
+def publish_to_registry_command(
+    metadata_path: Path = typer.Option(..., exists=True, help="本地 metadata 文件路径"),
+    registry_url: str = typer.Option(
+        "http://192.144.228.237/registry/agents",
+        help="中心注册接口地址",
+    ),
+    publisher: str = typer.Option(None, help="发布方标识"),
+    token: str = typer.Option(None, help="注册中心 bearer token"),
+) -> None:
+    async def _run() -> None:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        result = await publish_to_registry(
+            AgentMetadata.model_validate(metadata),
+            registry_url=registry_url,
+            publisher=publisher,
+            token=token,
+        )
+        typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

@@ -9,17 +9,22 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
 from agent_identity_sdk import (
+    AgentInstance,
     AgentKey,
     FileMetadataCache,
     InMemoryNonceStore,
     LocalPemSigner,
     VerificationConfig,
     generate_ed25519_keypair,
+    publish_to_registry,
     render_agent_metadata,
+    resolve_agent,
+    verify_agent_message,
     sign_http_request,
     verify_http_request,
 )
-from agent_identity_sdk.config import STRICT_PROFILE, TEST_PROFILE
+from agent_identity_sdk.config import MetadataResolverConfig, STRICT_PROFILE, TEST_PROFILE
+from examples.registry.app import create_app as create_registry_app
 
 
 def create_metadata_app(metadata: dict) -> FastAPI:
@@ -32,7 +37,7 @@ def create_metadata_app(metadata: dict) -> FastAPI:
     return app
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_metadata_discovery_and_verification_success() -> None:
     pair = generate_ed25519_keypair(kid="main")
     metadata = render_agent_metadata(
@@ -69,7 +74,7 @@ async def test_metadata_discovery_and_verification_success() -> None:
         assert result.ok is True
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_replay_request_rejected() -> None:
     pair = generate_ed25519_keypair(kid="main")
     metadata = render_agent_metadata(
@@ -117,7 +122,7 @@ async def test_replay_request_rejected() -> None:
         assert second.code == "NONCE_REPLAYED"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_strict_profile_rejects_ip_host_metadata() -> None:
     pair = generate_ed25519_keypair(kid="main")
     metadata = render_agent_metadata(
@@ -150,4 +155,69 @@ async def test_strict_profile_rejects_ip_host_metadata() -> None:
             config=VerificationConfig(profile=STRICT_PROFILE),
         )
         assert result.ok is False
+
+
+@pytest.mark.anyio
+async def test_signed_agent_message_can_be_verified_via_well_known_metadata() -> None:
+    agent = AgentInstance.create(
+        domain="127.0.0.1:9001",
+        name="publisher",
+        organization="Demo Org",
+        endpoint="http://127.0.0.1:9001/invoke",
+        capabilities=["agent-auth"],
+        environment="test",
+    )
+    assert agent.metadata is not None
+    transport = httpx.ASGITransport(app=create_metadata_app(agent.metadata.model_dump(mode="json")))
+    async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:9001") as client:
+        message = await agent.sign_message(
+            payload={"hello": "world"},
+            recipient="agent://127.0.0.1:8010/verifier",
+            message_type="chat.message",
+        )
+        result = await verify_agent_message(
+            message=message,
+            nonce_store=InMemoryNonceStore(),
+            http_client=client,
+            config=VerificationConfig(profile=TEST_PROFILE),
+            now=datetime.now(timezone.utc),
+        )
+        assert result.ok is True
+        assert result.message is not None
+        assert result.message.payload == {"hello": "world"}
+
+
+@pytest.mark.anyio
+async def test_publish_to_central_registry_and_resolve_from_registry() -> None:
+    agent = AgentInstance.create(
+        domain="192.144.228.237",
+        name="publisher",
+        organization="FDU",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish", "sign", "verify"],
+        environment="prod",
+    )
+    assert agent.metadata is not None
+
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        publish_result = await publish_to_registry(
+            agent.metadata,
+            registry_url="http://registry.local/registry/agents",
+            publisher="test-suite",
+            http_client=client,
+        )
+        assert publish_result["ok"] is True
+
+        resolved = await resolve_agent(
+            agent.agent_id,
+            profile=TEST_PROFILE,
+            http_client=client,
+            config=MetadataResolverConfig(
+                profile=TEST_PROFILE,
+                registry_url="http://registry.local/.well-known/agent.json",
+            ),
+        )
+        assert resolved.metadata.agent_id == agent.agent_id
+        assert resolved.metadata.organization == "FDU"
 

@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from .config import TEST_PROFILE, VerificationConfig
+from .config import MetadataResolverConfig, TEST_PROFILE, VerificationConfig
 from .crypto import verify_signature
 from .errors import VerificationErrorCode
 from .http_utils import build_canonical_request, canonicalize_headers
@@ -32,6 +32,7 @@ async def verify_http_request(
     http_client: httpx.AsyncClient,
     cache: MetadataCache | None = None,
     config: VerificationConfig | None = None,
+    resolver_config: MetadataResolverConfig | None = None,
     now: datetime | None = None,
     request_id: str | None = None,
 ) -> VerificationSuccess | VerificationFailure:
@@ -69,7 +70,13 @@ async def verify_http_request(
         return _failure(VerificationErrorCode.NONCE_REPLAYED, "Nonce has already been used")
 
     try:
-        resolved = await resolve_agent(agent_id, profile=profile, http_client=http_client, cache=cache)
+        resolved = await resolve_agent(
+            agent_id,
+            profile=profile,
+            http_client=http_client,
+            cache=cache,
+            config=resolver_config,
+        )
     except Exception as exc:
         return _failure(VerificationErrorCode.METADATA_FETCH_FAILED, str(exc))
 

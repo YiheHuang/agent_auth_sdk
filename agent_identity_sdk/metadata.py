@@ -11,7 +11,7 @@ import httpx
 from .config import MetadataResolverConfig, RuntimeProfile, TEST_PROFILE
 from .errors import AgentIdentityError, MetadataValidationError
 from .identity import assert_subject_match, parse_agent_id
-from .models import AgentKey, AgentMetadata, ResolveResult
+from .models import AgentKey, AgentMetadata, AgentRegistryDocument, ResolveResult
 from .stores import MetadataCache
 
 
@@ -72,6 +72,21 @@ async def resolve_agent(
     if cached and cached.etag:
         headers["If-None-Match"] = cached.etag
 
+    if config.registry_url:
+        try:
+            result = await _resolve_from_registry(
+                agent_id,
+                registry_url=config.registry_url,
+                profile=profile,
+                http_client=http_client,
+                timeout_seconds=config.request_timeout_seconds,
+            )
+            if cache:
+                await cache.set(agent_id, result, ttl_seconds)
+            return result
+        except Exception:
+            pass
+
     url = metadata_url_for_agent(agent_id, profile)
     try:
         response = await http_client.get(url, headers=headers, timeout=config.request_timeout_seconds)
@@ -94,6 +109,31 @@ async def resolve_agent(
         if cached:
             return cached
         raise exc
+
+
+async def _resolve_from_registry(
+    agent_id: str,
+    *,
+    registry_url: str,
+    profile: RuntimeProfile,
+    http_client: httpx.AsyncClient,
+    timeout_seconds: float,
+) -> ResolveResult:
+    response = await http_client.get(registry_url, timeout=timeout_seconds)
+    response.raise_for_status()
+    document = AgentRegistryDocument.model_validate(response.json())
+    for entry in document.agents:
+        if entry.agent_id != agent_id:
+            continue
+        validate_metadata(entry.metadata, profile)
+        assert_subject_match(agent_id, entry.metadata.domain)
+        return ResolveResult(
+            metadata=entry.metadata,
+            resolved_at=datetime.now(UTC),
+            etag=response.headers.get("etag"),
+            source_url=registry_url,
+        )
+    raise MetadataValidationError(f"agent not found in registry: {agent_id}")
 
 
 def select_verification_key(

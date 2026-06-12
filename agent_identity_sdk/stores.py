@@ -7,9 +7,12 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
-from redis.asyncio import Redis
+try:
+    from redis.asyncio import Redis
+except ModuleNotFoundError:  # pragma: no cover - 可选依赖
+    Redis = Any
 
 from .models import AgentMetadata, ResolveResult
 

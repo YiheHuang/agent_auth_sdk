@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Auth SDK Registry Service
+After=network.target
+
+[Service]
+Type=simple
+User=agentauth
+Group=agentauth
+WorkingDirectory=/opt/agent_auth_sdk
+EnvironmentFile=/etc/agent-auth/registry.env
+ExecStart=/opt/agent_auth_sdk/.venv/bin/python -m examples.registry.run
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

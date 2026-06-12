@@ -5,6 +5,7 @@ from datetime import datetime
 import pytest
 
 from agent_identity_sdk import (
+    AgentInstance,
     AgentKey,
     InMemoryNonceStore,
     build_agent_id,
@@ -30,7 +31,7 @@ def test_build_agent_id() -> None:
     assert build_agent_id("localhost:9000", "assistant") == "agent://localhost:9000/assistant"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_sign_and_verify_public_key_material() -> None:
     pair = generate_ed25519_keypair(kid="main")
     signer = LocalPemSigner(private_key_pem=pair.private_key_pem, kid_value="main")
@@ -89,9 +90,24 @@ def test_profiles_have_expected_policy() -> None:
     assert STRICT_PROFILE.allow_http is False
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_nonce_store_detects_replay() -> None:
     store = InMemoryNonceStore()
     await store.set("a", 600)
     assert await store.has("a") is True
+
+
+def test_agent_instance_auto_generates_identity_and_metadata() -> None:
+    agent = AgentInstance.create(
+        domain="192.144.228.237",
+        name="publisher",
+        organization="FDU",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish", "sign", "verify"],
+        environment="prod",
+    )
+    assert agent.agent_id == "agent://192.144.228.237/publisher"
+    assert agent.metadata is not None
+    assert agent.metadata.domain == "192.144.228.237"
+    assert agent.metadata.keys[0].kid == "main"
 

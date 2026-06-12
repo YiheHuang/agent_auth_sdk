@@ -6,6 +6,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
+
 from .models import AgentAuditConfig, AgentKey, AgentMetadata
 
 
@@ -51,4 +53,35 @@ def export_well_known(metadata: AgentMetadata, output_dir: str | Path) -> Path:
         encoding="utf-8",
     )
     return target_file
+
+
+async def publish_to_registry(
+    metadata: AgentMetadata,
+    *,
+    registry_url: str,
+    publisher: str | None = None,
+    token: str | None = None,
+    http_client: httpx.AsyncClient | None = None,
+    timeout_seconds: float = 10.0,
+) -> dict:
+    """将 Agent metadata 发布到中心注册服务器。"""
+
+    payload = {
+        "agent_id": metadata.agent_id,
+        "metadata": metadata.model_dump(mode="json"),
+        "publisher": publisher,
+    }
+    headers: dict[str, str] = {}
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+
+    if http_client is not None:
+        response = await http_client.post(registry_url, json=payload, headers=headers, timeout=timeout_seconds)
+        response.raise_for_status()
+        return response.json()
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(registry_url, json=payload, headers=headers, timeout=timeout_seconds)
+        response.raise_for_status()
+        return response.json()
 

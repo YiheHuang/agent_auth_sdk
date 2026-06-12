@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agent-identity-sdk"
 version = "0.2.0"
-description = "Python Agent Identity SDK and LLM Gateway"
+description = "Python Agent Identity SDK with central registry publishing"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -24,8 +24,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8.3.0",
-  "pytest-asyncio>=0.23.0"
+  "pytest>=8.3.0"
 ]
 
 [project.scripts]
@@ -35,7 +34,6 @@ agent-id = "agent_identity_sdk.cli:app"
 packages = ["agent_identity_sdk", "examples"]
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
 pythonpath = ["."]
 testpaths = ["pytests"]
 

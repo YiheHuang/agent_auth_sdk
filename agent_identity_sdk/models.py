@@ -59,6 +59,46 @@ class AgentMetadata(BaseModel):
     audit: AgentAuditConfig | None = None
 
 
+class SignedAgentMessage(BaseModel):
+    """Agent 之间传递的规范签名消息。"""
+
+    model_config = ConfigDict(extra="allow")
+
+    version: str = "1.0"
+    agent_id: str
+    kid: str
+    alg: Literal["Ed25519"] = "Ed25519"
+    timestamp: datetime
+    nonce: str
+    payload_type: str = "application/json"
+    payload: Any
+    signature: str
+    recipient: str | None = None
+    message_type: str | None = None
+
+
+class AgentRegistryEntry(BaseModel):
+    """中心注册表中的单个 Agent 条目。"""
+
+    model_config = ConfigDict(extra="allow")
+
+    agent_id: str
+    metadata: AgentMetadata
+    published_at: datetime
+    publisher: str | None = None
+
+
+class AgentRegistryDocument(BaseModel):
+    """中心服务器的 `/.well-known/agent.json` 结构。"""
+
+    model_config = ConfigDict(extra="allow")
+
+    version: str = "1.0"
+    registry_type: Literal["agent_registry"] = "agent_registry"
+    updated_at: datetime
+    agents: list[AgentRegistryEntry] = Field(default_factory=list)
+
+
 @dataclass(slots=True)
 class ResolveResult:
     """解析 metadata 后返回给调用方的结构化结果。"""
@@ -88,6 +128,7 @@ class VerificationSuccess:
     metadata: AgentMetadata | None = None
     canonical: str = ""
     request_id: str | None = None
+    message: SignedAgentMessage | None = None
 
 
 @dataclass(slots=True)

@@ -1,65 +1,29 @@
 # Agent Identity SDK
 
-这个仓库现在的主线实现是一个真正可集成、可发行的 Python Agent 身份认证 SDK，并附带一个可运行的 `LLM Agent Gateway` 示例服务。
+一个最小可发布的 Python SDK，用于完成三件事：
 
-旧的 TypeScript 原型已经归档到 [legacy/typescript-prototype](D:/FDU/agent_auth/legacy/typescript-prototype)。
+- 创建 Agent 身份、公私钥与 metadata
+- 发送带签名的 Agent 消息或 HTTP 请求
+- 从中心注册表 `/.well-known/agent.json` 解析并验证 Agent 身份
 
-## 当前交付
+仓库当前只保留三类内容：
 
-- Python SDK：`agent_identity_sdk/`
-- CLI：`agent-id`
-- 示例服务：`examples/gateway/`
-- Python 测试：`pytests/`
-- 主线运行说明：`guidebook.md`
-- 旧 TypeScript 原型：`legacy/typescript-prototype/`
+- SDK 主包：`agent_identity_sdk/`
+- 中心 registry 服务：`examples/registry/`
+- 测试套件：`pytests/`
 
-## 能力概览
+## 能力
 
-- `agent://host/name` 身份格式
-- `/.well-known/agent.json` 身份发布与发现
-- Ed25519 请求签名 / 验签
-- `strict` / `test` 双运行 profile
+- `agent://host/name` 格式的 `agent_id`
+- Ed25519 密钥生成、签名、验签
+- `SignedAgentMessage` 规范消息
+- `/.well-known/agent.json` metadata 发布
+- 中心注册表发布：`POST /registry/agents`
+- 中心注册表发现：`GET /.well-known/agent.json`
 - nonce 防重放
-- metadata 缓存与 `ETag` 支持
-- 本地内存与 Redis nonce 存储
-- 文件型 metadata 缓存
-- FastAPI 网关、审计日志和 OpenAI 兼容 LLM 转发
+- metadata 缓存
 
-## 当前目标口径
-
-这套 SDK 的目标已经明确为：
-
-- 让开发者完成 Agent 身份发布
-- 让调用方完成带签名的 Agent 调用
-- 让服务方完成 Agent 验签与审计
-- 把真实发布入口收敛到 `192.144.228.237/.well-known/agent.json`
-- 用真实网关应用完成从签名请求到 LLM 响应的全流程验证
-
-## 目录结构
-
-- `agent_identity_sdk/`：正式 Python SDK 主线实现
-- `examples/gateway/`：真实软件示例，包含 FastAPI 网关、审计与 LLM 转发
-- `pytests/`：Python 单元测试、集成测试、端到端测试
-- `legacy/typescript-prototype/`：早期 TypeScript 原型与说明文档
-- `req.txt`：最初需求草案
-
-## 路径说明
-
-这次重构后，主线路径已经统一到 Python 结构：
-
-- Python 入口包在 `agent_identity_sdk/`
-- 示例服务入口在 `examples/gateway/run.py`
-- 测试目录在 `pytests/`
-- 旧 TS 代码不再占用根目录的 `src/`、`demos/`、`tests/`
-
-我已经额外验证过两件事：
-
-- `pytest` 全部通过
-- `python -m agent_identity_sdk.cli --help` 能正常启动
-
-这说明 Python 主线没有遗留导入路径问题。
-
-## 快速开始
+## 安装
 
 ```bash
 python -m venv .venv
@@ -68,17 +32,34 @@ pip install -e .[dev]
 pytest
 ```
 
-如果你之前激活过一个损坏的 `.venv`，先退出旧环境再重新创建：
+## 最小使用方式
 
-```bash
-deactivate
-rmdir /s /q .venv
-python -m venv .venv
-.venv\Scripts\activate
-pip install -e .[dev]
+```python
+from agent_identity_sdk import AgentInstance
+
+agent = AgentInstance.create(
+    domain="agent-a.example.com",
+    name="weather",
+    organization="FDU",
+    endpoint="https://agent-a.example.com/invoke",
+    capabilities=["publish", "sign", "verify"],
+)
+
+agent.save_keys("runtime/keys")
+agent.export_metadata("runtime")
 ```
 
-## 常用命令
+发布到中心 registry：
+
+```python
+await agent.publish(
+    registry_url="http://192.144.228.237/registry/agents",
+    publisher="developer-a",
+    token="your-registry-token",
+)
+```
+
+## CLI
 
 生成密钥：
 
@@ -89,25 +70,27 @@ agent-id keygen
 渲染 metadata：
 
 ```bash
-agent-id render-metadata --host 192.144.228.237:8010 --agent-name llm-gateway --endpoint http://192.144.228.237:8010/invoke --public-key-pem-path runtime/keys/public_key.pem
+agent-id render-metadata --host demo.example.com --agent-name weather --endpoint https://demo.example.com/invoke --public-key-pem-path runtime/keys/public_key.pem
 ```
 
-启动网关：
+发布到中心 registry：
 
 ```bash
-set AGENT_PROFILE=test
-set AGENT_GATEWAY_HOST=0.0.0.0
-set AGENT_GATEWAY_AGENT_HOST=192.144.228.237:8010
-set AGENT_GATEWAY_LLM_API_KEY=你的key
-python -m examples.gateway.run
+agent-id publish-to-registry --metadata-path runtime/.well-known/agent.json --registry-url http://192.144.228.237/registry/agents --token your-registry-token
 ```
 
-调用网关：
+从中心仓库解析：
 
 ```bash
-set AGENT_CALLER_URL=http://192.144.228.237:8010/invoke
-set AGENT_CALLER_HOST=192.144.228.237:8010
-python -m examples.gateway.caller
+agent-id inspect-metadata agent://demo.example.com/weather --registry-url http://192.144.228.237/.well-known/agent.json
+```
+
+## 启动 registry 服务
+
+```bash
+set AGENT_REGISTRY_PATH=runtime/registry/.well-known/agent.json
+set AGENT_REGISTRY_PORT=8008
+python -m examples.registry.run
 ```
 
 ## 测试
@@ -116,13 +99,6 @@ python -m examples.gateway.caller
 pytest
 ```
 
-## Legacy 说明
+## 部署
 
-旧 TypeScript 原型保存在：
-
-- [legacy/typescript-prototype](D:/FDU/agent_auth/legacy/typescript-prototype)
-- 旧原型导览文档：[legacy/typescript-prototype/guidebook.md](D:/FDU/agent_auth/legacy/typescript-prototype/guidebook.md)
-
-Python 主线运行逻辑说明见：
-
-- [guidebook.md](D:/FDU/agent_auth/guidebook.md)
+CentOS 部署方案见 [deploy/DEPLOY_BETA_V1.md](/C:/Users/Yihe Huang/FDU/agent_auth_sdk/deploy/DEPLOY_BETA_V1.md)。

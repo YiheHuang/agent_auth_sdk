@@ -1,9 +1,8 @@
-"""SDK 配置模型集中放在这里，方便库与示例服务共享。"""
+"""SDK 配置模型。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 
 
 @dataclass(slots=True, frozen=True)
@@ -62,23 +61,4 @@ class MetadataResolverConfig:
     profile: RuntimeProfile = field(default_factory=lambda: TEST_PROFILE)
     cache_ttl_seconds: int | None = None
     request_timeout_seconds: float = 10.0
-
-
-@dataclass(slots=True)
-class GatewaySettings:
-    host: str = "0.0.0.0"
-    port: int = 8010
-    agent_host: str = "192.144.228.237:8010"
-    agent_name: str = "llm-gateway"
-    organization: str = "Demo Org"
-    profile: RuntimeProfile = field(default_factory=lambda: TEST_PROFILE)
-    audit_path: Path = field(default_factory=lambda: Path("runtime/audit.sqlite3"))
-    metadata_dir: Path = field(default_factory=lambda: Path("runtime/well-known"))
-    private_key_path: Path = field(default_factory=lambda: Path("runtime/keys/private_key.pem"))
-    public_key_path: Path = field(default_factory=lambda: Path("runtime/keys/public_key.pem"))
-    public_key_base64url_path: Path = field(default_factory=lambda: Path("runtime/keys/public_key.base64url"))
-    kid: str = "main"
-    llm_base_url: str = "https://yunwu.ai/"
-    llm_api_key: str | None = None
-    llm_model: str = "gpt-4o-mini"
-    llm_timeout_seconds: float = 30.0
+    registry_url: str | None = None

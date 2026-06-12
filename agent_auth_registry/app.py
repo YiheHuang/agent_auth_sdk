@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +10,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from agent_identity_sdk.models import AgentMetadata, AgentRegistryDocument, AgentRegistryEntry
+from agent_auth_sdk.models import AgentMetadata, AgentRegistryDocument, AgentRegistryEntry
 
 
 class PublishRequest(BaseModel):
@@ -58,9 +57,8 @@ def create_app() -> FastAPI:
         authorization: str | None = Header(default=None),
     ) -> JSONResponse:
         expected_token = load_registry_token()
-        if expected_token:
-            if authorization != f"Bearer {expected_token}":
-                raise HTTPException(status_code=401, detail="invalid registry token")
+        if expected_token and authorization != f"Bearer {expected_token}":
+            raise HTTPException(status_code=401, detail="invalid registry token")
 
         path = load_registry_path()
         document = _read_registry(path)

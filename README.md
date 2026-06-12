@@ -1,4 +1,4 @@
-# Agent Identity SDK
+# Agent Auth SDK
 
 一个最小可发布的 Python SDK，用于完成三件事：
 
@@ -6,11 +6,12 @@
 - 发送带签名的 Agent 消息或 HTTP 请求
 - 从中心注册表 `/.well-known/agent.json` 解析并验证 Agent 身份
 
-仓库当前只保留三类内容：
+仓库当前只保留四类内容：
 
-- SDK 主包：`agent_identity_sdk/`
-- 中心 registry 服务：`examples/registry/`
+- SDK 主包：`agent_auth_sdk/`
+- 中心 registry 服务：`agent_auth_registry/`
 - 测试套件：`pytests/`
+- 部署资产：`deploy/`
 
 ## 能力
 
@@ -35,12 +36,12 @@ pytest
 ## 最小使用方式
 
 ```python
-from agent_identity_sdk import AgentInstance
+from agent_auth_sdk import AgentInstance
 
 agent = AgentInstance.create(
     domain="agent-a.example.com",
     name="weather",
-    organization="FDU",
+    organization="A",
     endpoint="https://agent-a.example.com/invoke",
     capabilities=["publish", "sign", "verify"],
 )
@@ -64,25 +65,25 @@ await agent.publish(
 生成密钥：
 
 ```bash
-agent-id keygen
+agent-auth-sdk keygen
 ```
 
 渲染 metadata：
 
 ```bash
-agent-id render-metadata --host demo.example.com --agent-name weather --endpoint https://demo.example.com/invoke --public-key-pem-path runtime/keys/public_key.pem
+agent-auth-sdk render-metadata --host demo.example.com --agent-name weather --endpoint https://demo.example.com/invoke --public-key-pem-path runtime/keys/public_key.pem
 ```
 
 发布到中心 registry：
 
 ```bash
-agent-id publish-to-registry --metadata-path runtime/.well-known/agent.json --registry-url http://192.144.228.237/registry/agents --token your-registry-token
+agent-auth-sdk publish-to-registry --metadata-path runtime/.well-known/agent.json --registry-url http://192.144.228.237/registry/agents --token your-registry-token
 ```
 
 从中心仓库解析：
 
 ```bash
-agent-id inspect-metadata agent://demo.example.com/weather --registry-url http://192.144.228.237/.well-known/agent.json
+agent-auth-sdk inspect-metadata agent://demo.example.com/weather --registry-url http://192.144.228.237/.well-known/agent.json
 ```
 
 ## 启动 registry 服务
@@ -90,7 +91,7 @@ agent-id inspect-metadata agent://demo.example.com/weather --registry-url http:/
 ```bash
 set AGENT_REGISTRY_PATH=runtime/registry/.well-known/agent.json
 set AGENT_REGISTRY_PORT=8008
-python -m examples.registry.run
+python -m agent_auth_registry.run
 ```
 
 ## 测试
@@ -101,4 +102,4 @@ pytest
 
 ## 部署
 
-CentOS 部署方案见 [deploy/DEPLOY_BETA_V1.md](/C:/Users/Yihe Huang/FDU/agent_auth_sdk/deploy/DEPLOY_BETA_V1.md)。
+CentOS 部署方案见 [deploy/DEPLOY_BETA_V1.md]。

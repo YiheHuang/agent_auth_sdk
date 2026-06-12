@@ -3,14 +3,28 @@ requires = ["hatchling>=1.26.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-identity-sdk"
-version = "0.2.0"
-description = "Python Agent Identity SDK with central registry publishing"
+name = "agent-auth-sdk"
+version = "1.0.0b1"
+description = "Python SDK for agent identity publishing, signed messaging, and registry-based verification"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
-  { name = "OpenAI Codex" }
+  { name = "Yihe Huang" }
+]
+maintainers = [
+  { name = "Yihe Huang" }
+]
+keywords = ["agent", "authentication", "identity", "signature", "registry", "a2a"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security :: Cryptography",
+  "Topic :: Software Development :: Libraries :: Python Modules"
 ]
 dependencies = [
   "cryptography>=43.0.0",
@@ -28,10 +42,11 @@ dev = [
 ]
 
 [project.scripts]
-agent-id = "agent_identity_sdk.cli:app"
+agent-auth-sdk = "agent_auth_sdk.cli:app"
+agent-auth-registry = "agent_auth_registry.run:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["agent_identity_sdk", "examples"]
+packages = ["agent_auth_sdk", "agent_auth_registry"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

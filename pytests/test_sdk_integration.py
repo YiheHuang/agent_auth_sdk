@@ -8,7 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from agent_identity_sdk import (
+from agent_auth_sdk import (
     AgentInstance,
     AgentKey,
     FileMetadataCache,
@@ -23,8 +23,8 @@ from agent_identity_sdk import (
     sign_http_request,
     verify_http_request,
 )
-from agent_identity_sdk.config import MetadataResolverConfig, STRICT_PROFILE, TEST_PROFILE
-from examples.registry.app import create_app as create_registry_app
+from agent_auth_sdk.config import MetadataResolverConfig, STRICT_PROFILE, TEST_PROFILE
+from agent_auth_registry.app import create_app as create_registry_app
 
 
 def create_metadata_app(metadata: dict) -> FastAPI:

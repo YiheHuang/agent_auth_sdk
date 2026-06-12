@@ -4,7 +4,7 @@ from datetime import datetime
 
 import pytest
 
-from agent_identity_sdk import (
+from agent_auth_sdk import (
     AgentInstance,
     AgentKey,
     InMemoryNonceStore,
@@ -14,10 +14,10 @@ from agent_identity_sdk import (
     render_agent_metadata,
     select_verification_key,
 )
-from agent_identity_sdk.config import STRICT_PROFILE, TEST_PROFILE
-from agent_identity_sdk.crypto import LocalPemSigner, verify_signature
-from agent_identity_sdk.http_utils import build_canonical_request
-from agent_identity_sdk.signing import sign_http_request
+from agent_auth_sdk.config import STRICT_PROFILE, TEST_PROFILE
+from agent_auth_sdk.crypto import LocalPemSigner, verify_signature
+from agent_auth_sdk.http_utils import build_canonical_request
+from agent_auth_sdk.signing import sign_http_request
 
 
 def test_parse_agent_id_supports_host_port_and_nested_path() -> None:

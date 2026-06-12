@@ -10,6 +10,10 @@
 
 - `registry`
 
+服务代码位置：
+
+- `agent_auth_registry/`
+
 ## 一、对外接口
 
 - `GET http://192.144.228.237/.well-known/agent.json`
@@ -124,9 +128,9 @@ curl http://192.144.228.237/.well-known/agent.json
 开发者机器上执行：
 
 ```bash
-agent-id keygen
-agent-id render-metadata --host demo.example.com --agent-name weather --endpoint https://demo.example.com/invoke --public-key-pem-path runtime/keys/public_key.pem
-agent-id publish-to-registry --metadata-path runtime/.well-known/agent.json --registry-url http://192.144.228.237/registry/agents --token <registry-token>
+agent-auth-sdk keygen
+agent-auth-sdk render-metadata --host demo.example.com --agent-name weather --endpoint https://demo.example.com/invoke --public-key-pem-path runtime/keys/public_key.pem
+agent-auth-sdk publish-to-registry --metadata-path runtime/.well-known/agent.json --registry-url http://192.144.228.237/registry/agents --token <registry-token>
 ```
 
 然后在服务器上确认：
@@ -138,7 +142,7 @@ curl http://192.144.228.237/.well-known/agent.json
 再做解析验证：
 
 ```bash
-agent-id inspect-metadata agent://demo.example.com/weather --registry-url http://192.144.228.237/.well-known/agent.json
+agent-auth-sdk inspect-metadata agent://demo.example.com/weather --registry-url http://192.144.228.237/.well-known/agent.json
 ```
 
 ## 十二、Beta v1.0 发布门槛

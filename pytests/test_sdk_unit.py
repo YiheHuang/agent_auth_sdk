@@ -20,12 +20,14 @@ from agent_auth_sdk import (
 from agent_auth_sdk.config import STRICT_PROFILE, TEST_PROFILE
 from agent_auth_sdk.crypto import verify_signature
 from agent_auth_sdk.http_utils import build_canonical_request
+from agent_auth_sdk.registry_security import hash_api_key, legacy_hash_api_key, verify_api_key
 from agent_auth_sdk.signing import sign_http_request
 from agent_auth_sdk.vault_kms import (
     VaultKmsConfig,
     VaultTransitPublicKeyResolver,
     VaultTransitSigner,
     parse_vault_signature,
+    read_vault_token,
 )
 
 
@@ -231,6 +233,7 @@ def test_vault_resolver_accepts_p256_key() -> None:
             vault_token="root",
             transit_mount="transit",
             key_name="agent-key",
+            allow_insecure_raw_token=True,
         ),
         client=_FakeVaultClient(public_pem, private_pem),
     )
@@ -252,6 +255,7 @@ def test_vault_resolver_rejects_non_p256_key() -> None:
             vault_token="root",
             transit_mount="transit",
             key_name="agent-key",
+            allow_insecure_raw_token=True,
         ),
         client=_FakeVaultClient(public_pem),
     )
@@ -267,6 +271,7 @@ def test_vault_signer_validate_access_rejects_when_signing_fails() -> None:
             vault_token="root",
             transit_mount="transit",
             key_name="agent-key",
+            allow_insecure_raw_token=True,
         ),
         client=_FakeVaultClient(public_pem, sign_error=RuntimeError("sign denied")),
     )
@@ -283,6 +288,7 @@ async def test_vault_signer_default_kid_and_signature_parse() -> None:
             vault_token="root",
             transit_mount="transit",
             key_name="agent-key",
+            allow_insecure_raw_token=True,
         ),
         client=_FakeVaultClient(public_pem, private_pem),
     )
@@ -315,6 +321,7 @@ def test_agent_instance_from_vault_builds_es256_metadata(monkeypatch) -> None:
         endpoint="https://192.144.228.237/invoke",
         vault_addr="http://127.0.0.1:8200",
         vault_token="root",
+        allow_insecure_raw_token=True,
         transit_mount="transit",
         key_name="publisher-key",
         capabilities=["publish"],
@@ -323,3 +330,57 @@ def test_agent_instance_from_vault_builds_es256_metadata(monkeypatch) -> None:
     assert agent.metadata is not None
     assert agent.metadata.keys[0].kid == "vault:transit/publisher-key"
     assert agent.metadata.keys[0].alg == "ES256"
+
+
+def test_vault_config_rejects_raw_token_in_production() -> None:
+    with pytest.raises(ValueError, match="Raw vault_token"):
+        VaultKmsConfig(
+            vault_addr="https://vault.example.com",
+            vault_token="raw-token",
+            transit_mount="transit",
+            key_name="agent-key",
+        )
+
+
+def test_vault_config_reads_token_file(tmp_path) -> None:
+    token_file = tmp_path / "vault-token"
+    token_file.write_text("token-from-agent\n", encoding="utf-8")
+    config = VaultKmsConfig(
+        vault_addr="https://vault.example.com",
+        vault_token_file=token_file,
+        transit_mount="transit",
+        key_name="agent-key",
+    )
+    assert read_vault_token(config) == "token-from-agent"
+
+
+def test_vault_config_rejects_empty_token_file(tmp_path) -> None:
+    token_file = tmp_path / "vault-token"
+    token_file.write_text("\n", encoding="utf-8")
+    config = VaultKmsConfig(
+        vault_addr="https://vault.example.com",
+        vault_token_file=token_file,
+        transit_mount="transit",
+        key_name="agent-key",
+    )
+    with pytest.raises(ValueError, match="empty"):
+        read_vault_token(config)
+
+
+def test_vault_config_rejects_skip_verify_in_production() -> None:
+    with pytest.raises(ValueError, match="TLS verification"):
+        VaultKmsConfig(
+            vault_addr="https://vault.example.com",
+            vault_token_file="/tmp/token",
+            transit_mount="transit",
+            key_name="agent-key",
+            verify=False,
+        )
+
+
+def test_api_key_hash_uses_pbkdf2_and_verifies_legacy_hash() -> None:
+    stored = hash_api_key("secret-api-key")
+    assert stored.startswith("pbkdf2_sha256$")
+    assert verify_api_key("secret-api-key", stored) is True
+    assert verify_api_key("wrong", stored) is False
+    assert verify_api_key("secret-api-key", legacy_hash_api_key("secret-api-key")) is True

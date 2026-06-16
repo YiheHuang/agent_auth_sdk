@@ -11,7 +11,7 @@ from .crypto import public_key_to_base64url
 from .identity import build_agent_id
 from .messaging import sign_agent_message
 from .models import AgentAuditConfig, AgentKey, AgentMetadata, SignedAgentMessage
-from .publish import export_well_known, publish_to_registry, render_agent_metadata
+from .publish import export_well_known, publish_to_registry, render_agent_metadata, rotate_key_in_registry
 from .signing import sign_http_request
 from .vault_kms import VaultKmsConfig, VaultTransitSigner, resolve_vault_public_key
 
@@ -43,9 +43,11 @@ class AgentInstance:
         organization: str,
         endpoint: str,
         vault_addr: str,
-        vault_token: str,
         transit_mount: str,
         key_name: str,
+        vault_token_file: str | Path | None = None,
+        vault_token: str | None = None,
+        allow_insecure_raw_token: bool = False,
         namespace: str | None = None,
         verify: bool | str = True,
         capabilities: list[str] | None = None,
@@ -54,9 +56,11 @@ class AgentInstance:
     ) -> "AgentInstance":
         config = VaultKmsConfig(
             vault_addr=vault_addr,
-            vault_token=vault_token,
             transit_mount=transit_mount,
             key_name=key_name,
+            vault_token_file=vault_token_file,
+            vault_token=vault_token,
+            allow_insecure_raw_token=allow_insecure_raw_token,
             namespace=namespace,
             verify=verify,
             kid=kid,
@@ -163,6 +167,51 @@ class AgentInstance:
             http_client=http_client,
             timeout_seconds=timeout_seconds,
         )
+
+    async def rotate_key(
+        self,
+        *,
+        registry_url: str,
+        client_id: str,
+        api_key: str,
+        new_signer: object,
+        new_public_key_pem: str,
+        new_kid: str,
+        http_client: httpx.AsyncClient | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> dict:
+        new_key = AgentKey(
+            kid=new_kid,
+            alg="ES256",
+            public_key_pem=new_public_key_pem,
+            public_key_base64url=public_key_to_base64url(new_public_key_pem),
+            status="active",
+        )
+        result = await rotate_key_in_registry(
+            agent_id=self.agent_id,
+            new_key=new_key,
+            registry_url=registry_url,
+            client_id=client_id,
+            api_key=api_key,
+            current_signer=self.signer,
+            new_signer=new_signer,
+            http_client=http_client,
+            timeout_seconds=timeout_seconds,
+        )
+        self.kid = new_kid
+        self.public_key_pem = new_public_key_pem
+        self.public_key_base64url = new_key.public_key_base64url or ""
+        self.signer_override = new_signer
+        if self.metadata is not None:
+            self.metadata = self.metadata.model_copy(
+                update={
+                    "keys": [
+                        *(key.model_copy(update={"status": "inactive"}) if key.status == "active" else key for key in self.metadata.keys),
+                        new_key,
+                    ],
+                },
+            )
+        return result
 
     async def sign_http(self, **kwargs: object):
         return await sign_http_request(agent_id=self.agent_id, signer=self.signer, **kwargs)

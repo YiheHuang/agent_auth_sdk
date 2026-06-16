@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from .config import MetadataResolverConfig, TEST_PROFILE, VerificationConfig
+from .config import MetadataResolverConfig, VerificationConfig
 from .crypto import verify_signature
 from .errors import VerificationErrorCode
 from .http_utils import build_canonical_request, canonicalize_headers
@@ -36,7 +36,7 @@ async def verify_http_request(
     now: datetime | None = None,
     request_id: str | None = None,
 ) -> VerificationSuccess | VerificationFailure:
-    config = config or VerificationConfig(profile=TEST_PROFILE)
+    config = config or VerificationConfig()
     profile = config.profile
     normalized_headers = canonicalize_headers(headers)
     agent_id = normalized_headers.get("x-agent-id")

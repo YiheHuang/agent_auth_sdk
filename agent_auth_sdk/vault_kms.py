@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from cryptography.hazmat.primitives import serialization
@@ -16,17 +17,25 @@ from .http_utils import _to_base64url
 @dataclass(frozen=True, slots=True)
 class VaultKmsConfig:
     vault_addr: str
-    vault_token: str
     transit_mount: str
     key_name: str
+    vault_token_file: str | Path | None = None
+    vault_token: str | None = None
     namespace: str | None = None
     verify: bool | str = True
     kid: str | None = None
+    allow_insecure_raw_token: bool = False
 
     def __post_init__(self) -> None:
-        for field_name in ("vault_addr", "vault_token", "transit_mount", "key_name"):
+        for field_name in ("vault_addr", "transit_mount", "key_name"):
             if not getattr(self, field_name):
                 raise ValueError(f"{field_name} is required")
+        if self.verify is False and not self.allow_insecure_raw_token:
+            raise ValueError("Disabling Vault TLS verification is only allowed in explicit dev/test mode.")
+        if self.vault_token and not self.allow_insecure_raw_token:
+            raise ValueError("Raw vault_token is dev/test-only. Use vault_token_file in production.")
+        if not self.vault_token_file and not self.vault_token:
+            raise ValueError("vault_token_file is required in production.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,10 +154,25 @@ def _build_vault_client(config: VaultKmsConfig) -> Any:
         raise RuntimeError("hvac is required for Vault Transit support. Install project dependencies first.") from exc
     return hvac.Client(
         url=config.vault_addr,
-        token=config.vault_token,
+        token=read_vault_token(config),
         namespace=config.namespace,
         verify=config.verify,
     )
+
+
+def read_vault_token(config: VaultKmsConfig) -> str:
+    if config.vault_token_file:
+        path = Path(config.vault_token_file)
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError(f"Unable to read Vault token file: {path}") from exc
+        if not token:
+            raise ValueError(f"Vault token file is empty: {path}")
+        return token
+    if config.vault_token and config.allow_insecure_raw_token:
+        return config.vault_token
+    raise ValueError("vault_token_file is required in production.")
 
 
 def _base64(data: bytes) -> str:

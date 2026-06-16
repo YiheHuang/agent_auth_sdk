@@ -46,19 +46,19 @@ def get_runtime_profile(name: str) -> RuntimeProfile:
 
 @dataclass(slots=True)
 class SigningConfig:
-    profile: RuntimeProfile = field(default_factory=lambda: TEST_PROFILE)
+    profile: RuntimeProfile = field(default_factory=lambda: STRICT_PROFILE)
     include_signature_input_header: bool = True
 
 
 @dataclass(slots=True)
 class VerificationConfig:
-    profile: RuntimeProfile = field(default_factory=lambda: TEST_PROFILE)
+    profile: RuntimeProfile = field(default_factory=lambda: STRICT_PROFILE)
     require_signature_input_header: bool = True
 
 
 @dataclass(slots=True)
 class MetadataResolverConfig:
-    profile: RuntimeProfile = field(default_factory=lambda: TEST_PROFILE)
+    profile: RuntimeProfile = field(default_factory=lambda: STRICT_PROFILE)
     cache_ttl_seconds: int | None = None
     request_timeout_seconds: float = 10.0
     registry_url: str | None = None

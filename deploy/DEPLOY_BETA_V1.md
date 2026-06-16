@@ -71,6 +71,8 @@ sudo systemctl reload nginx
 - `http://192.144.228.237/registry/agents/publish` 可被 SDK 调用
 - `http://192.144.228.237/registry/agents/rotate-key` 可被 SDK 调用
 
+当前演示部署保持 HTTP；如切换正式公网生产环境，再在 Nginx 或上游负载均衡处启用 TLS。
+
 ## 5. 初始化 Developer 凭证
 
 ```bash
@@ -100,9 +102,13 @@ agent-auth-registry-admin inspect-agent --agent-id agent://demo.example.com/weat
 vault server -dev -dev-root-token-id=root
 export VAULT_ADDR='http://127.0.0.1:8200'
 export VAULT_TOKEN='root'
+mkdir -p runtime
+printf '%s' "$VAULT_TOKEN" > runtime/vault-token.txt
 vault secrets enable transit
 vault write -f transit/keys/weather-agent type=ecdsa-p256
 ```
+
+上面的 dev root token 只允许本地演示。生产环境应使用 Vault Agent sink、AppRole/OIDC 等外部机制写入短期 token 文件，SDK 只读取 token 文件路径，不直接接收 raw token。
 
 最小 policy 示例：
 
@@ -128,7 +134,7 @@ from agent_auth_sdk import VaultKmsConfig, validate_vault_key
 info = validate_vault_key(
     VaultKmsConfig(
         vault_addr=os.environ["VAULT_ADDR"],
-        vault_token=os.environ["VAULT_TOKEN"],
+        vault_token_file="runtime/vault-token.txt",
         transit_mount="transit",
         key_name="weather-agent",
     )
@@ -153,7 +159,7 @@ async def main():
         organization="Demo Org",
         endpoint="https://demo.example.com/invoke",
         vault_addr=os.environ["VAULT_ADDR"],
-        vault_token=os.environ["VAULT_TOKEN"],
+        vault_token_file="runtime/vault-token.txt",
         transit_mount="transit",
         key_name="weather-agent",
         capabilities=["weather.query", "sign", "verify"],
@@ -173,7 +179,12 @@ PY
 
 ## 8. 密钥轮换
 
-先由开发者在 Vault 中创建或准备新 key，然后调用 `POST /registry/agents/rotate-key`。轮换请求必须由当前 active key 签名，新 key 只提交公钥材料。SDK 保留 `sign_registry_publish_request(...)` 与 `resolve_vault_public_key(...)`，开发者可以在自己的发布工具或 CI 流程中组合调用。
+先由开发者在 Vault 中创建或准备新 key，然后调用 `POST /registry/agents/rotate-key`。轮换请求必须同时满足：
+
+- 当前 active key 对完整 rotate 请求签名。
+- 新 key 对绑定 `agent_id`、`new_key.kid`、新公钥指纹、timestamp、nonce、client_id 与 host 的 proof 签名。
+
+推荐使用 SDK 高层接口 `AgentInstance.rotate_key(...)` 或 `rotate_key_in_registry(...)`，不要手写轮换协议。
 
 ## 9. 验收标准
 

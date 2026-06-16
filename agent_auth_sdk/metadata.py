@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .config import MetadataResolverConfig, RuntimeProfile, TEST_PROFILE
+from .config import MetadataResolverConfig, RuntimeProfile, STRICT_PROFILE
 from .errors import AgentIdentityError, MetadataValidationError
 from .identity import assert_subject_match, parse_agent_id
 from .models import AgentKey, AgentMetadata, AgentRegistryDocument, ResolveResult
@@ -59,7 +59,7 @@ def validate_metadata(metadata: AgentMetadata, profile: RuntimeProfile) -> None:
 async def resolve_agent(
     agent_id: str,
     *,
-    profile: RuntimeProfile = TEST_PROFILE,
+    profile: RuntimeProfile = STRICT_PROFILE,
     http_client: httpx.AsyncClient,
     cache: MetadataCache | None = None,
     config: MetadataResolverConfig | None = None,

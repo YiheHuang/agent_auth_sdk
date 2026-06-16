@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import httpx
 
-from .config import MetadataResolverConfig, TEST_PROFILE, VerificationConfig
+from .config import MetadataResolverConfig, VerificationConfig
 from .crypto import Signer, verify_signature
 from .errors import VerificationErrorCode
 from .http_utils import _to_base64url, ensure_bytes, sha256_base64url, to_iso_z
@@ -113,7 +113,7 @@ async def verify_agent_message(
     resolver_config: MetadataResolverConfig | None = None,
     now: datetime | None = None,
 ) -> VerificationSuccess | VerificationFailure:
-    config = config or VerificationConfig(profile=TEST_PROFILE)
+    config = config or VerificationConfig()
     profile = config.profile
     parsed_message = message if isinstance(message, SignedAgentMessage) else SignedAgentMessage.model_validate(message)
 

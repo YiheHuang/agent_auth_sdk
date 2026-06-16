@@ -11,7 +11,7 @@ import httpx
 
 from .crypto import Signer
 from .models import AgentAuditConfig, AgentKey, AgentMetadata
-from .registry_security import sign_registry_publish_request
+from .registry_security import sign_registry_new_key_proof, sign_registry_publish_request
 
 
 def render_agent_metadata(
@@ -90,6 +90,57 @@ async def publish_to_registry(
 
     if http_client is not None:
         response = await http_client.post(registry_url, json=payload, headers=headers, timeout=timeout_seconds)
+        response.raise_for_status()
+        return response.json()
+
+
+async def rotate_key_in_registry(
+    *,
+    agent_id: str,
+    new_key: AgentKey,
+    registry_url: str,
+    client_id: str,
+    api_key: str,
+    current_signer: Signer,
+    new_signer: Signer,
+    http_client: httpx.AsyncClient | None = None,
+    timeout_seconds: float = 10.0,
+) -> dict:
+    """显式轮换 registry 中的 Agent active key，并证明新私钥可控。"""
+
+    parsed = urlparse(registry_url)
+    path = parsed.path or "/"
+    host = parsed.netloc
+    proof = await sign_registry_new_key_proof(
+        agent_id=agent_id,
+        new_key=new_key,
+        client_id=client_id,
+        host=host,
+        signer=new_signer,
+    )
+    payload = {
+        "agent_id": agent_id,
+        "new_key": new_key.model_dump(mode="json"),
+        "new_key_proof_headers": proof.headers,
+    }
+    signed = await sign_registry_publish_request(
+        path=path,
+        host=host,
+        body=payload,
+        agent_id=agent_id,
+        client_id=client_id,
+        signer=current_signer,
+    )
+    headers = dict(signed.headers)
+    headers["authorization"] = f"Bearer {api_key}"
+
+    if http_client is not None:
+        response = await http_client.post(registry_url, json=payload, headers=headers, timeout=timeout_seconds)
+        response.raise_for_status()
+        return response.json()
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(registry_url, json=payload, headers=headers, timeout=timeout_seconds)
         response.raise_for_status()
         return response.json()
 

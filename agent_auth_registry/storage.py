@@ -132,6 +132,13 @@ class RegistryStore:
                 (_now_iso(), client_id),
             )
 
+    def update_developer_api_key_hash(self, *, client_id: str, api_key_hash: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE developers SET api_key_hash = ? WHERE client_id = ?",
+                (api_key_hash, client_id),
+            )
+
     def get_developer_by_client_id(self, client_id: str) -> DeveloperRecord | None:
         with self._connect() as conn:
             row = conn.execute(

@@ -13,8 +13,11 @@ from pydantic import BaseModel
 from agent_auth_sdk.identity import build_agent_id
 from agent_auth_sdk.models import AgentKey, AgentMetadata
 from agent_auth_sdk.registry_security import (
+    agent_key_fingerprint,
     hash_api_key,
-    public_key_fingerprint,
+    is_legacy_api_key_hash,
+    verify_api_key,
+    verify_registry_new_key_proof,
     verify_registry_publish_signature,
 )
 
@@ -30,6 +33,7 @@ class PublishRequest(BaseModel):
 class RotateKeyRequest(BaseModel):
     agent_id: str
     new_key: AgentKey
+    new_key_proof_headers: dict[str, str]
 
 
 def load_registry_public_path() -> Path:
@@ -103,7 +107,7 @@ def create_app() -> FastAPI:
                     metadata=request.metadata,
                     developer_id=developer.developer_id,
                     current_kid=x_agent_kid,
-                    public_key_fingerprint=public_key_fingerprint(signing_key.public_key_pem or ""),
+                    public_key_fingerprint=agent_key_fingerprint(signing_key),
                 )
             else:
                 if ownership.owner_developer_id != developer.developer_id:
@@ -183,6 +187,17 @@ def create_app() -> FastAPI:
             nonce_key = f"{developer.developer_id}:{x_agent_nonce}"
             if store.has_nonce(nonce_key):
                 raise HTTPException(status_code=409, detail="NONCE_REPLAYED")
+            proof_headers = request.new_key_proof_headers
+            if not proof_headers:
+                raise HTTPException(status_code=400, detail="NEW_KEY_PROOF_REQUIRED")
+            normalized_proof_headers = {key.lower(): value for key, value in proof_headers.items()}
+            _assert_fresh_timestamp(normalized_proof_headers.get("x-agent-timestamp"))
+            proof_nonce = normalized_proof_headers.get("x-agent-nonce")
+            if not proof_nonce:
+                raise HTTPException(status_code=400, detail="NEW_KEY_PROOF_MISSING_NONCE")
+            proof_nonce_key = f"{developer.developer_id}:new-key:{proof_nonce}"
+            if store.has_nonce(proof_nonce_key):
+                raise HTTPException(status_code=409, detail="NEW_KEY_PROOF_NONCE_REPLAYED")
 
             ownership = store.get_ownership(request.agent_id)
             if ownership is None:
@@ -203,6 +218,14 @@ def create_app() -> FastAPI:
             )
             if not verified:
                 raise HTTPException(status_code=401, detail="SIGNATURE_INVALID")
+            proof_valid = verify_registry_new_key_proof(
+                agent_id=request.agent_id,
+                new_key=request.new_key,
+                headers=proof_headers,
+                host=http_request.headers.get("host", ""),
+            )
+            if not proof_valid:
+                raise HTTPException(status_code=401, detail="NEW_KEY_PROOF_INVALID")
 
             updated_keys = []
             for key in metadata.keys:
@@ -221,10 +244,11 @@ def create_app() -> FastAPI:
                 metadata=updated_metadata,
                 developer_id=developer.developer_id,
                 current_kid=request.new_key.kid,
-                public_key_fingerprint=public_key_fingerprint(request.new_key.public_key_pem or ""),
+                public_key_fingerprint=agent_key_fingerprint(request.new_key),
                 created_at=ownership.created_at,
             )
             store.set_nonce(nonce_key, datetime.now(timezone.utc) + timedelta(seconds=load_registry_allowed_skew_seconds()))
+            store.set_nonce(proof_nonce_key, datetime.now(timezone.utc) + timedelta(seconds=load_registry_allowed_skew_seconds()))
             store.write_public_document(load_registry_public_path())
             store.write_audit(
                 developer_id=developer.developer_id,
@@ -258,8 +282,10 @@ def _authenticate_developer(store: RegistryStore, authorization: str | None, cli
     if developer is None or developer.status != "active":
         raise HTTPException(status_code=401, detail="DEVELOPER_NOT_FOUND")
     api_key = authorization.removeprefix("Bearer ").strip()
-    if hash_api_key(api_key) != developer.api_key_hash:
+    if not verify_api_key(api_key, developer.api_key_hash):
         raise HTTPException(status_code=401, detail="INVALID_DEVELOPER_API_KEY")
+    if is_legacy_api_key_hash(developer.api_key_hash):
+        store.update_developer_api_key_hash(client_id=client_id, api_key_hash=hash_api_key(api_key))
     return developer
 
 
@@ -289,7 +315,10 @@ def _validate_publish_headers(
 def _assert_fresh_timestamp(value: str | None) -> None:
     if not value:
         raise HTTPException(status_code=400, detail="MISSING_TIMESTAMP")
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="INVALID_TIMESTAMP") from exc
     skew = abs((datetime.now(timezone.utc) - parsed).total_seconds())
     if skew > load_registry_allowed_skew_seconds():
         raise HTTPException(status_code=401, detail="TIMESTAMP_EXPIRED")

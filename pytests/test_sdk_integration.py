@@ -92,15 +92,18 @@ def seed_developer(db_path, *, developer_id: str = "dev-1", client_id: str = "de
 def maybe_kms_test_config() -> VaultKmsConfig | None:
     vault_addr = os.getenv("AGENT_AUTH_TEST_VAULT_ADDR")
     vault_token = os.getenv("AGENT_AUTH_TEST_VAULT_TOKEN")
+    vault_token_file = os.getenv("AGENT_AUTH_TEST_VAULT_TOKEN_FILE")
     transit_mount = os.getenv("AGENT_AUTH_TEST_VAULT_TRANSIT_MOUNT") or "transit"
     key_name = os.getenv("AGENT_AUTH_TEST_VAULT_KEY_NAME") or os.getenv("AGENT_AUTH_TEST_KMS_KEY_ID")
-    if not vault_addr or not vault_token or not key_name:
+    if not vault_addr or not (vault_token_file or vault_token) or not key_name:
         return None
     return VaultKmsConfig(
         vault_addr=vault_addr,
-        vault_token=vault_token,
         transit_mount=transit_mount,
         key_name=key_name,
+        vault_token_file=vault_token_file,
+        vault_token=vault_token,
+        allow_insecure_raw_token=bool(vault_token),
         namespace=os.getenv("AGENT_AUTH_TEST_VAULT_NAMESPACE") or None,
         verify=os.getenv("AGENT_AUTH_TEST_VAULT_CA_CERT") or True,
         kid=os.getenv("AGENT_AUTH_TEST_KMS_KID") or f"vault:{transit_mount}/{key_name}",
@@ -449,15 +452,54 @@ async def test_rotate_key_succeeds_and_old_key_becomes_inactive(registry_env) ->
             api_key="secret-api-key",
             http_client=client,
         )
+        result = await agent.rotate_key(
+            registry_url="http://registry.local/registry/agents/rotate-key",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            new_signer=_TestEs256Signer(new_private_pem, kid="vault:next"),
+            new_public_key_pem=new_public_pem,
+            new_kid="vault:next",
+            http_client=client,
+        )
+        assert result["ok"] is True
+        store = RegistryStore(db_path)
+        entry = store.get_registry_entry(agent.agent_id)
+        assert entry is not None
+        metadata = AgentMetadata.model_validate_json(entry.metadata_json)
+        assert any(key.kid == "vault:main" and key.status == "inactive" for key in metadata.keys)
+        assert any(key.kid == "vault:next" and key.status == "active" for key in metadata.keys)
+
+
+@pytest.mark.anyio
+async def test_rotate_key_rejects_missing_new_key_proof(registry_env) -> None:
+    db_path, _ = registry_env
+    seed_developer(db_path)
+    current_private_pem, current_public_pem = _generate_es256_pem_pair()
+    _, new_public_pem = _generate_es256_pem_pair()
+    agent = AgentInstance.from_signer(
+        domain="192.144.228.237",
+        name="publisher",
+        organization="FDU",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish"],
+        environment="prod",
+        signer=_TestEs256Signer(current_private_pem, kid="vault:main"),
+        public_key_pem=current_public_pem,
+        kid="vault:main",
+        alg="ES256",
+    )
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        await agent.publish(
+            registry_url="http://registry.local/registry/agents/publish",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            http_client=client,
+        )
         payload = {
             "agent_id": agent.agent_id,
-            "new_key": AgentKey(
-                kid="vault:next",
-                alg="ES256",
-                public_key_pem=new_public_pem,
-                public_key_base64url=None,
-                status="active",
-            ).model_dump(mode="json"),
+            "new_key": AgentKey(kid="vault:next", alg="ES256", public_key_pem=new_public_pem).model_dump(mode="json"),
+            "new_key_proof_headers": {},
         }
         signed = await sign_registry_publish_request(
             path="/registry/agents/rotate-key",
@@ -472,13 +514,67 @@ async def test_rotate_key_succeeds_and_old_key_becomes_inactive(registry_env) ->
             json=payload,
             headers={"authorization": "Bearer secret-api-key", **signed.headers},
         )
-        assert response.status_code == 200
-        store = RegistryStore(db_path)
-        entry = store.get_registry_entry(agent.agent_id)
-        assert entry is not None
-        metadata = AgentMetadata.model_validate_json(entry.metadata_json)
-        assert any(key.kid == "vault:main" and key.status == "inactive" for key in metadata.keys)
-        assert any(key.kid == "vault:next" and key.status == "active" for key in metadata.keys)
+        assert response.status_code == 400
+        assert response.json()["detail"] == "NEW_KEY_PROOF_REQUIRED"
+
+
+@pytest.mark.anyio
+async def test_rotate_key_rejects_invalid_new_key_proof(registry_env) -> None:
+    db_path, _ = registry_env
+    seed_developer(db_path)
+    current_private_pem, current_public_pem = _generate_es256_pem_pair()
+    wrong_private_pem, _ = _generate_es256_pem_pair()
+    _, new_public_pem = _generate_es256_pem_pair()
+    agent = AgentInstance.from_signer(
+        domain="192.144.228.237",
+        name="publisher",
+        organization="FDU",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish"],
+        environment="prod",
+        signer=_TestEs256Signer(current_private_pem, kid="vault:main"),
+        public_key_pem=current_public_pem,
+        kid="vault:main",
+        alg="ES256",
+    )
+    new_key = AgentKey(kid="vault:next", alg="ES256", public_key_pem=new_public_pem)
+    from agent_auth_sdk import sign_registry_new_key_proof
+
+    proof = await sign_registry_new_key_proof(
+        agent_id=agent.agent_id,
+        new_key=new_key,
+        client_id="developer-a",
+        host="registry.local",
+        signer=_TestEs256Signer(wrong_private_pem, kid="vault:next"),
+    )
+    payload = {
+        "agent_id": agent.agent_id,
+        "new_key": new_key.model_dump(mode="json"),
+        "new_key_proof_headers": proof.headers,
+    }
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        await agent.publish(
+            registry_url="http://registry.local/registry/agents/publish",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            http_client=client,
+        )
+        signed = await sign_registry_publish_request(
+            path="/registry/agents/rotate-key",
+            host="registry.local",
+            body=payload,
+            agent_id=agent.agent_id,
+            client_id="developer-a",
+            signer=agent.signer,
+        )
+        response = await client.post(
+            "http://registry.local/registry/agents/rotate-key",
+            json=payload,
+            headers={"authorization": "Bearer secret-api-key", **signed.headers},
+        )
+        assert response.status_code == 401
+        assert response.json()["detail"] == "NEW_KEY_PROOF_INVALID"
 
 
 @pytest.mark.anyio
@@ -528,7 +624,7 @@ async def test_real_vault_publish_and_resolve_from_registry(registry_env) -> Non
     kms_config = maybe_kms_test_config()
     if kms_config is None:
         pytest.skip(
-            "Real Vault integration requires AGENT_AUTH_TEST_VAULT_ADDR, AGENT_AUTH_TEST_VAULT_TOKEN, and AGENT_AUTH_TEST_VAULT_KEY_NAME",
+            "Real Vault integration requires AGENT_AUTH_TEST_VAULT_ADDR, AGENT_AUTH_TEST_VAULT_TOKEN_FILE, and AGENT_AUTH_TEST_VAULT_KEY_NAME",
         )
     db_path, _ = registry_env
     seed_developer(db_path)
@@ -539,7 +635,9 @@ async def test_real_vault_publish_and_resolve_from_registry(registry_env) -> Non
         organization="FDU",
         endpoint="https://demo.example.com/invoke",
         vault_addr=kms_config.vault_addr,
+        vault_token_file=kms_config.vault_token_file,
         vault_token=kms_config.vault_token,
+        allow_insecure_raw_token=kms_config.allow_insecure_raw_token,
         transit_mount=kms_config.transit_mount,
         key_name=kms_config.key_name,
         namespace=kms_config.namespace,

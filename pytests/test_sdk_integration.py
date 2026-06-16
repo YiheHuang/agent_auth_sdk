@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import FastAPI
@@ -26,7 +27,6 @@ from agent_auth_sdk import (
     verify_http_request,
 )
 from agent_auth_sdk.config import MetadataResolverConfig, STRICT_PROFILE, TEST_PROFILE
-from agent_auth_sdk.crypto import LocalPemSigner, generate_ed25519_keypair
 from agent_auth_sdk.registry_security import hash_api_key, sign_registry_publish_request
 from agent_auth_sdk.vault_kms import VaultKmsConfig, resolve_vault_public_key
 
@@ -44,6 +44,21 @@ def _generate_es256_pem_pair() -> tuple[str, str]:
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode("utf-8")
     return private_pem, public_pem
+
+
+class _TestEs256Signer:
+    def __init__(self, private_pem: str, kid: str = "vault:test") -> None:
+        self._private_key = serialization.load_pem_private_key(private_pem.encode("utf-8"), password=None)
+        self._kid = kid
+
+    async def kid(self) -> str:
+        return self._kid
+
+    async def algorithm(self) -> str:
+        return "ES256"
+
+    async def sign(self, data: bytes) -> bytes:
+        return self._private_key.sign(data, ec.ECDSA(hashes.SHA256()))
 
 
 def create_metadata_app(metadata: dict) -> FastAPI:
@@ -94,7 +109,7 @@ def maybe_kms_test_config() -> VaultKmsConfig | None:
 
 @pytest.mark.anyio
 async def test_metadata_discovery_and_verification_success() -> None:
-    pair = generate_ed25519_keypair(kid="main")
+    private_pem, public_pem = _generate_es256_pem_pair()
     metadata = render_agent_metadata(
         agent_id="agent://127.0.0.1:9001/publisher",
         domain="127.0.0.1:9001",
@@ -102,12 +117,12 @@ async def test_metadata_discovery_and_verification_success() -> None:
         organization="Demo Org",
         endpoint="http://127.0.0.1:9001/invoke",
         capabilities=["agent-auth"],
-        keys=[AgentKey(kid="main", public_key_pem=pair.public_key_pem, public_key_base64url=pair.public_key_base64url)],
+        keys=[AgentKey(kid="vault:test", alg="ES256", public_key_pem=public_pem)],
         environment="test",
     ).model_dump(mode="json")
     transport = httpx.ASGITransport(app=create_metadata_app(metadata))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:9001") as client:
-        signer = LocalPemSigner(private_key_pem=pair.private_key_pem, kid_value="main")
+        signer = _TestEs256Signer(private_pem, kid="vault:test")
         signed = await sign_http_request(
             method="POST",
             url="http://127.0.0.1:8010/invoke",
@@ -131,7 +146,7 @@ async def test_metadata_discovery_and_verification_success() -> None:
 
 @pytest.mark.anyio
 async def test_replay_request_rejected() -> None:
-    pair = generate_ed25519_keypair(kid="main")
+    private_pem, public_pem = _generate_es256_pem_pair()
     metadata = render_agent_metadata(
         agent_id="agent://127.0.0.1:9001/publisher",
         domain="127.0.0.1:9001",
@@ -139,13 +154,13 @@ async def test_replay_request_rejected() -> None:
         organization="Demo Org",
         endpoint="http://127.0.0.1:9001/invoke",
         capabilities=[],
-        keys=[AgentKey(kid="main", public_key_pem=pair.public_key_pem, public_key_base64url=pair.public_key_base64url)],
+        keys=[AgentKey(kid="vault:test", alg="ES256", public_key_pem=public_pem)],
         environment="test",
     ).model_dump(mode="json")
     transport = httpx.ASGITransport(app=create_metadata_app(metadata))
     nonce_store = InMemoryNonceStore()
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:9001") as client:
-        signer = LocalPemSigner(private_key_pem=pair.private_key_pem, kid_value="main")
+        signer = _TestEs256Signer(private_pem, kid="vault:test")
         signed = await sign_http_request(
             method="POST",
             url="http://127.0.0.1:8010/invoke",
@@ -179,7 +194,7 @@ async def test_replay_request_rejected() -> None:
 
 @pytest.mark.anyio
 async def test_strict_profile_rejects_ip_host_metadata() -> None:
-    pair = generate_ed25519_keypair(kid="main")
+    private_pem, public_pem = _generate_es256_pem_pair()
     metadata = render_agent_metadata(
         agent_id="agent://127.0.0.1:9001/publisher",
         domain="127.0.0.1:9001",
@@ -187,12 +202,12 @@ async def test_strict_profile_rejects_ip_host_metadata() -> None:
         organization="Demo Org",
         endpoint="http://127.0.0.1:9001/invoke",
         capabilities=[],
-        keys=[AgentKey(kid="main", public_key_pem=pair.public_key_pem, public_key_base64url=pair.public_key_base64url)],
+        keys=[AgentKey(kid="vault:test", alg="ES256", public_key_pem=public_pem)],
         environment="test",
     ).model_dump(mode="json")
     transport = httpx.ASGITransport(app=create_metadata_app(metadata))
     async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1:9001") as client:
-        signer = LocalPemSigner(private_key_pem=pair.private_key_pem, kid_value="main")
+        signer = _TestEs256Signer(private_pem, kid="vault:test")
         signed = await sign_http_request(
             method="POST",
             url="http://127.0.0.1:8010/invoke",
@@ -222,9 +237,9 @@ async def test_signed_agent_message_can_be_verified_via_well_known_metadata() ->
         endpoint="http://127.0.0.1:9001/invoke",
         capabilities=["agent-auth"],
         environment="test",
-        signer=LocalPemSigner(private_key_pem=private_pem, kid_value="kms:test"),
+        signer=_TestEs256Signer(private_pem, kid="vault:test"),
         public_key_pem=public_pem,
-        kid="kms:test",
+        kid="vault:test",
         alg="ES256",
     )
     assert agent.metadata is not None
@@ -259,9 +274,9 @@ async def test_secure_publish_to_registry_and_resolve_from_registry(registry_env
         endpoint="https://192.144.228.237/invoke",
         capabilities=["publish", "sign", "verify"],
         environment="prod",
-        signer=LocalPemSigner(private_key_pem=private_pem, kid_value="kms:test"),
+        signer=_TestEs256Signer(private_pem, kid="vault:test"),
         public_key_pem=public_pem,
-        kid="kms:test",
+        kid="vault:test",
         alg="ES256",
     )
     transport = httpx.ASGITransport(app=create_registry_app())
@@ -300,9 +315,9 @@ async def test_publish_rejects_wrong_owner(registry_env) -> None:
         endpoint="https://192.144.228.237/invoke",
         capabilities=["publish"],
         environment="prod",
-        signer=LocalPemSigner(private_key_pem=private_pem, kid_value="kms:test"),
+        signer=_TestEs256Signer(private_pem, kid="vault:test"),
         public_key_pem=public_pem,
-        kid="kms:test",
+        kid="vault:test",
         alg="ES256",
     )
     transport = httpx.ASGITransport(app=create_registry_app())
@@ -355,9 +370,9 @@ async def test_publish_rejects_when_only_api_key_is_stolen(registry_env) -> None
         endpoint="https://192.144.228.237/invoke",
         capabilities=["publish"],
         environment="prod",
-        signer=LocalPemSigner(private_key_pem=legit_private_pem, kid_value="kms:legit"),
+        signer=_TestEs256Signer(legit_private_pem, kid="vault:legit"),
         public_key_pem=legit_public_pem,
-        kid="kms:legit",
+        kid="vault:legit",
         alg="ES256",
     )
     rogue_agent = AgentInstance.from_signer(
@@ -367,9 +382,9 @@ async def test_publish_rejects_when_only_api_key_is_stolen(registry_env) -> None
         endpoint="https://192.144.228.237/invoke",
         capabilities=["publish"],
         environment="prod",
-        signer=LocalPemSigner(private_key_pem=rogue_private_pem, kid_value="kms:rogue"),
+        signer=_TestEs256Signer(rogue_private_pem, kid="vault:rogue"),
         public_key_pem=rogue_public_pem,
-        kid="kms:rogue",
+        kid="vault:rogue",
         alg="ES256",
     )
     transport = httpx.ASGITransport(app=create_registry_app())
@@ -421,9 +436,9 @@ async def test_rotate_key_succeeds_and_old_key_becomes_inactive(registry_env) ->
         endpoint="https://192.144.228.237/invoke",
         capabilities=["publish"],
         environment="prod",
-        signer=LocalPemSigner(private_key_pem=current_private_pem, kid_value="kms:main"),
+        signer=_TestEs256Signer(current_private_pem, kid="vault:main"),
         public_key_pem=current_public_pem,
-        kid="kms:main",
+        kid="vault:main",
         alg="ES256",
     )
     transport = httpx.ASGITransport(app=create_registry_app())
@@ -437,7 +452,7 @@ async def test_rotate_key_succeeds_and_old_key_becomes_inactive(registry_env) ->
         payload = {
             "agent_id": agent.agent_id,
             "new_key": AgentKey(
-                kid="kms:next",
+                kid="vault:next",
                 alg="ES256",
                 public_key_pem=new_public_pem,
                 public_key_base64url=None,
@@ -462,8 +477,8 @@ async def test_rotate_key_succeeds_and_old_key_becomes_inactive(registry_env) ->
         entry = store.get_registry_entry(agent.agent_id)
         assert entry is not None
         metadata = AgentMetadata.model_validate_json(entry.metadata_json)
-        assert any(key.kid == "kms:main" and key.status == "inactive" for key in metadata.keys)
-        assert any(key.kid == "kms:next" and key.status == "active" for key in metadata.keys)
+        assert any(key.kid == "vault:main" and key.status == "inactive" for key in metadata.keys)
+        assert any(key.kid == "vault:next" and key.status == "active" for key in metadata.keys)
 
 
 @pytest.mark.anyio
@@ -478,9 +493,9 @@ async def test_publish_timestamp_expired_is_rejected(registry_env) -> None:
         endpoint="https://192.144.228.237/invoke",
         capabilities=["publish"],
         environment="prod",
-        signer=LocalPemSigner(private_key_pem=private_pem, kid_value="kms:test"),
+        signer=_TestEs256Signer(private_pem, kid="vault:test"),
         public_key_pem=public_pem,
-        kid="kms:test",
+        kid="vault:test",
         alg="ES256",
     )
     transport = httpx.ASGITransport(app=create_registry_app())

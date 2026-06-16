@@ -7,7 +7,7 @@ from .config import (
     VerificationConfig,
 )
 from .agent import AgentInstance
-from .crypto import CallableSigner, GeneratedKeyPair, LocalPemSigner, generate_ed25519_keypair
+from .crypto import CallableSigner, Signer
 from .identity import ParsedAgentId, assert_subject_match, build_agent_id, parse_agent_id
 from .messaging import (
     build_canonical_message,
@@ -46,8 +46,6 @@ from .vault_kms import (
     VaultKmsKeyDescription,
     VaultTransitPublicKeyResolver,
     VaultTransitSigner,
-    create_vault_key_if_missing,
-    parse_vault_signature,
     resolve_vault_public_key,
     validate_vault_key,
 )
@@ -61,10 +59,8 @@ __all__ = [
     "AgentRegistryEntry",
     "CallableSigner",
     "FileMetadataCache",
-    "GeneratedKeyPair",
     "InMemoryMetadataCache",
     "InMemoryNonceStore",
-    "LocalPemSigner",
     "MetadataCache",
     "MetadataResolverConfig",
     "NonceStore",
@@ -74,6 +70,7 @@ __all__ = [
     "ResolveResult",
     "RuntimeProfile",
     "SignedAgentMessage",
+    "Signer",
     "SignatureHeaders",
     "SigningConfig",
     "VerificationConfig",
@@ -86,11 +83,8 @@ __all__ = [
     "assert_subject_match",
     "build_agent_id",
     "build_canonical_message",
-    "create_vault_key_if_missing",
     "export_well_known",
-    "generate_ed25519_keypair",
     "parse_agent_id",
-    "parse_vault_signature",
     "publish_to_registry",
     "render_agent_metadata",
     "resolve_agent",

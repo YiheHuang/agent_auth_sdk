@@ -121,55 +121,59 @@ path "transit/sign/*" {
 检查 Vault key：
 
 ```bash
-agent-auth-sdk validate-kms-key \
-  --vault-addr http://127.0.0.1:8200 \
-  --vault-token-env VAULT_TOKEN \
-  --transit-mount transit \
-  --key-name weather-agent
+python - <<'PY'
+import os
+from agent_auth_sdk import VaultKmsConfig, validate_vault_key
+
+info = validate_vault_key(
+    VaultKmsConfig(
+        vault_addr=os.environ["VAULT_ADDR"],
+        vault_token=os.environ["VAULT_TOKEN"],
+        transit_mount="transit",
+        key_name="weather-agent",
+    )
+)
+print(info)
+PY
 ```
 
-渲染 metadata：
-
-```bash
-agent-auth-sdk render-metadata \
-  --host demo.example.com \
-  --agent-name weather \
-  --endpoint https://demo.example.com/invoke \
-  --vault-addr http://127.0.0.1:8200 \
-  --vault-token-env VAULT_TOKEN \
-  --transit-mount transit \
-  --key-name weather-agent
-```
-
-发布到 registry：
+创建 Agent、渲染 metadata 并发布：
 
 ```bash
 export AGENT_AUTH_REGISTRY_API_KEY='your-registry-api-key'
-agent-auth-sdk publish-to-registry \
-  --metadata-path runtime/.well-known/agent.json \
-  --vault-addr http://127.0.0.1:8200 \
-  --vault-token-env VAULT_TOKEN \
-  --transit-mount transit \
-  --key-name weather-agent \
-  --registry-url http://192.144.228.237/registry/agents/publish \
-  --client-id developer-a
+python - <<'PY'
+import asyncio
+import os
+from agent_auth_sdk import AgentInstance
+
+async def main():
+    agent = AgentInstance.from_vault(
+        domain="demo.example.com",
+        name="weather",
+        organization="Demo Org",
+        endpoint="https://demo.example.com/invoke",
+        vault_addr=os.environ["VAULT_ADDR"],
+        vault_token=os.environ["VAULT_TOKEN"],
+        transit_mount="transit",
+        key_name="weather-agent",
+        capabilities=["weather.query", "sign", "verify"],
+        environment="beta",
+    )
+    agent.export_metadata("runtime")
+    result = await agent.publish(
+        registry_url="http://192.144.228.237/registry/agents/publish",
+        client_id="developer-a",
+        api_key=os.environ["AGENT_AUTH_REGISTRY_API_KEY"],
+    )
+    print(result)
+
+asyncio.run(main())
+PY
 ```
 
 ## 8. 密钥轮换
 
-先由开发者在 Vault 中创建或准备新 key，然后走 registry 显式轮换：
-
-```bash
-agent-auth-sdk rotate-key \
-  --registry-url http://192.144.228.237/registry/agents/rotate-key \
-  --agent-id agent://demo.example.com/weather \
-  --vault-addr http://127.0.0.1:8200 \
-  --vault-token-env VAULT_TOKEN \
-  --transit-mount transit \
-  --current-kms-key-id weather-agent-current \
-  --new-kms-key-id weather-agent-next \
-  --client-id developer-a
-```
+先由开发者在 Vault 中创建或准备新 key，然后调用 `POST /registry/agents/rotate-key`。轮换请求必须由当前 active key 签名，新 key 只提交公钥材料。SDK 保留 `sign_registry_publish_request(...)` 与 `resolve_vault_public_key(...)`，开发者可以在自己的发布工具或 CI 流程中组合调用。
 
 ## 9. 验收标准
 

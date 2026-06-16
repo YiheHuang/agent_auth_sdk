@@ -64,8 +64,8 @@ async def sign_agent_message(
     parse_agent_id(agent_id)
     kid = await signer.kid()
     algorithm = await signer.algorithm()
-    if algorithm not in {"Ed25519", "ES256"}:
-        raise ValueError("Only Ed25519 and ES256 are supported in v1")
+    if algorithm != "ES256":
+        raise ValueError("Only ES256 is supported in beta-v1")
 
     if isinstance(timestamp, datetime):
         message_time = timestamp.astimezone(timezone.utc)

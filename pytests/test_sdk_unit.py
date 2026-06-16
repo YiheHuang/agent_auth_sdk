@@ -13,13 +13,12 @@ from agent_auth_sdk import (
     AgentKey,
     InMemoryNonceStore,
     build_agent_id,
-    generate_ed25519_keypair,
     parse_agent_id,
     render_agent_metadata,
     select_verification_key,
 )
 from agent_auth_sdk.config import STRICT_PROFILE, TEST_PROFILE
-from agent_auth_sdk.crypto import LocalPemSigner, verify_signature
+from agent_auth_sdk.crypto import verify_signature
 from agent_auth_sdk.http_utils import build_canonical_request
 from agent_auth_sdk.signing import sign_http_request
 from agent_auth_sdk.vault_kms import (
@@ -43,6 +42,21 @@ def _generate_es256_pem_pair() -> tuple[str, str]:
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode("utf-8")
     return private_pem, public_pem
+
+
+class _TestEs256Signer:
+    def __init__(self, private_pem: str, kid: str = "vault:test") -> None:
+        self._private_key = serialization.load_pem_private_key(private_pem.encode("utf-8"), password=None)
+        self._kid = kid
+
+    async def kid(self) -> str:
+        return self._kid
+
+    async def algorithm(self) -> str:
+        return "ES256"
+
+    async def sign(self, data: bytes) -> bytes:
+        return self._private_key.sign(data, ec.ECDSA(hashes.SHA256()))
 
 
 class _FakeTransit:
@@ -102,9 +116,9 @@ def test_vault_kms_config_requires_required_fields() -> None:
 
 
 @pytest.mark.anyio
-async def test_sign_and_verify_public_key_material_ed25519() -> None:
-    pair = generate_ed25519_keypair(kid="main")
-    signer = LocalPemSigner(private_key_pem=pair.private_key_pem, kid_value="main")
+async def test_sign_and_verify_public_key_material_es256() -> None:
+    private_pem, public_pem = _generate_es256_pem_pair()
+    signer = _TestEs256Signer(private_pem, kid="vault:test")
     signed = await sign_http_request(
         method="POST",
         url="http://127.0.0.1:8010/invoke",
@@ -113,18 +127,18 @@ async def test_sign_and_verify_public_key_material_ed25519() -> None:
         signer=signer,
     )
     assert verify_signature(
-        public_key_pem=pair.public_key_pem,
+        public_key_pem=public_pem,
         public_key_base64url=None,
         data=signed.canonical.encode("utf-8"),
         signature_base64url=signed.headers["x-agent-signature"],
-        alg="Ed25519",
+        alg="ES256",
     )
 
 
 @pytest.mark.anyio
-async def test_sign_and_verify_public_key_material_es256() -> None:
+async def test_sign_and_verify_public_key_material_es256_base64url() -> None:
     private_pem, public_pem = _generate_es256_pem_pair()
-    signer = LocalPemSigner(private_key_pem=private_pem, kid_value="kms:test")
+    signer = _TestEs256Signer(private_pem, kid="vault:test")
     signed = await sign_http_request(
         method="POST",
         url="http://127.0.0.1:8010/invoke",
@@ -195,9 +209,9 @@ def test_agent_instance_from_signer_builds_metadata() -> None:
         name="publisher",
         organization="FDU",
         endpoint="https://192.144.228.237/invoke",
-        signer=LocalPemSigner(private_key_pem=private_pem, kid_value="kms:test"),
+        signer=_TestEs256Signer(private_pem, kid="vault:test"),
         public_key_pem=public_pem,
-        kid="kms:test",
+        kid="vault:test",
         capabilities=["publish", "sign", "verify"],
         environment="prod",
         alg="ES256",
@@ -205,7 +219,7 @@ def test_agent_instance_from_signer_builds_metadata() -> None:
     assert agent.agent_id == "agent://192.144.228.237/publisher"
     assert agent.metadata is not None
     assert agent.metadata.domain == "192.144.228.237"
-    assert agent.metadata.keys[0].kid == "kms:test"
+    assert agent.metadata.keys[0].kid == "vault:test"
     assert agent.metadata.keys[0].alg == "ES256"
 
 

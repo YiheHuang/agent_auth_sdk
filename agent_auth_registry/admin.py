@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import secrets
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 
 import typer
@@ -49,7 +50,7 @@ def list_developers(
     db_path: Path = typer.Option(None, help="registry sqlite 路径"),
 ) -> None:
     store = RegistryStore(db_path or load_registry_db_path())
-    payload = [record.__dict__ for record in store.list_developers()]
+    payload = [asdict(record) for record in store.list_developers()]
     typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
@@ -74,8 +75,8 @@ def inspect_agent(
     typer.echo(
         json.dumps(
             {
-                "ownership": ownership.__dict__ if ownership else None,
-                "entry": entry.__dict__ if entry else None,
+                "ownership": asdict(ownership) if ownership else None,
+                "entry": asdict(entry) if entry else None,
             },
             ensure_ascii=False,
             indent=2,

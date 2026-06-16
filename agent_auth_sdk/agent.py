@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 
-from .crypto import LocalPemSigner, public_key_to_base64url
+from .crypto import public_key_to_base64url
 from .identity import build_agent_id
 from .messaging import sign_agent_message
 from .models import AgentAuditConfig, AgentKey, AgentMetadata, SignedAgentMessage
@@ -32,35 +32,7 @@ class AgentInstance:
     environment: str | None = None
     metadata: AgentMetadata | None = None
     signer_override: object | None = None
-    kms_key_id: str | None = None
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        domain: str,
-        name: str,
-        organization: str,
-        endpoint: str,
-        capabilities: list[str] | None = None,
-        kid: str = "main",
-        environment: str | None = None,
-        private_key_pem: str | None = None,
-        public_key_pem: str | None = None,
-    ) -> "AgentInstance":
-        if not private_key_pem or not public_key_pem:
-            raise ValueError("Local key generation is removed. Use from_vault() or from_signer().")
-        return cls.from_signer(
-            domain=domain,
-            name=name,
-            organization=organization,
-            endpoint=endpoint,
-            signer=LocalPemSigner(private_key_pem=private_key_pem, kid_value=kid),
-            public_key_pem=public_key_pem,
-            kid=kid,
-            capabilities=capabilities,
-            environment=environment,
-        )
+    key_name: str | None = None
 
     @classmethod
     def from_vault(
@@ -103,43 +75,7 @@ class AgentInstance:
             capabilities=capabilities,
             environment=environment,
             alg="ES256",
-            kms_key_id=key_name,
-        )
-
-    @classmethod
-    def from_kms(
-        cls,
-        *,
-        domain: str,
-        name: str,
-        organization: str,
-        endpoint: str,
-        vault_addr: str,
-        vault_token: str,
-        transit_mount: str,
-        key_name: str,
-        namespace: str | None = None,
-        verify: bool | str = True,
-        capabilities: list[str] | None = None,
-        environment: str | None = None,
-        kid: str | None = None,
-    ) -> "AgentInstance":
-        """Deprecated compatibility alias; use from_vault()."""
-
-        return cls.from_vault(
-            domain=domain,
-            name=name,
-            organization=organization,
-            endpoint=endpoint,
-            vault_addr=vault_addr,
-            vault_token=vault_token,
-            transit_mount=transit_mount,
             key_name=key_name,
-            namespace=namespace,
-            verify=verify,
-            capabilities=capabilities,
-            environment=environment,
-            kid=kid,
         )
 
     @classmethod
@@ -155,8 +91,8 @@ class AgentInstance:
         kid: str,
         capabilities: list[str] | None = None,
         environment: str | None = None,
-        alg: str = "Ed25519",
-        kms_key_id: str | None = None,
+        alg: str = "ES256",
+        key_name: str | None = None,
     ) -> "AgentInstance":
         agent_id = build_agent_id(domain, name)
         metadata = render_agent_metadata(
@@ -193,7 +129,7 @@ class AgentInstance:
             environment=environment,
             metadata=metadata,
             signer_override=signer,
-            kms_key_id=kms_key_id,
+            key_name=key_name,
         )
 
     @property

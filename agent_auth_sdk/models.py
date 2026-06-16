@@ -1,4 +1,4 @@
-"""Pydantic 模型负责把协议结构稳定下来，并给 CLI / FastAPI 复用。"""
+"""Pydantic 模型负责把协议结构稳定下来，并给 SDK / Registry 复用。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ class AgentKey(BaseModel):
     """一把可供验签使用的公钥。"""
 
     kid: str
-    alg: Literal["Ed25519", "ES256"] = "Ed25519"
+    alg: Literal["ES256"] = "ES256"
     status: Literal["active", "inactive"] = "active"
     public_key_base64url: str | None = None
     public_key_pem: str | None = None
@@ -67,7 +67,7 @@ class SignedAgentMessage(BaseModel):
     version: str = "1.0"
     agent_id: str
     kid: str
-    alg: Literal["Ed25519", "ES256"] = "Ed25519"
+    alg: Literal["ES256"] = "ES256"
     timestamp: datetime
     nonce: str
     payload_type: str = "application/json"
@@ -138,16 +138,6 @@ class VerificationFailure:
     ok: Literal[False] = False
     code: str = ""
     reason: str = ""
-
-
-@dataclass(slots=True)
-class GeneratedKeyPair:
-    """CLI、测试和示例服务都依赖这份统一的密钥返回结构。"""
-
-    private_key_pem: str
-    public_key_pem: str
-    public_key_base64url: str
-    kid: str
 
 
 @dataclass(slots=True)

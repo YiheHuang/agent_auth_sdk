@@ -131,24 +131,6 @@ def validate_vault_key(config: VaultKmsConfig) -> VaultKmsKeyDescription:
     return description
 
 
-def create_vault_key_if_missing(config: VaultKmsConfig) -> bool:
-    client = _build_vault_client(config)
-    try:
-        VaultTransitPublicKeyResolver(config, client=client).describe()
-        return False
-    except Exception as exc:
-        if "unsupported" in str(exc).lower():
-            raise
-    client.secrets.transit.create_key(
-        name=config.key_name,
-        key_type="ecdsa-p256",
-        exportable=False,
-        allow_plaintext_backup=False,
-        mount_point=config.transit_mount,
-    )
-    return True
-
-
 def parse_vault_signature(signature: str) -> bytes:
     parts = signature.split(":", 2)
     if len(parts) != 3 or parts[0] != "vault":

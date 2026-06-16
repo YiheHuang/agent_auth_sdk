@@ -74,8 +74,8 @@ async def sign_registry_publish_request(
     normalized_headers = canonicalize_headers(None)
     kid = await signer.kid()
     algorithm = await signer.algorithm()
-    if algorithm not in {"Ed25519", "ES256"}:
-        raise ValueError("Only Ed25519 and ES256 are supported in v1")
+    if algorithm != "ES256":
+        raise ValueError("Only ES256 is supported in beta-v1")
     request_timestamp = timestamp or to_iso_z(utc_now())
     request_nonce = nonce or str(uuid4())
     canonical, body_digest = build_registry_publish_canonical(

@@ -29,6 +29,7 @@ classifiers = [
 dependencies = [
   "cryptography>=43.0.0",
   "fastapi>=0.115.0",
+  "hvac>=2.4.0",
   "httpx>=0.27.0",
   "pydantic>=2.8.0",
   "redis>=5.0.0",
@@ -44,6 +45,7 @@ dev = [
 [project.scripts]
 agent-auth-sdk = "agent_auth_sdk.cli:app"
 agent-auth-registry = "agent_auth_registry.run:main"
+agent-auth-registry-admin = "agent_auth_registry.admin:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agent_auth_sdk", "agent_auth_registry"]

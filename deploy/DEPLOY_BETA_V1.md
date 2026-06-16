@@ -1,164 +1,188 @@
-# Agent Identity SDK Beta v1.0 部署方案
+# Beta-v1 部署说明
 
-目标：在 CentOS 服务器 `192.144.228.237` 上部署一个中心 registry，使 SDK 可以真正完成：
+目标：在 CentOS 服务器 `192.144.228.237` 上部署安全版中心 registry，并让开发者使用自己的 HashiCorp Vault Transit 完成 Agent 签名。
 
-- 开发者发布 Agent metadata
-- 外部读取统一 `/.well-known/agent.json`
-- SDK 从中心仓库解析并验签
+## 1. 架构边界
 
-当前最小 beta 只部署一个服务：
+- `agent_auth_registry` 部署在你的服务器上，负责 developer 凭证、ownership 绑定、publish / rotate-key 验签与 `/.well-known/agent.json` 公开视图。
+- `agent_auth_sdk` 运行在开发者或 agent 所在环境，负责读取 Vault Transit 公钥、调用 Vault Transit 签名、发布 metadata、发起 HTTP / message 签名。
+- registry 不连接 Vault，不保存 Vault token，也不替开发者管理私钥。
+- 开发者必须自行安装、初始化、解封、授权并配置 Vault。
 
-- `registry`
-
-服务代码位置：
-
-- `agent_auth_registry/`
-
-## 一、对外接口
-
-- `GET http://192.144.228.237/.well-known/agent.json`
-- `POST http://192.144.228.237/registry/agents`
-
-## 二、服务器组件
-
-- CentOS 7/8/9
-- Python 3.11+
-- nginx
-- systemd
-
-## 三、安装依赖
-
-CentOS 8/9:
+## 2. 服务器准备
 
 ```bash
-sudo dnf install -y python3 python3-pip nginx git
-```
-
-CentOS 7:
-
-```bash
-sudo yum install -y python3 python3-pip nginx git
-```
-
-如果系统 Python 太旧，建议自行安装 Python 3.11 后再继续。
-
-## 四、部署目录
-
-```bash
+sudo yum update -y
+sudo yum install -y python3 python3-pip nginx
 sudo mkdir -p /opt/agent_auth_sdk
-sudo chown $USER:$USER /opt/agent_auth_sdk
-git clone <你的仓库地址> /opt/agent_auth_sdk
-cd /opt/agent_auth_sdk
+sudo chown -R $USER:$USER /opt/agent_auth_sdk
 ```
 
-## 五、安装项目
+上传项目后安装：
 
 ```bash
+cd /opt/agent_auth_sdk
 python3 -m venv .venv
 source .venv/bin/activate
-pip install --upgrade pip
+pip install -U pip
 pip install -e .[dev]
 pytest
 ```
 
-要求：
+## 3. Registry 环境变量
 
-- `pytest` 全部通过
-
-## 六、准备运行目录
+创建环境文件：
 
 ```bash
-mkdir -p runtime/registry/.well-known
-sudo mkdir -p /etc/agent-auth
+cp deploy/registry.env.example /opt/agent_auth_sdk/registry.env
 ```
 
-## 七、配置 registry
+推荐配置：
 
 ```bash
-sudo cp deploy/registry.env.example /etc/agent-auth/registry.env
-sudo vi /etc/agent-auth/registry.env
-```
-
-建议配置：
-
-```env
 AGENT_REGISTRY_HOST=127.0.0.1
 AGENT_REGISTRY_PORT=8008
+AGENT_REGISTRY_DB_PATH=/opt/agent_auth_sdk/runtime/registry/registry.sqlite3
 AGENT_REGISTRY_PATH=/opt/agent_auth_sdk/runtime/registry/.well-known/agent.json
-AGENT_REGISTRY_TOKEN=replace-with-strong-random-token
+AGENT_REGISTRY_ALLOWED_SKEW_SECONDS=300
 ```
 
-## 八、安装 systemd 服务
+## 4. systemd 与 Nginx
+
+把 `deploy/registry.service` 拷到 `/etc/systemd/system/agent-auth-registry.service`，确认路径后启动：
 
 ```bash
-sudo cp deploy/registry.service /etc/systemd/system/registry.service
 sudo systemctl daemon-reload
-sudo systemctl enable registry.service
-sudo systemctl start registry.service
-sudo systemctl status registry.service
+sudo systemctl enable agent-auth-registry
+sudo systemctl start agent-auth-registry
+sudo systemctl status agent-auth-registry
 ```
 
-## 九、安装 nginx
+把 `deploy/nginx.agent-auth.conf` 放到 `/etc/nginx/conf.d/agent-auth.conf`：
 
 ```bash
-sudo cp deploy/nginx.agent-auth.conf /etc/nginx/conf.d/agent-auth.conf
 sudo nginx -t
-sudo systemctl enable nginx
-sudo systemctl restart nginx
+sudo systemctl reload nginx
 ```
 
-## 十、验证
+目标效果：
 
-先验证 registry 内部服务：
+- `http://192.144.228.237/.well-known/agent.json` 对外可读
+- `http://192.144.228.237/registry/agents/publish` 可被 SDK 调用
+- `http://192.144.228.237/registry/agents/rotate-key` 可被 SDK 调用
+
+## 5. 初始化 Developer 凭证
 
 ```bash
-curl http://127.0.0.1:8008/healthz
-curl http://127.0.0.1:8008/.well-known/agent.json
+source /opt/agent_auth_sdk/.venv/bin/activate
+agent-auth-registry-admin create-developer --client-id developer-a
+agent-auth-registry-admin list-developers
 ```
 
-再验证公网入口：
+查看 agent owner：
 
 ```bash
-curl http://192.144.228.237/healthz
-curl http://192.144.228.237/.well-known/agent.json
+agent-auth-registry-admin inspect-agent --agent-id agent://demo.example.com/weather
 ```
 
-## 十一、开发者发布验证
+## 6. 开发者侧 Vault 前置条件
 
-开发者机器上执行：
+开发者侧需要准备：
+
+- Vault server
+- 已启用的 Transit secrets engine
+- `ecdsa-p256` Transit key
+- 可读取 key metadata 与执行 sign 的 Vault token
+
+本地演示：
 
 ```bash
-agent-auth-sdk keygen
-agent-auth-sdk render-metadata --host demo.example.com --agent-name weather --endpoint https://demo.example.com/invoke --public-key-pem-path runtime/keys/public_key.pem
-agent-auth-sdk publish-to-registry --metadata-path runtime/.well-known/agent.json --registry-url http://192.144.228.237/registry/agents --token <registry-token>
+vault server -dev -dev-root-token-id=root
+export VAULT_ADDR='http://127.0.0.1:8200'
+export VAULT_TOKEN='root'
+vault secrets enable transit
+vault write -f transit/keys/weather-agent type=ecdsa-p256
 ```
 
-然后在服务器上确认：
+最小 policy 示例：
+
+```hcl
+path "transit/keys/*" {
+  capabilities = ["read"]
+}
+
+path "transit/sign/*" {
+  capabilities = ["update"]
+}
+```
+
+## 7. 发布前自检
+
+检查 Vault key：
 
 ```bash
-curl http://192.144.228.237/.well-known/agent.json
+agent-auth-sdk validate-kms-key \
+  --vault-addr http://127.0.0.1:8200 \
+  --vault-token-env VAULT_TOKEN \
+  --transit-mount transit \
+  --key-name weather-agent
 ```
 
-再做解析验证：
+渲染 metadata：
 
 ```bash
-agent-auth-sdk inspect-metadata agent://demo.example.com/weather --registry-url http://192.144.228.237/.well-known/agent.json
+agent-auth-sdk render-metadata \
+  --host demo.example.com \
+  --agent-name weather \
+  --endpoint https://demo.example.com/invoke \
+  --vault-addr http://127.0.0.1:8200 \
+  --vault-token-env VAULT_TOKEN \
+  --transit-mount transit \
+  --key-name weather-agent
 ```
 
-## 十二、Beta v1.0 发布门槛
+发布到 registry：
 
-- `pytest` 通过
-- registry 服务可启动
-- `/.well-known/agent.json` 可读
-- `/registry/agents` 可写
-- 至少 1 个 Agent 成功发布
-- SDK 可从中心仓库解析该 Agent
+```bash
+export AGENT_AUTH_REGISTRY_API_KEY='your-registry-api-key'
+agent-auth-sdk publish-to-registry \
+  --metadata-path runtime/.well-known/agent.json \
+  --vault-addr http://127.0.0.1:8200 \
+  --vault-token-env VAULT_TOKEN \
+  --transit-mount transit \
+  --key-name weather-agent \
+  --registry-url http://192.144.228.237/registry/agents/publish \
+  --client-id developer-a
+```
 
-## 十三、当前 beta 边界
+## 8. 密钥轮换
 
-当前适合 beta，不建议称为正式生产版，原因：
+先由开发者在 Vault 中创建或准备新 key，然后走 registry 显式轮换：
 
-- registry 使用单 JSON 文件存储
-- 发布鉴权是 token 级别
-- 没有后台管理界面
-- 没有高可用与多副本
+```bash
+agent-auth-sdk rotate-key \
+  --registry-url http://192.144.228.237/registry/agents/rotate-key \
+  --agent-id agent://demo.example.com/weather \
+  --vault-addr http://127.0.0.1:8200 \
+  --vault-token-env VAULT_TOKEN \
+  --transit-mount transit \
+  --current-kms-key-id weather-agent-current \
+  --new-kms-key-id weather-agent-next \
+  --client-id developer-a
+```
+
+## 9. 验收标准
+
+- `curl http://192.144.228.237/.well-known/agent.json` 可返回文档
+- 至少 1 个 Agent 成功通过 Vault Transit 签名发布 metadata
+- registry 拒绝 owner 冲突、签名无效、过期 timestamp 和重放 nonce
+- `agent-auth-registry-admin inspect-agent` 能看到 ownership 绑定
+
+## 10. 备份建议
+
+registry 需要备份：
+
+- `/opt/agent_auth_sdk/runtime/registry/registry.sqlite3`
+- `/opt/agent_auth_sdk/runtime/registry/.well-known/agent.json`
+
+Vault 备份、解封密钥、高可用与审计由开发者自行负责。

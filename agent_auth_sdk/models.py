@@ -22,7 +22,7 @@ class AgentKey(BaseModel):
     """一把可供验签使用的公钥。"""
 
     kid: str
-    alg: Literal["Ed25519"] = "Ed25519"
+    alg: Literal["Ed25519", "ES256"] = "Ed25519"
     status: Literal["active", "inactive"] = "active"
     public_key_base64url: str | None = None
     public_key_pem: str | None = None
@@ -67,7 +67,7 @@ class SignedAgentMessage(BaseModel):
     version: str = "1.0"
     agent_id: str
     kid: str
-    alg: Literal["Ed25519"] = "Ed25519"
+    alg: Literal["Ed25519", "ES256"] = "Ed25519"
     timestamp: datetime
     nonce: str
     payload_type: str = "application/json"
@@ -158,4 +158,3 @@ class ParsedAgentId:
     host: str
     agent_name: str
     path_segments: tuple[str, ...] = field(default_factory=tuple)
-

@@ -105,6 +105,7 @@ async def verify_http_request(
         public_key_base64url=key.public_key_base64url,
         data=canonical.encode("utf-8"),
         signature_base64url=signature,
+        alg=key.alg,
     )
     if not verified:
         return _failure(VerificationErrorCode.SIGNATURE_INVALID, "Signature verification failed")

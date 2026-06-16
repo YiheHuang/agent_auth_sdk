@@ -63,8 +63,9 @@ async def sign_agent_message(
 ) -> SignedAgentMessage:
     parse_agent_id(agent_id)
     kid = await signer.kid()
-    if await signer.algorithm() != "Ed25519":
-        raise ValueError("Only Ed25519 is supported in v1")
+    algorithm = await signer.algorithm()
+    if algorithm not in {"Ed25519", "ES256"}:
+        raise ValueError("Only Ed25519 and ES256 are supported in v1")
 
     if isinstance(timestamp, datetime):
         message_time = timestamp.astimezone(timezone.utc)
@@ -91,6 +92,7 @@ async def sign_agent_message(
     return SignedAgentMessage(
         agent_id=agent_id,
         kid=kid,
+        alg=algorithm,
         timestamp=message_time,
         nonce=message_nonce,
         payload_type=payload_type,
@@ -167,6 +169,7 @@ async def verify_agent_message(
         public_key_base64url=key.public_key_base64url,
         data=canonical.encode("utf-8"),
         signature_base64url=parsed_message.signature,
+        alg=key.alg,
     )
     if not verified:
         return _failure(VerificationErrorCode.SIGNATURE_INVALID, "Signature verification failed")

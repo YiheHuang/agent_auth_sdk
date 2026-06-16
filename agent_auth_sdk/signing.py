@@ -34,8 +34,9 @@ async def sign_http_request(
     normalized_headers = canonicalize_headers(headers)
 
     kid = await signer.kid()
-    if await signer.algorithm() != "Ed25519":
-        raise ValueError("Only Ed25519 is supported in v1")
+    algorithm = await signer.algorithm()
+    if algorithm not in {"Ed25519", "ES256"}:
+        raise ValueError("Only Ed25519 and ES256 are supported in v1")
 
     request_timestamp = timestamp or to_iso_z(utc_now())
     request_nonce = nonce or str(uuid4())

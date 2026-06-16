@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Protocol
 
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
@@ -49,7 +50,7 @@ class CallableSigner(Signer):
 
 @dataclass(slots=True)
 class LocalPemSigner(Signer):
-    """本地 PEM 私钥签名器，用于开发、测试和简单部署。"""
+    """本地 PEM 私钥签名器，仅用于开发、测试或迁移。"""
 
     private_key_pem: str
     kid_value: str
@@ -59,15 +60,25 @@ class LocalPemSigner(Signer):
             self.private_key_pem.encode("utf-8"),
             password=None,
         )
+        if isinstance(self._private_key, Ed25519PrivateKey):
+            self._algorithm = "Ed25519"
+        elif isinstance(self._private_key, ec.EllipticCurvePrivateKey):
+            if not isinstance(self._private_key.curve, ec.SECP256R1):
+                raise ValueError("Only P-256 ECDSA keys are supported in PEM signer")
+            self._algorithm = "ES256"
+        else:
+            raise ValueError("Unsupported private key type")
 
     async def kid(self) -> str:
         return self.kid_value
 
     async def algorithm(self) -> str:
-        return "Ed25519"
+        return self._algorithm
 
     async def sign(self, data: bytes) -> bytes:
-        return self._private_key.sign(data)
+        if self._algorithm == "Ed25519":
+            return self._private_key.sign(data)
+        return self._private_key.sign(data, ec.ECDSA(hashes.SHA256()))
 
 
 def generate_ed25519_keypair(*, kid: str = "main") -> GeneratedKeyPair:
@@ -110,26 +121,33 @@ def verify_signature(
     public_key_base64url: str | None,
     data: bytes,
     signature_base64url: str,
+    alg: str = "Ed25519",
 ) -> bool:
     if public_key_pem:
         public_key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
     elif public_key_base64url:
-        public_key = Ed25519PublicKey.from_public_bytes(
-            _extract_raw_public_key(from_base64url(public_key_base64url)),
-        )
+        raw = from_base64url(public_key_base64url)
+        if alg == "Ed25519":
+            public_key = Ed25519PublicKey.from_public_bytes(_extract_raw_public_key(raw))
+        else:
+            public_key = serialization.load_der_public_key(raw)
     else:
         raise ValueError("public key is required")
 
     try:
-        public_key.verify(from_base64url(signature_base64url), data)
+        signature = from_base64url(signature_base64url)
+        if alg == "Ed25519":
+            public_key.verify(signature, data)
+        elif alg == "ES256":
+            public_key.verify(signature, data, ec.ECDSA(hashes.SHA256()))
+        else:
+            raise ValueError(f"Unsupported algorithm: {alg}")
         return True
     except Exception:
         return False
 
 
 def _extract_raw_public_key(der_or_raw: bytes) -> bytes:
-    # DER 编码的 SubjectPublicKeyInfo 固定以 12 字节前缀引导到 32 字节原始公钥。
     if len(der_or_raw) == 32:
         return der_or_raw
     return der_or_raw[-32:]
-

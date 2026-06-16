@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
+from .crypto import Signer
 from .models import AgentAuditConfig, AgentKey, AgentMetadata
+from .registry_security import sign_registry_publish_request
 
 
 def render_agent_metadata(
@@ -59,8 +62,9 @@ async def publish_to_registry(
     metadata: AgentMetadata,
     *,
     registry_url: str,
-    publisher: str | None = None,
-    token: str | None = None,
+    client_id: str,
+    api_key: str,
+    signer: Signer,
     http_client: httpx.AsyncClient | None = None,
     timeout_seconds: float = 10.0,
 ) -> dict:
@@ -69,11 +73,20 @@ async def publish_to_registry(
     payload = {
         "agent_id": metadata.agent_id,
         "metadata": metadata.model_dump(mode="json"),
-        "publisher": publisher,
+        "publish_intent": "upsert_metadata",
     }
-    headers: dict[str, str] = {}
-    if token:
-        headers["authorization"] = f"Bearer {token}"
+    parsed = urlparse(registry_url)
+    path = parsed.path or "/"
+    signed = await sign_registry_publish_request(
+        path=path,
+        host=parsed.netloc,
+        body=payload,
+        agent_id=metadata.agent_id,
+        client_id=client_id,
+        signer=signer,
+    )
+    headers = dict(signed.headers)
+    headers["authorization"] = f"Bearer {api_key}"
 
     if http_client is not None:
         response = await http_client.post(registry_url, json=payload, headers=headers, timeout=timeout_seconds)

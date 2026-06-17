@@ -43,9 +43,10 @@ else 拒绝
 end
 
 note over Dev, Callee
-当前版改进：Vault 托管私钥、SDK 自动管理 key、
-Registry 双重验证 + owner 绑定、rotate-key 安全轮换。
-详见 sdk-current-sequence.puml
+当前版改进：Vault 托管私钥、SDK 一站式管理 key、
+Registry 双重验证 + developer 注册 + owner 绑定、
+完整 Key 生命周期（add_key / rotate_key / revoke_key / revoke_agent）。
+详见 sdk-current-sequence.puml 和 sdk-key-lifecycle-sequence.puml
 end note
 
 @enduml

@@ -1,5 +1,5 @@
 @startuml
-title 当前 SDK：Agent 身份发布、签名与验签
+title 当前 SDK：Developer 注册、Agent 发布、签名与验签
 
 skinparam shadowing false
 skinparam sequenceMessageAlign center
@@ -13,42 +13,69 @@ skinparam responseMessageBelowArrow true
 autonumber
 
 actor "开发者" as Dev
+participant "Admin CLI" as Admin
 participant "SDK" as SDK
 participant "Vault" as Vault
 participant "Registry" as Registry
 participant "Agent\n调用方" as Caller
 participant "Agent\n被调用方" as Callee
 
+== Developer 注册（一次性） ==
+
+Dev -> Admin : create-developer --client-id <id>
+Admin -> Registry : 存储 developer + API key hash
+Registry --> Admin : developer_id + api_key
+Admin --> Dev : 交付 client_id + api_key
+
+note over Dev, Registry
+开发者凭 client_id + api_key 认证所有 publish / key 管理操作。
+end note
+
 == Agent 身份发布 ==
 
-Dev -> SDK : from_vault(auto_create_key=True)
+Dev -> SDK : from_vault(domain, name, …, auto_create_key=True)
 SDK -> Vault : 确保 ecdsa-p256 key 存在\n(不存在则自动创建)
 Vault --> SDK : public_key
+SDK -> SDK : 构建 AgentInstance\n(含 metadata + signer)
+
+Dev -> SDK : publish(registry_url, client_id, api_key)
 SDK -> Vault : 签名 publish 请求
-Vault --> SDK : x-agent-* headers
-SDK -> Registry : POST /registry/agents/publish\nAPI key + Agent 签名
+Vault --> SDK : signature
+SDK -> Registry : POST /registry/agents/publish\nBearer api_key + x-agent-* headers
+Registry -> Registry : 校验 developer + Agent 签名\n+ agent_id 合法性
 Registry --> SDK : 发布成功，建立 owner 绑定
-SDK --> Dev : AgentInstance
+SDK --> Dev : ok
 
 note over SDK, Registry
-SDK 一站式管理 Vault key 生命周期。
-Registry 双重验证（developer + Agent 签名）并记录 owner。
+首次 publish 建立 agent_id → developer_id 绑定，
+后续同一 agent 仅 owner 可更新。
 end note
 
 == 跨 Agent 调用 ==
 
-Caller -> Vault : 签名 HTTP 请求
-Vault --> Caller : x-agent-* headers
+Caller -> SDK : sign_http(method, url, body)
+SDK -> Vault : 签名 canonical string
+Vault --> SDK : signature
+SDK --> Caller : x-agent-* headers
+
 Caller -> Callee : HTTP 请求 + 签名 headers
 
-Callee -> Registry : 查询调用方 metadata
-Registry --> Callee : AgentMetadata + public_key
-Callee -> Callee : 验签（timestamp / nonce / signature）
+Callee -> SDK : verify_http_request(method, url, headers, body)
+SDK -> Registry : resolve_agent(agent_id)
+Registry --> SDK : AgentMetadata + public_key
+SDK -> SDK : 校验 timestamp / nonce / signature
 
 alt 验签通过
+    SDK --> Callee : ok + agent_id + metadata
     Callee --> Caller : 处理业务
 else 验签失败
-    Callee --> Caller : 拒绝（SIGNATURE_INVALID / NONCE_REPLAYED / ...）
+    SDK --> Callee : code + reason
+    Callee --> Caller : 拒绝
 end
+
+note over Caller, Callee
+完整 Key 生命周期（add_key / rotate_key / revoke_key / revoke_agent）
+见 sdk-key-lifecycle-sequence.puml。
+end note
 
 @enduml

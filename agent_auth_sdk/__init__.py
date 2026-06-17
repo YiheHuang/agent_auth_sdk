@@ -2,7 +2,7 @@
 
 提供 6 个核心接口：
 
-1. 创建 Agent Metadata — AgentInstance.from_vault() / AgentInstance.from_signer()
+1. 创建 Agent Metadata — AgentInstance.from_vault()
 2. 发布 Agent 到 Registry — AgentInstance.publish()
 3. 签名消息        — AgentInstance.sign_http() / AgentInstance.sign_message()
 4. 验签            — verify_http_request() / verify_agent_message()

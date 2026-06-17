@@ -1,83 +1,54 @@
 @startuml
-title 当前 SDK：开发者注册、Agent 发布、签名、验签抽象流程
+title 当前 SDK：Agent 身份发布、签名与验签
 
 skinparam shadowing false
 skinparam sequenceMessageAlign center
 skinparam responseMessageBelowArrow true
 
 <style>
-  participant {
-    Padding 28
-  }
-  box {
-    Padding 10
-  }
+  participant { Padding 28 }
+  box { Padding 10 }
 </style>
 
 autonumber
 
 actor "开发者" as Dev
-participant "Vault\n(Transit)" as Vault
+participant "SDK" as SDK
+participant "Vault" as Vault
 participant "Registry" as Registry
-participant "Agent 调用者" as Caller
-participant "被调用 Agent" as Callee
-
-== 开发者身份注册 ==
-
-Dev -> Registry : 注册开发者身份\nclient_id + api_key
-Registry -> Registry : PBKDF2-HMAC-SHA256\n哈希存储 api_key
-Registry --> Dev : 返回注册结果\n建立 developer 身份
-
-note over Dev,Registry
-开发者身份只代表发布资格，
-不代表已经持有某个 Agent 的私钥。
-end note
+participant "Agent\n调用方" as Caller
+participant "Agent\n被调用方" as Callee
 
 == Agent 身份发布 ==
 
-Dev -> Vault : 创建 / 选择 Agent 私钥\nvault write transit/keys/{name} type=ecdsa-p256
-Vault --> Dev : 返回 key_name / public_key
-note right
-私钥不可导出，
-始终由 Vault 托管。
+Dev -> SDK : from_vault(auto_create_key=True)
+SDK -> Vault : 确保 ecdsa-p256 key 存在\n(不存在则自动创建)
+Vault --> SDK : public_key
+SDK -> Vault : 签名 publish 请求
+Vault --> SDK : x-agent-* headers
+SDK -> Registry : POST /registry/agents/publish\nAPI key + Agent 签名
+Registry --> SDK : 发布成功，建立 owner 绑定
+SDK --> Dev : AgentInstance
+
+note over SDK, Registry
+SDK 一站式管理 Vault key 生命周期。
+Registry 双重验证（developer + Agent 签名）并记录 owner。
 end note
 
-Dev -> Vault : SDK 调用 sign_registry_publish_request\n对 publish canonical string 签名
-Vault --> Dev : 返回 Agent 签名\nx-agent-* headers
+== 跨 Agent 调用 ==
 
-Dev -> Registry : POST /registry/agents/publish\nAuthorization: Bearer {api_key}\nmetadata + Agent 签名 headers
-Registry -> Registry : 校验 developer API key
-Registry -> Registry : 使用 metadata 中的 public_key\n验证 Agent 发布签名
-Registry -> Registry : 首次发布绑定\na gent_id -> developer_id owner
-Registry --> Dev : 发布成功\nAgent 身份进入 registry
+Caller -> Vault : 签名 HTTP 请求
+Vault --> Caller : x-agent-* headers
+Caller -> Callee : HTTP 请求 + 签名 headers
 
-note over Vault,Registry
-核心安全保证：
-1. Agent 发布需私钥控制权证明（签名）
-2. 私钥不落在开发者本地，由 Vault 管理
-3. Registry 记录 owner 绑定，防止他人覆盖同一 agent_id
-4. 普通 publish 禁止替换 keys，必须走 rotate-key
-end note
-
-== 调用签名 ==
-
-Caller -> Vault : SDK 调用 sign_http_request\n对 HTTP canonical request 签名
-Vault --> Caller : 返回签名结果\nx-agent-id / x-agent-kid /\nx-agent-timestamp / x-agent-nonce /\nx-agent-signature / x-agent-signature-input
-
-Caller -> Callee : 发起请求\nbody + 签名 headers
-
-== 被调用方验签 ==
-
-Callee -> Registry : resolve_agent(agent_id)\n查询调用方 Agent metadata
-Registry --> Callee : 返回 AgentMetadata\n含 active public_key
-
-Callee -> Callee : 1. 解析 x-agent-* headers\n2. 校验 timestamp 在允许偏移内\n3. 校验 nonce 未重放\n4. 重建 canonical request\n5. 使用 public_key 验证签名
+Callee -> Registry : 查询调用方 metadata
+Registry --> Callee : AgentMetadata + public_key
+Callee -> Callee : 验签（timestamp / nonce / signature）
 
 alt 验签通过
-    Callee -> Callee : 记录 nonce 防重放
-    Callee --> Caller : 接受请求并处理业务
+    Callee --> Caller : 处理业务
 else 验签失败
-    Callee --> Caller : 拒绝请求（VerificationFailure）\nSIGNATURE_INVALID / METADATA_FETCH_FAILED /\nKEY_NOT_FOUND / TIMESTAMP_EXPIRED /\nNONCE_REPLAYED / POLICY_REJECTED
+    Callee --> Caller : 拒绝（SIGNATURE_INVALID / NONCE_REPLAYED / ...）
 end
 
 @enduml

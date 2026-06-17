@@ -177,7 +177,7 @@ class AgentInstance:
         registry_url: str,
         client_id: str,
         api_key: str,
-        # 方式 A（兼容 HSM / 云 KMS）: 预创建的 signer
+        # 方式 A（兼容）: 预创建的 signer（new_signer + new_public_key_pem + new_kid）
         new_signer: object | None = None,
         new_public_key_pem: str | None = None,
         new_kid: str | None = None,

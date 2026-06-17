@@ -37,38 +37,9 @@
 3. 创建 `VaultTransitSigner`，连接 Vault 服务
 4. 调用 `signer.validate_access()` 校验签名权限
 5. 调用 `resolve_vault_public_key()` 从 Transit 获取 ECDSA-P256 公钥
-6. 调用 `from_signer()` 完成 AgentInstance 构造（见下文）
+6. 完成 AgentInstance 构造并返回
 
 > **Vault 权限要求**：`auto_create_key=True` 时，Vault token 需要对 `transit/keys/*` 有 `create` 或 `update` 权限。详见 [VAULT_SETUP.md](VAULT_SETUP.md)。
-> **Vault 权限要求**：`auto_create_key=True` 时，Vault token 需要对 `transit/keys/*` 有 `create` 或 `update` 权限。详见 [VAULT_SETUP.md](VAULT_SETUP.md)。
-
----
-
-### `AgentInstance.from_signer()`
-
-**用途**：使用自定义 Signer 创建 Agent 实例，适用于 HSM、云 KMS 或测试场景。
-
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `domain` | `str` | 是 | Agent 所属域名 |
-| `name` | `str` | 是 | Agent 名称 |
-| `organization` | `str` | 是 | 组织名 |
-| `endpoint` | `str` | 是 | Agent 服务入口 URL |
-| `signer` | `object` | 是 | 实现 `Signer` 协议的签名器 |
-| `public_key_pem` | `str` | 是 | 对应公钥（PEM 格式） |
-| `kid` | `str` | 是 | Key ID，用于验签时匹配 |
-| `capabilities` | `list[str]` | 否 | Agent 能力声明 |
-| `environment` | `str` | 否 | 运行环境标识 |
-| `alg` | `str` | 否 | 签名算法，默认 `"ES256"` |
-| `key_name` | `str` | 否 | 密钥名，用于内部追踪 |
-
-**返回值**：`AgentInstance` 对象。
-
-**内部逻辑**：
-1. 调用 `build_agent_id(domain, name)` 构造 `agent://{domain}/{name}` 格式的 agent_id
-2. 调用 `public_key_to_base64url(public_key_pem)` 派生公钥的 base64url 编码
-3. 调用 `render_agent_metadata(...)` 构造 `AgentMetadata` Pydantic 模型，包含 identity、endpoint、capabilities、keys（含公钥）、签名/验签策略和审计配置
-4. 返回包含完整 metadata 和 signer 的 `AgentInstance`
 
 ---
 
@@ -280,32 +251,21 @@
 | `registry_url` | `str` | 是 | Registry 轮换端点 URL |
 | `client_id` | `str` | 是 | Developer client ID |
 | `api_key` | `str` | 是 | Developer API key |
-| **方式 A（HSM / 云 KMS / 预创建 signer）** | | | |
-| `new_signer` | `object` | 见下 | 新 key 的签名器（实现 `Signer` 协议） |
-| `new_public_key_pem` | `str` | 见下 | 新公钥（PEM 格式） |
-| `new_kid` | `str` | 见下 | 新 key 的 Key ID |
-| **方式 B（Vault 托管，SDK 自动创建）** | | | |
-| `new_key_name` | `str` | 见下 | 新 key 在 Vault Transit 中的名称，SDK 自动创建 ecdsa-p256 key |
+| `new_key_name` | `str` | 是 | 新 key 在 Vault Transit 中的名称，SDK 自动创建 ecdsa-p256 key、读取公钥、构造 signer |
 | `http_client` | `httpx.AsyncClient` | 否 | 复用的 HTTP 客户端 |
 | `timeout_seconds` | `float` | 否 | 请求超时，默认 10.0 |
-
-> **必填规则**：方式 A（兼容 HSM/云 KMS）需同时提供 `new_signer`、`new_public_key_pem`、`new_kid`；方式 B（Vault 托管）只需提供 `new_key_name`。两者必须选其一。
 
 **返回值**：`dict` — Registry 返回的 JSON 响应体。
 
 **内部逻辑**：
 
-_方式 A（预创建 signer）_：
-1. 使用传入的 `new_signer`、`new_public_key_pem`、`new_kid` 直接构造 `AgentKey`
-2. 进入步骤 3
+_SDK 自动创建新 key_：
+1. 从当前 signer 的 Vault 配置中复制连接参数
+2. 调用 `_ensure_transit_key(new_config)` 自动创建 ecdsa-p256 key
+3. 调用 `resolve_vault_public_key(new_config)` 读取公钥
+4. 构造新 `VaultTransitSigner` 和 `new_kid`
 
-_方式 B（Vault 自动创建，`new_key_name` 有值）_：
-1. 从当前 signer 的 Vault 配置中复制连接参数（`vault_addr`、`transit_mount`、token 等）
-2. 调用 `_ensure_transit_key(new_config)` 在 Vault Transit 中自动创建 `ecdsa-p256` 类型新 key
-3. 调用 `resolve_vault_public_key(new_config)` 读取新 key 公钥
-4. 构造新 `VaultTransitSigner` 和 `new_kid = "vault:{transit_mount}/{new_key_name}"`
-
-_共用流程_：
+_双签名 + 提交_：
 1. 构造新的 `AgentKey(new_kid, "ES256", new_public_key_pem, status="active")`
 2. 调用 `sign_registry_new_key_proof(agent_id, new_key, client_id, host, signer=new_signer)` 生成新 key 的 proof 签名——proof 的 canonical string 绑定 `agent_id`、`new_key.kid`、新公钥指纹、timestamp、nonce、`client_id` 和 `host`，由新 signer 签名证明私钥可控
 3. 构造轮换 payload：`{"agent_id", "new_key", "new_key_proof_headers"}`

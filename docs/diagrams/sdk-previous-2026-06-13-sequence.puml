@@ -1,63 +1,50 @@
 @startuml
-title 2026-06-13 版本 SDK：Agent 发布、签名、验签抽象流程
+title 旧版 SDK（Vault 引入前）：Agent 发布与验签
 
 skinparam shadowing false
 skinparam sequenceMessageAlign center
 skinparam responseMessageBelowArrow true
 
 <style>
-  participant {
-    Padding 28
-  }
-  box {
-    Padding 10
-  }
+  participant { Padding 28 }
+  box { Padding 10 }
 </style>
 
 autonumber
 
 actor "开发者" as Dev
 participant "Registry" as Registry
-participant "Agent 调用者" as Caller
-participant "被调用 Agent" as Callee
+participant "Agent\n调用方" as Caller
+participant "Agent\n被调用方" as Callee
 
-== Agent 身份注册 / 发布 ==
+== Agent 发布 ==
 
-Dev -> Dev : 本地生成 Agent keypair\n(private_key.pem + public_key.pem)
-Dev -> Registry : 注册 / 发布 Agent 身份\nagent_id + metadata + public_key
-Registry -> Registry : 写入或覆盖 Agent metadata
-Registry --> Dev : 发布成功\nAgent 身份进入 registry
+Dev -> Dev : 本地生成 keypair
+Dev -> Registry : 发布 agent_id + metadata + public_key
+Registry --> Dev : 写入成功
 
-note over Dev,Registry
-旧版发布流程特征：
-1. Registry 主要接收 metadata，不验证发布请求
-   是否由 Agent 私钥签名
-2. 不建立 developer -> agent_id 的 owner 绑定
-3. 私钥由开发者本地文件或进程内管理
-4. 无 publish 签名证明 => 无密钥轮换双签名机制
+note over Dev, Registry
+无签名验证、无 owner 绑定、无私钥托管。
 end note
 
-== 调用签名 ==
+== 签名与验签 ==
 
-Caller -> Caller : 使用本地私钥对\ncanonical request 签名
-Caller -> Callee : 发起请求\nbody + 签名 headers
+Caller -> Caller : 本地私钥签名
+Caller -> Callee : HTTP 请求 + 签名 headers
 
-== 被调用方验签 ==
+Callee -> Registry : 查询 metadata
+Registry --> Callee : public_key
+Callee -> Callee : 验签
 
-Callee -> Registry : 查询调用方 Agent 身份\nagent_id / kid
-Registry --> Callee : 返回 metadata 与 public_key
-Callee -> Callee : 校验 timestamp / nonce / body digest
-Callee -> Callee : 使用 public_key 验证签名
-
-alt 验签通过
-    Callee --> Caller : 接受请求并处理业务
-else 验签失败
-    Callee --> Caller : 拒绝请求\n签名无效 / 未注册 / 重放 / key 不匹配
+alt 通过
+    Callee --> Caller : 处理
+else 拒绝
+    Callee --> Caller : 签名无效
 end
 
-note over Dev,Caller
-旧版私钥由本地文件或进程内对象管理；
-当前版则改为 Vault 托管私钥并执行签名。
+note over Dev, Callee
+当前版改进：Vault 托管私钥、SDK 自动管理 key、
+Registry 双重验证 + owner 绑定、rotate-key 安全轮换。
 详见 sdk-current-sequence.puml
 end note
 

@@ -68,7 +68,7 @@ SDK 对开发者暴露 6 个接口类别，对应以下入口：
 
 | # | 接口 | 入口 | 说明 |
 |---|------|------|------|
-| 1 | 创建 Agent Metadata | `AgentInstance.from_vault()` / `AgentInstance.from_signer()` | 从 Vault KMS 或自定义签名器创建 Agent 身份 |
+| 1 | 创建 Agent Metadata | `AgentInstance.from_vault()` | 从 Vault KMS 创建 Agent 身份 |
 | 2 | 发布到 Registry | `AgentInstance.publish()` | 将 metadata 发布到中心 Registry，含双重签名认证 |
 | 3 | 签名消息 | `AgentInstance.sign_http()` / `AgentInstance.sign_message()` | HTTP 请求签名 / 规范消息签名 |
 | 4 | 验签 | `verify_http_request()` / `verify_agent_message()` | HTTP 请求验签 / 消息验签（含 nonce 防重放） |

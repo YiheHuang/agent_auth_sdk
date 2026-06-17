@@ -161,9 +161,9 @@ Registry 对外暴露的 `/.well-known/agent.json` 顶层结构。
 | 字段 | JSON 类型 | 必填 | 说明 |
 |------|----------|------|------|
 | `keys` | `array[AgentKey]` | 是 | 公钥列表，至少包含一把 `active` 状态的 key。详见第四节 |
-| `revoked_kids` | `array[string]` | 是 | 已撤销的 key ID 列表。验签时若 `kid` 在此列表中直接拒绝（即使 key 列表中还有该 kid 的记录） |
+| `revoked_kids` | `array[string]` | 是 | 已撤销的 key ID 列表。验签时若 `kid` 在此列表中直接拒绝（即使 key 列表中还有该 kid 的记录）。通过 `revoke_key` 端点添加 |
 
-> `keys` 可以包含多把 key（例如轮换后新旧 key 共存），但同一时刻只有一把 `status: "active"` 的 key 用于签名。其他 key 应为 `"inactive"`。
+> `keys` 可以包含多把 key（例如轮换后新旧 key 共存，或多地域部署场景下多把 active key 并存）。仅 `"active"` 状态的 key 可用于签名和验签；`"inactive"` 表示正常轮换退役；`"revoked"` 表示因泄露等原因被显式撤销。
 
 ### 3.4 策略字段
 
@@ -205,13 +205,18 @@ Registry 对外暴露的 `/.well-known/agent.json` 顶层结构。
 |------|----------|------|------|
 | `kid` | `string` | 是 | Key ID，在 metadata 中唯一标识一把 key。Vault 托管时格式为 `"vault:{transit_mount}/{key_name}"`。验签时根据请求中的 `x-agent-kid` header 匹配 |
 | `alg` | `string` | 是 | 签名算法。当前仅支持 `"ES256"`（ECDSA P-256 + SHA-256） |
-| `status` | `string` | 是 | Key 状态。`"active"` — 当前用于签名和验签；`"inactive"` — 轮换后的旧 key，仅用于验签过渡期，不用于新签名 |
+| `status` | `string` | 是 | Key 状态。`"active"` — 当前用于签名和验签；`"inactive"` — 轮换后的旧 key，仅用于验签过渡期；`"revoked"` — 已显式撤销，验签时与 `revoked_kids` 双重拒绝 |
 | `public_key_base64url` | `string` \| `null` | 条件必填 | 公钥的 DER 编码再 base64url 编码。与 `public_key_pem` 至少提供一个 |
 | `public_key_pem` | `string` \| `null` | 条件必填 | 公钥的 PEM 格式。与 `public_key_base64url` 至少提供一个 |
 | `not_before` | `string` \| `null` | 否 | 密钥生效时间（ISO 8601），在此时间之前 key 不可用于验签。`null` 表示立即生效 |
 | `not_after` | `string` \| `null` | 否 | 密钥过期时间（ISO 8601），在此时间之后 key 不可用于验签。`null` 表示永不过期 |
 
-> **密钥轮换后的状态**：轮换时 Registry 将旧 active key 的 `status` 改为 `"inactive"`，新增 `status: "active"` 的新 key。验签时 `select_verification_key()` 只匹配 `status == "active"` 的 key。
+> **密钥生命周期**：
+> - `rotate_key`：旧 active key → `inactive`，新增 `active` key
+> - `add_key`：追加 `active` key，不修改已有 key 状态
+> - `revoke_key`：对应 key 的 `status` → `"revoked"`，同时 kid 加入 `revoked_kids` 列表
+> 
+> 验签时 `select_verification_key()` 只匹配 `status == "active"` 且不在 `revoked_kids` 中的 key。
 
 ---
 
@@ -335,10 +340,22 @@ Registry 对外暴露的 `/.well-known/agent.json` 顶层结构。
 
 ### 生成流程
 
-1. Agent 通过 SDK 调用 `AgentInstance.publish()` → `publish_to_registry()` → `sign_registry_publish_request()` 签名后 POST 到 Registry
-2. Registry `app.py` 的 `publish_agent()` 端点**双重验证**：
+Registry 提供以下写操作端点，均由 SDK 对应方法驱动：
+
+| 端点 | SDK 方法 | 签名要求 | 效果 |
+|------|---------|---------|------|
+| `POST /registry/agents/publish` | `AgentInstance.publish()` | 单签名（active key） | 首次发布建立 owner 绑定；后续更新 metadata（不可变字段除外） |
+| `POST /registry/agents/rotate-key` | `AgentInstance.rotate_key()` | 双重签名（旧 key + 新 key proof） | 旧 active key → inactive，新增 active key |
+| `POST /registry/agents/add-key` | `AgentInstance.add_key()` | 双重签名（旧 key + 新 key proof，域名分离） | 追加 active key，已有 key 状态不变 |
+| `POST /registry/agents/revoke-key` | `AgentInstance.revoke_key()` | 单签名（active key） | 指定 kid 加入 `revoked_kids`，key status → `"revoked"` |
+| `POST /registry/agents/revoke` | `AgentInstance.revoke_agent()` | 单签名（active key） | Agent ownership → `"revoked"`，从公开文档移除，所有操作拒绝 |
+
+**通用流程**：
+1. Agent 通过 SDK 调用对应方法 → 构造签名（单签名或双重签名）→ POST 到 Registry
+2. Registry 端点**验证**：
    - 校验 `Authorization: Bearer {api_key}` 中的 developer API key
-   - 使用 metadata 中的公钥验证 Agent 签名（`verify_registry_publish_signature`）
+   - 使用 metadata 中的公钥验证 Agent 签名
+   - 额外校验（nonce 防重放、timestamp 新鲜度、ownership 归属、防锁死检查）
 3. 首次 publish 建立 `agent_id → developer_id` owner 绑定
 4. `RegistryStore.upsert_agent()` 写入 SQLite（`agent_ownership` + `agent_registry_entries` 表）
 5. `RegistryStore.write_public_document()` 调用 `render_public_document()`，从数据库读取所有条目、反序列化 metadata、构造 `AgentRegistryDocument`、写入 JSON 文件

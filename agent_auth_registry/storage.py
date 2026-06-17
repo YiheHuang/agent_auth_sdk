@@ -132,6 +132,15 @@ class RegistryStore:
                 (_now_iso(), client_id),
             )
 
+    def revoke_agent(self, *, agent_id: str) -> None:
+        """将 agent ownership 标记为 revoked，并从公开文档中移除。"""
+        now = _now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE agent_ownership SET status = 'revoked', updated_at = ? WHERE agent_id = ?",
+                (now, agent_id),
+            )
+
     def update_developer_api_key_hash(self, *, client_id: str, api_key_hash: str) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -266,9 +275,11 @@ class RegistryStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT agent_id, metadata_json, published_at
-                FROM agent_registry_entries
-                ORDER BY agent_id ASC
+                SELECT e.agent_id, e.metadata_json, e.published_at
+                FROM agent_registry_entries e
+                JOIN agent_ownership o ON e.agent_id = o.agent_id
+                WHERE o.status = 'active'
+                ORDER BY e.agent_id ASC
                 """,
             ).fetchall()
         agents = [

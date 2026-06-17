@@ -12,7 +12,7 @@ import typer
 
 from agent_auth_sdk.registry_security import hash_api_key
 
-from .app import load_registry_db_path
+from .app import load_registry_db_path, load_registry_public_path
 from .storage import RegistryStore
 
 
@@ -62,6 +62,18 @@ def revoke_developer(
     store = RegistryStore(db_path or load_registry_db_path())
     store.revoke_developer(client_id=client_id)
     typer.echo(json.dumps({"ok": True, "client_id": client_id}, ensure_ascii=False, indent=2))
+
+
+@app.command("revoke-agent")
+def revoke_agent(
+    agent_id: str = typer.Option(..., help="要撤销的 agent_id"),
+    db_path: Path = typer.Option(None, help="registry sqlite 路径"),
+) -> None:
+    """撤销 Agent，将其从公开文档移除，并拒绝后续所有操作。"""
+    store = RegistryStore(db_path or load_registry_db_path())
+    store.revoke_agent(agent_id=agent_id)
+    store.write_public_document(load_registry_public_path())
+    typer.echo(json.dumps({"ok": True, "agent_id": agent_id}, ensure_ascii=False, indent=2))
 
 
 @app.command("inspect-agent")

@@ -26,7 +26,12 @@ from agent_auth_sdk.models import AgentKey, AgentMetadata
 from agent_auth_sdk.publish import render_agent_metadata
 from agent_auth_sdk.signing import sign_http_request
 from agent_auth_sdk.config import MetadataResolverConfig, STRICT_PROFILE, TEST_PROFILE
-from agent_auth_sdk.registry_security import hash_api_key, sign_registry_publish_request
+from agent_auth_sdk.registry_security import (
+    hash_api_key,
+    sign_registry_add_key_proof,
+    sign_registry_new_key_proof,
+    sign_registry_publish_request,
+)
 from agent_auth_sdk.vault_kms import VaultKmsConfig, resolve_vault_public_key
 
 
@@ -664,3 +669,536 @@ async def test_real_vault_publish_and_resolve_from_registry(registry_env) -> Non
         assert resolved.metadata.agent_id == agent.agent_id
         assert resolved.metadata.keys[0].alg == "ES256"
         assert resolved.metadata.keys[0].public_key_pem == key_info.public_key_pem
+
+
+# ── add_key 集成测试 ───────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_add_key_succeeds_and_both_keys_active(registry_env) -> None:
+    """add_key 成功后两个 key 同时保持 active。"""
+    db_path, _ = registry_env
+    seed_developer(db_path)
+    current_private_pem, current_public_pem = _generate_es256_pem_pair()
+    new_private_pem, new_public_pem = _generate_es256_pem_pair()
+    agent = AgentInstance.from_signer(
+        domain="192.144.228.237",
+        name="publisher",
+        organization="FDU",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish"],
+        environment="prod",
+        signer=_TestEs256Signer(current_private_pem, kid="vault:main"),
+        public_key_pem=current_public_pem,
+        kid="vault:main",
+        alg="ES256",
+    )
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        await agent.publish(
+            registry_url="http://registry.local/registry/agents/publish",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            http_client=client,
+        )
+        result = await agent.add_key(
+            registry_url="http://registry.local/registry/agents/add-key",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            new_signer=_TestEs256Signer(new_private_pem, kid="vault:extra"),
+            new_public_key_pem=new_public_pem,
+            new_kid="vault:extra",
+            http_client=client,
+        )
+        assert result["ok"] is True
+        assert result["added_kid"] == "vault:extra"
+
+        store = RegistryStore(db_path)
+        entry = store.get_registry_entry(agent.agent_id)
+        assert entry is not None
+        metadata = AgentMetadata.model_validate_json(entry.metadata_json)
+        assert any(key.kid == "vault:main" and key.status == "active" for key in metadata.keys)
+        assert any(key.kid == "vault:extra" and key.status == "active" for key in metadata.keys)
+
+
+@pytest.mark.anyio
+async def test_add_key_rejects_wrong_owner(registry_env) -> None:
+    """非 owner 的 developer 无法 add_key。"""
+    db_path, _ = registry_env
+    seed_developer(db_path, developer_id="dev-1", client_id="developer-a", api_key="secret-a")
+    seed_developer(db_path, developer_id="dev-2", client_id="developer-b", api_key="secret-b")
+    current_private_pem, current_public_pem = _generate_es256_pem_pair()
+    new_private_pem, new_public_pem = _generate_es256_pem_pair()
+    agent = AgentInstance.from_signer(
+        domain="192.144.228.237",
+        name="publisher",
+        organization="FDU",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish"],
+        environment="prod",
+        signer=_TestEs256Signer(current_private_pem, kid="vault:main"),
+        public_key_pem=current_public_pem,
+        kid="vault:main",
+        alg="ES256",
+    )
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        await agent.publish(
+            registry_url="http://registry.local/registry/agents/publish",
+            client_id="developer-a",
+            api_key="secret-a",
+            http_client=client,
+        )
+        new_key = AgentKey(kid="vault:extra", alg="ES256", public_key_pem=new_public_pem)
+        proof = await sign_registry_add_key_proof(
+            agent_id=agent.agent_id,
+            new_key=new_key,
+            client_id="developer-b",
+            host="registry.local",
+            signer=_TestEs256Signer(new_private_pem, kid="vault:extra"),
+        )
+        payload = {
+            "agent_id": agent.agent_id,
+            "new_key": new_key.model_dump(mode="json"),
+            "new_key_proof_headers": proof.headers,
+        }
+        signed = await sign_registry_publish_request(
+            path="/registry/agents/add-key",
+            host="registry.local",
+            body=payload,
+            agent_id=agent.agent_id,
+            client_id="developer-b",
+            signer=agent.signer,
+        )
+        response = await client.post(
+            "http://registry.local/registry/agents/add-key",
+            json=payload,
+            headers={"authorization": "Bearer secret-b", **signed.headers},
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"] == "OWNER_MISMATCH"
+
+
+@pytest.mark.anyio
+async def test_add_key_rejects_invalid_proof(registry_env) -> None:
+    """使用错误私钥签名的 add-key proof 被拒绝。"""
+    db_path, _ = registry_env
+    seed_developer(db_path)
+    current_private_pem, current_public_pem = _generate_es256_pem_pair()
+    wrong_private_pem, _ = _generate_es256_pem_pair()
+    _, new_public_pem = _generate_es256_pem_pair()
+    agent = AgentInstance.from_signer(
+        domain="192.144.228.237",
+        name="publisher",
+        organization="FDU",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish"],
+        environment="prod",
+        signer=_TestEs256Signer(current_private_pem, kid="vault:main"),
+        public_key_pem=current_public_pem,
+        kid="vault:main",
+        alg="ES256",
+    )
+    new_key = AgentKey(kid="vault:extra", alg="ES256", public_key_pem=new_public_pem)
+    proof = await sign_registry_add_key_proof(
+        agent_id=agent.agent_id,
+        new_key=new_key,
+        client_id="developer-a",
+        host="registry.local",
+        signer=_TestEs256Signer(wrong_private_pem, kid="vault:extra"),
+    )
+    payload = {
+        "agent_id": agent.agent_id,
+        "new_key": new_key.model_dump(mode="json"),
+        "new_key_proof_headers": proof.headers,
+    }
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        await agent.publish(
+            registry_url="http://registry.local/registry/agents/publish",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            http_client=client,
+        )
+        signed = await sign_registry_publish_request(
+            path="/registry/agents/add-key",
+            host="registry.local",
+            body=payload,
+            agent_id=agent.agent_id,
+            client_id="developer-a",
+            signer=agent.signer,
+        )
+        response = await client.post(
+            "http://registry.local/registry/agents/add-key",
+            json=payload,
+            headers={"authorization": "Bearer secret-api-key", **signed.headers},
+        )
+        assert response.status_code == 401
+        assert response.json()["detail"] == "NEW_KEY_PROOF_INVALID"
+
+
+# ── revoke_key 集成测试 ────────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_revoke_key_succeeds_and_key_blacklisted(registry_env) -> None:
+    """revoke_key 成功后 kid 进入 revoked_kids 且 status="revoked"。"""
+    db_path, _ = registry_env
+    seed_developer(db_path)
+    # 需要两个 key：先 add_key 再 revoke 其中一个
+    main_private_pem, main_public_pem = _generate_es256_pem_pair()
+    extra_private_pem, extra_public_pem = _generate_es256_pem_pair()
+    agent = AgentInstance.from_signer(
+        domain="192.144.228.237",
+        name="publisher",
+        organization="FDU",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish"],
+        environment="prod",
+        signer=_TestEs256Signer(main_private_pem, kid="vault:main"),
+        public_key_pem=main_public_pem,
+        kid="vault:main",
+        alg="ES256",
+    )
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        await agent.publish(
+            registry_url="http://registry.local/registry/agents/publish",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            http_client=client,
+        )
+        await agent.add_key(
+            registry_url="http://registry.local/registry/agents/add-key",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            new_signer=_TestEs256Signer(extra_private_pem, kid="vault:extra"),
+            new_public_key_pem=extra_public_pem,
+            new_kid="vault:extra",
+            http_client=client,
+        )
+        result = await agent.revoke_key(
+            registry_url="http://registry.local/registry/agents/revoke-key",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            kid_to_revoke="vault:extra",
+            http_client=client,
+        )
+        assert result["ok"] is True
+        assert result["revoked_kid"] == "vault:extra"
+
+        store = RegistryStore(db_path)
+        entry = store.get_registry_entry(agent.agent_id)
+        assert entry is not None
+        metadata = AgentMetadata.model_validate_json(entry.metadata_json)
+        assert "vault:extra" in metadata.revoked_kids
+        assert any(key.kid == "vault:extra" and key.status == "revoked" for key in metadata.keys)
+        # vault:main 仍为 active
+        assert any(key.kid == "vault:main" and key.status == "active" for key in metadata.keys)
+
+
+@pytest.mark.anyio
+async def test_revoke_key_rejects_wrong_owner(registry_env) -> None:
+    """非 owner 的 developer 无法 revoke_key。"""
+    db_path, _ = registry_env
+    seed_developer(db_path, developer_id="dev-1", client_id="developer-a", api_key="secret-a")
+    seed_developer(db_path, developer_id="dev-2", client_id="developer-b", api_key="secret-b")
+    # 需要两个 active key 才能安全 revoke
+    main_private_pem, main_public_pem = _generate_es256_pem_pair()
+    extra_private_pem, extra_public_pem = _generate_es256_pem_pair()
+    agent = AgentInstance.from_signer(
+        domain="192.144.228.237",
+        name="publisher",
+        organization="FDU",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish"],
+        environment="prod",
+        signer=_TestEs256Signer(main_private_pem, kid="vault:main"),
+        public_key_pem=main_public_pem,
+        kid="vault:main",
+        alg="ES256",
+    )
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        await agent.publish(
+            registry_url="http://registry.local/registry/agents/publish",
+            client_id="developer-a",
+            api_key="secret-a",
+            http_client=client,
+        )
+        await agent.add_key(
+            registry_url="http://registry.local/registry/agents/add-key",
+            client_id="developer-a",
+            api_key="secret-a",
+            new_signer=_TestEs256Signer(extra_private_pem, kid="vault:extra"),
+            new_public_key_pem=extra_public_pem,
+            new_kid="vault:extra",
+            http_client=client,
+        )
+        payload = {"agent_id": agent.agent_id, "kid_to_revoke": "vault:extra"}
+        signed = await sign_registry_publish_request(
+            path="/registry/agents/revoke-key",
+            host="registry.local",
+            body=payload,
+            agent_id=agent.agent_id,
+            client_id="developer-b",
+            signer=_TestEs256Signer(main_private_pem, kid="vault:main"),
+        )
+        response = await client.post(
+            "http://registry.local/registry/agents/revoke-key",
+            json=payload,
+            headers={"authorization": "Bearer secret-b", **signed.headers},
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"] == "OWNER_MISMATCH"
+
+
+@pytest.mark.anyio
+async def test_revoke_key_rejects_last_active(registry_env) -> None:
+    """撤销唯一的 active key 返回 409 CANNOT_REVOKE_LAST_ACTIVE_KEY。"""
+    db_path, _ = registry_env
+    seed_developer(db_path)
+    private_pem, public_pem = _generate_es256_pem_pair()
+    agent = AgentInstance.from_signer(
+        domain="192.144.228.237",
+        name="publisher",
+        organization="FDU",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish"],
+        environment="prod",
+        signer=_TestEs256Signer(private_pem, kid="vault:main"),
+        public_key_pem=public_pem,
+        kid="vault:main",
+        alg="ES256",
+    )
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        await agent.publish(
+            registry_url="http://registry.local/registry/agents/publish",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            http_client=client,
+        )
+        payload = {"agent_id": agent.agent_id, "kid_to_revoke": "vault:main"}
+        signed = await sign_registry_publish_request(
+            path="/registry/agents/revoke-key",
+            host="registry.local",
+            body=payload,
+            agent_id=agent.agent_id,
+            client_id="developer-a",
+            signer=agent.signer,
+        )
+        response = await client.post(
+            "http://registry.local/registry/agents/revoke-key",
+            json=payload,
+            headers={"authorization": "Bearer secret-api-key", **signed.headers},
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"] == "CANNOT_REVOKE_LAST_ACTIVE_KEY"
+
+
+@pytest.mark.anyio
+async def test_full_key_lifecycle(registry_env) -> None:
+    """完整密钥生命周期：publish → add_key → rotate_key → revoke_key。"""
+    db_path, _ = registry_env
+    seed_developer(db_path)
+    main_private_pem, main_public_pem = _generate_es256_pem_pair()
+    extra_private_pem, extra_public_pem = _generate_es256_pem_pair()
+    next_private_pem, next_public_pem = _generate_es256_pem_pair()
+    agent = AgentInstance.from_signer(
+        domain="agent.example.com",
+        name="lifecycle-agent",
+        organization="Test Lab",
+        endpoint="https://agent.example.com/tasks",
+        capabilities=["publish"],
+        environment="test",
+        signer=_TestEs256Signer(main_private_pem, kid="vault:main"),
+        public_key_pem=main_public_pem,
+        kid="vault:main",
+        alg="ES256",
+    )
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        # 1. publish
+        pub = await agent.publish(
+            registry_url="http://registry.local/registry/agents/publish",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            http_client=client,
+        )
+        assert pub["ok"] is True
+
+        # 2. add_key — 两个 key 同时 active
+        add = await agent.add_key(
+            registry_url="http://registry.local/registry/agents/add-key",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            new_signer=_TestEs256Signer(extra_private_pem, kid="vault:extra"),
+            new_public_key_pem=extra_public_pem,
+            new_kid="vault:extra",
+            http_client=client,
+        )
+        assert add["ok"] is True
+
+        store = RegistryStore(db_path)
+        entry = store.get_registry_entry(agent.agent_id)
+        metadata = AgentMetadata.model_validate_json(entry.metadata_json)
+        assert any(k.kid == "vault:main" and k.status == "active" for k in metadata.keys)
+        assert any(k.kid == "vault:extra" and k.status == "active" for k in metadata.keys)
+
+        # 3. rotate_key — vault:main → inactive, vault:next → active
+        rot = await agent.rotate_key(
+            registry_url="http://registry.local/registry/agents/rotate-key",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            new_signer=_TestEs256Signer(next_private_pem, kid="vault:next"),
+            new_public_key_pem=next_public_pem,
+            new_kid="vault:next",
+            http_client=client,
+        )
+        assert rot["ok"] is True
+
+        entry = store.get_registry_entry(agent.agent_id)
+        metadata = AgentMetadata.model_validate_json(entry.metadata_json)
+        assert any(k.kid == "vault:main" and k.status == "inactive" for k in metadata.keys)
+        assert any(k.kid == "vault:extra" and k.status == "active" for k in metadata.keys)
+        assert any(k.kid == "vault:next" and k.status == "active" for k in metadata.keys)
+
+        # 4. revoke_key — 撤销 vault:extra
+        rev = await agent.revoke_key(
+            registry_url="http://registry.local/registry/agents/revoke-key",
+            client_id="developer-a",
+            api_key="secret-api-key",
+            kid_to_revoke="vault:extra",
+            http_client=client,
+        )
+        assert rev["ok"] is True
+
+        entry = store.get_registry_entry(agent.agent_id)
+        metadata = AgentMetadata.model_validate_json(entry.metadata_json)
+        assert "vault:extra" in metadata.revoked_kids
+        assert any(k.kid == "vault:extra" and k.status == "revoked" for k in metadata.keys)
+        # vault:next 仍为唯一 active key
+        assert any(k.kid == "vault:next" and k.status == "active" for k in metadata.keys)
+
+
+# ── revoke_agent 集成测试 ──────────────────────────────────────────────────
+
+
+@pytest.mark.anyio
+async def test_revoke_agent_succeeds_and_agent_disappears(registry_env) -> None:
+    """revoke_agent 成功后 agent 从公开文档消失，后续操作被拒绝。"""
+    db_path, public_path = registry_env
+    seed_developer(db_path)
+    private_pem, public_pem = _generate_es256_pem_pair()
+    agent = AgentInstance.from_signer(
+        domain="192.144.228.237",
+        name="doomed-agent",
+        organization="Test",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish"],
+        environment="test",
+        signer=_TestEs256Signer(private_pem, kid="vault:main"),
+        public_key_pem=public_pem,
+        kid="vault:main",
+        alg="ES256",
+    )
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        # 1. publish
+        await agent.publish(
+            registry_url="http://registry.local/registry/agents/publish",
+            client_id="developer-a", api_key="secret-api-key", http_client=client,
+        )
+        # 确认在公开文档中
+        doc = (await client.get("http://registry.local/.well-known/agent.json")).json()
+        assert any(e["agent_id"] == agent.agent_id for e in doc["agents"])
+
+        # 2. revoke_agent
+        result = await agent.revoke_agent(
+            registry_url="http://registry.local/registry/agents/revoke",
+            client_id="developer-a", api_key="secret-api-key", http_client=client,
+        )
+        assert result["ok"] is True
+
+        # 3. 确认从公开文档消失
+        doc = (await client.get("http://registry.local/.well-known/agent.json")).json()
+        assert not any(e["agent_id"] == agent.agent_id for e in doc["agents"])
+
+        # 4. 确认 ownership status 变为 revoked
+        store = RegistryStore(db_path)
+        ownership = store.get_ownership(agent.agent_id)
+        assert ownership is not None
+        assert ownership.status == "revoked"
+
+        # 5. 后续 publish 被拒绝 (410 AGENT_REVOKED)
+        response = await client.post(
+            "http://registry.local/registry/agents/publish",
+            json={
+                "agent_id": agent.agent_id,
+                "metadata": agent.metadata.model_dump(mode="json"),
+                "publish_intent": "upsert_metadata",
+            },
+            headers={
+                "authorization": "Bearer secret-api-key",
+                **(
+                    await sign_registry_publish_request(
+                        path="/registry/agents/publish",
+                        host="registry.local",
+                        body={
+                            "agent_id": agent.agent_id,
+                            "metadata": agent.metadata.model_dump(mode="json"),
+                            "publish_intent": "upsert_metadata",
+                        },
+                        agent_id=agent.agent_id,
+                        client_id="developer-a",
+                        signer=agent.signer,
+                    )
+                ).headers,
+            },
+        )
+        assert response.status_code == 410
+        assert response.json()["detail"] == "AGENT_REVOKED"
+
+
+@pytest.mark.anyio
+async def test_revoke_agent_rejects_wrong_owner(registry_env) -> None:
+    """非 owner 无法撤销 agent。"""
+    db_path, _ = registry_env
+    seed_developer(db_path, developer_id="dev-1", client_id="developer-a", api_key="secret-a")
+    seed_developer(db_path, developer_id="dev-2", client_id="developer-b", api_key="secret-b")
+    private_pem, public_pem = _generate_es256_pem_pair()
+    agent = AgentInstance.from_signer(
+        domain="192.144.228.237",
+        name="guarded-agent",
+        organization="Test",
+        endpoint="https://192.144.228.237/invoke",
+        capabilities=["publish"],
+        environment="test",
+        signer=_TestEs256Signer(private_pem, kid="vault:main"),
+        public_key_pem=public_pem,
+        kid="vault:main",
+        alg="ES256",
+    )
+    transport = httpx.ASGITransport(app=create_registry_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
+        await agent.publish(
+            registry_url="http://registry.local/registry/agents/publish",
+            client_id="developer-a", api_key="secret-a", http_client=client,
+        )
+        payload = {"agent_id": agent.agent_id}
+        signed = await sign_registry_publish_request(
+            path="/registry/agents/revoke",
+            host="registry.local",
+            body=payload,
+            agent_id=agent.agent_id,
+            client_id="developer-b",
+            signer=agent.signer,
+        )
+        response = await client.post(
+            "http://registry.local/registry/agents/revoke",
+            json=payload,
+            headers={"authorization": "Bearer secret-b", **signed.headers},
+        )
+        assert response.status_code == 403
+        assert response.json()["detail"] == "OWNER_MISMATCH"

@@ -23,7 +23,7 @@ class AgentKey(BaseModel):
 
     kid: str
     alg: Literal["ES256"] = "ES256"
-    status: Literal["active", "inactive"] = "active"
+    status: Literal["active", "inactive", "revoked"] = "active"
     public_key_base64url: str | None = None
     public_key_pem: str | None = None
     not_before: datetime | None = None

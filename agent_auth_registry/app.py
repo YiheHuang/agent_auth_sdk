@@ -17,6 +17,7 @@ from agent_auth_sdk.registry_security import (
     hash_api_key,
     is_legacy_api_key_hash,
     verify_api_key,
+    verify_registry_add_key_proof,
     verify_registry_new_key_proof,
     verify_registry_publish_signature,
 )
@@ -34,6 +35,21 @@ class RotateKeyRequest(BaseModel):
     agent_id: str
     new_key: AgentKey
     new_key_proof_headers: dict[str, str]
+
+
+class AddKeyRequest(BaseModel):
+    agent_id: str
+    new_key: AgentKey
+    new_key_proof_headers: dict[str, str]
+
+
+class RevokeKeyRequest(BaseModel):
+    agent_id: str
+    kid_to_revoke: str
+
+
+class RevokeAgentRequest(BaseModel):
+    agent_id: str
 
 
 def load_registry_public_path() -> Path:
@@ -112,6 +128,7 @@ def create_app() -> FastAPI:
             else:
                 if ownership.owner_developer_id != developer.developer_id:
                     raise HTTPException(status_code=403, detail="OWNER_MISMATCH")
+                _assert_agent_active(ownership)
                 entry = store.get_registry_entry(request.agent_id)
                 if entry is None:
                     raise HTTPException(status_code=500, detail="REGISTRY_ENTRY_MISSING")
@@ -204,6 +221,7 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail="AGENT_NOT_FOUND")
             if ownership.owner_developer_id != developer.developer_id:
                 raise HTTPException(status_code=403, detail="OWNER_MISMATCH")
+            _assert_agent_active(ownership)
             entry = store.get_registry_entry(request.agent_id)
             if entry is None:
                 raise HTTPException(status_code=500, detail="REGISTRY_ENTRY_MISSING")
@@ -270,6 +288,274 @@ def create_app() -> FastAPI:
             )
             raise
 
+    @app.post("/registry/agents/add-key")
+    async def add_key(
+        request: AddKeyRequest,
+        http_request: Request,
+        authorization: str | None = Header(default=None),
+        x_agent_id: str | None = Header(default=None),
+        x_agent_kid: str | None = Header(default=None),
+        x_agent_timestamp: str | None = Header(default=None),
+        x_agent_nonce: str | None = Header(default=None),
+        x_agent_signature: str | None = Header(default=None),
+        x_registry_client_id: str | None = Header(default=None),
+    ) -> JSONResponse:
+        source_ip = http_request.client.host if http_request.client else None
+        developer = _authenticate_developer(store, authorization, x_registry_client_id)
+        try:
+            if x_agent_id != request.agent_id:
+                raise HTTPException(status_code=400, detail="AGENT_ID_MISMATCH")
+            _assert_fresh_timestamp(x_agent_timestamp)
+            nonce_key = f"{developer.developer_id}:{x_agent_nonce}"
+            if store.has_nonce(nonce_key):
+                raise HTTPException(status_code=409, detail="NONCE_REPLAYED")
+            proof_headers = request.new_key_proof_headers
+            if not proof_headers:
+                raise HTTPException(status_code=400, detail="NEW_KEY_PROOF_REQUIRED")
+            normalized_proof_headers = {key.lower(): value for key, value in proof_headers.items()}
+            _assert_fresh_timestamp(normalized_proof_headers.get("x-agent-timestamp"))
+            proof_nonce = normalized_proof_headers.get("x-agent-nonce")
+            if not proof_nonce:
+                raise HTTPException(status_code=400, detail="NEW_KEY_PROOF_MISSING_NONCE")
+            proof_nonce_key = f"{developer.developer_id}:add-key:{proof_nonce}"
+            if store.has_nonce(proof_nonce_key):
+                raise HTTPException(status_code=409, detail="NEW_KEY_PROOF_NONCE_REPLAYED")
+
+            ownership = store.get_ownership(request.agent_id)
+            if ownership is None:
+                raise HTTPException(status_code=404, detail="AGENT_NOT_FOUND")
+            if ownership.owner_developer_id != developer.developer_id:
+                raise HTTPException(status_code=403, detail="OWNER_MISMATCH")
+            _assert_agent_active(ownership)
+            entry = store.get_registry_entry(request.agent_id)
+            if entry is None:
+                raise HTTPException(status_code=500, detail="REGISTRY_ENTRY_MISSING")
+            metadata = AgentMetadata.model_validate_json(entry.metadata_json)
+            old_key = _select_key(metadata.keys, x_agent_kid)
+            verified = verify_registry_publish_signature(
+                path="/registry/agents/add-key",
+                host=http_request.headers.get("host", ""),
+                body=request.model_dump(mode="json"),
+                headers=dict(http_request.headers),
+                public_key=old_key,
+            )
+            if not verified:
+                raise HTTPException(status_code=401, detail="SIGNATURE_INVALID")
+            proof_valid = verify_registry_add_key_proof(
+                agent_id=request.agent_id,
+                new_key=request.new_key,
+                headers=proof_headers,
+                host=http_request.headers.get("host", ""),
+            )
+            if not proof_valid:
+                raise HTTPException(status_code=401, detail="NEW_KEY_PROOF_INVALID")
+
+            # 追加新 key，不修改已有 key 状态
+            updated_keys = [*metadata.keys, request.new_key.model_copy(update={"status": "active"})]
+            updated_metadata = metadata.model_copy(
+                update={
+                    "keys": updated_keys,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+            )
+            store.upsert_agent(
+                metadata=updated_metadata,
+                developer_id=developer.developer_id,
+                current_kid=request.new_key.kid,
+                public_key_fingerprint=agent_key_fingerprint(request.new_key),
+                created_at=ownership.created_at,
+            )
+            store.set_nonce(nonce_key, datetime.now(timezone.utc) + timedelta(seconds=load_registry_allowed_skew_seconds()))
+            store.set_nonce(proof_nonce_key, datetime.now(timezone.utc) + timedelta(seconds=load_registry_allowed_skew_seconds()))
+            store.write_public_document(load_registry_public_path())
+            store.write_audit(
+                developer_id=developer.developer_id,
+                agent_id=request.agent_id,
+                action="add_key",
+                result="success",
+                reason_code=None,
+                source_ip=source_ip,
+            )
+            return JSONResponse({"ok": True, "agent_id": request.agent_id, "added_kid": request.new_key.kid})
+        except HTTPException as exc:
+            store.write_audit(
+                developer_id=getattr(developer, "developer_id", None),
+                agent_id=request.agent_id,
+                action="add_key",
+                result="rejected",
+                reason_code=str(exc.detail),
+                source_ip=source_ip,
+            )
+            raise
+
+    @app.post("/registry/agents/revoke-key")
+    async def revoke_key(
+        request: RevokeKeyRequest,
+        http_request: Request,
+        authorization: str | None = Header(default=None),
+        x_agent_id: str | None = Header(default=None),
+        x_agent_kid: str | None = Header(default=None),
+        x_agent_timestamp: str | None = Header(default=None),
+        x_agent_nonce: str | None = Header(default=None),
+        x_agent_signature: str | None = Header(default=None),
+        x_registry_client_id: str | None = Header(default=None),
+    ) -> JSONResponse:
+        source_ip = http_request.client.host if http_request.client else None
+        developer = _authenticate_developer(store, authorization, x_registry_client_id)
+        try:
+            if x_agent_id != request.agent_id:
+                raise HTTPException(status_code=400, detail="AGENT_ID_MISMATCH")
+            _assert_fresh_timestamp(x_agent_timestamp)
+            nonce_key = f"{developer.developer_id}:{x_agent_nonce}"
+            if store.has_nonce(nonce_key):
+                raise HTTPException(status_code=409, detail="NONCE_REPLAYED")
+
+            ownership = store.get_ownership(request.agent_id)
+            if ownership is None:
+                raise HTTPException(status_code=404, detail="AGENT_NOT_FOUND")
+            if ownership.owner_developer_id != developer.developer_id:
+                raise HTTPException(status_code=403, detail="OWNER_MISMATCH")
+            _assert_agent_active(ownership)
+            entry = store.get_registry_entry(request.agent_id)
+            if entry is None:
+                raise HTTPException(status_code=500, detail="REGISTRY_ENTRY_MISSING")
+            metadata = AgentMetadata.model_validate_json(entry.metadata_json)
+            old_key = _select_key(metadata.keys, x_agent_kid)
+            verified = verify_registry_publish_signature(
+                path="/registry/agents/revoke-key",
+                host=http_request.headers.get("host", ""),
+                body=request.model_dump(mode="json"),
+                headers=dict(http_request.headers),
+                public_key=old_key,
+            )
+            if not verified:
+                raise HTTPException(status_code=401, detail="SIGNATURE_INVALID")
+
+            # 校验 kid_to_revoke 存在
+            target_key = None
+            active_count = 0
+            for key in metadata.keys:
+                if key.kid == request.kid_to_revoke:
+                    target_key = key
+                if key.status == "active":
+                    active_count += 1
+            if target_key is None:
+                raise HTTPException(status_code=400, detail="KEY_NOT_FOUND")
+            # 防锁死：不能撤销唯一的 active key
+            if target_key.status == "active" and active_count <= 1:
+                raise HTTPException(status_code=409, detail="CANNOT_REVOKE_LAST_ACTIVE_KEY")
+
+            # 加入 revoked_kids + 标记 status="revoked"
+            updated_revoked = [*metadata.revoked_kids, request.kid_to_revoke]
+            updated_keys = [
+                key.model_copy(update={"status": "revoked"}) if key.kid == request.kid_to_revoke else key
+                for key in metadata.keys
+            ]
+            updated_metadata = metadata.model_copy(
+                update={
+                    "keys": updated_keys,
+                    "revoked_kids": updated_revoked,
+                    "updated_at": datetime.now(timezone.utc),
+                },
+            )
+            store.upsert_agent(
+                metadata=updated_metadata,
+                developer_id=developer.developer_id,
+                current_kid=ownership.current_kid,
+                public_key_fingerprint=ownership.public_key_fingerprint,
+                created_at=ownership.created_at,
+            )
+            store.set_nonce(nonce_key, datetime.now(timezone.utc) + timedelta(seconds=load_registry_allowed_skew_seconds()))
+            store.write_public_document(load_registry_public_path())
+            store.write_audit(
+                developer_id=developer.developer_id,
+                agent_id=request.agent_id,
+                action="revoke_key",
+                result="success",
+                reason_code=None,
+                source_ip=source_ip,
+            )
+            return JSONResponse({"ok": True, "agent_id": request.agent_id, "revoked_kid": request.kid_to_revoke})
+        except HTTPException as exc:
+            store.write_audit(
+                developer_id=getattr(developer, "developer_id", None),
+                agent_id=request.agent_id,
+                action="revoke_key",
+                result="rejected",
+                reason_code=str(exc.detail),
+                source_ip=source_ip,
+            )
+            raise
+
+    @app.post("/registry/agents/revoke")
+    async def revoke_agent(
+        request: RevokeAgentRequest,
+        http_request: Request,
+        authorization: str | None = Header(default=None),
+        x_agent_id: str | None = Header(default=None),
+        x_agent_kid: str | None = Header(default=None),
+        x_agent_timestamp: str | None = Header(default=None),
+        x_agent_nonce: str | None = Header(default=None),
+        x_agent_signature: str | None = Header(default=None),
+        x_registry_client_id: str | None = Header(default=None),
+    ) -> JSONResponse:
+        """撤销整个 Agent。撤销后 agent 从公开文档消失，所有操作被拒绝。"""
+        source_ip = http_request.client.host if http_request.client else None
+        developer = _authenticate_developer(store, authorization, x_registry_client_id)
+        try:
+            if x_agent_id != request.agent_id:
+                raise HTTPException(status_code=400, detail="AGENT_ID_MISMATCH")
+            if not x_agent_kid:
+                raise HTTPException(status_code=400, detail="MISSING_AGENT_KID")
+            _assert_fresh_timestamp(x_agent_timestamp)
+            nonce_key = f"{developer.developer_id}:{x_agent_nonce}"
+            if store.has_nonce(nonce_key):
+                raise HTTPException(status_code=409, detail="NONCE_REPLAYED")
+
+            ownership = store.get_ownership(request.agent_id)
+            if ownership is None:
+                raise HTTPException(status_code=404, detail="AGENT_NOT_FOUND")
+            _assert_agent_active(ownership)
+            if ownership.owner_developer_id != developer.developer_id:
+                raise HTTPException(status_code=403, detail="OWNER_MISMATCH")
+            entry = store.get_registry_entry(request.agent_id)
+            if entry is None:
+                raise HTTPException(status_code=500, detail="REGISTRY_ENTRY_MISSING")
+            metadata = AgentMetadata.model_validate_json(entry.metadata_json)
+            old_key = _select_key(metadata.keys, x_agent_kid)
+            verified = verify_registry_publish_signature(
+                path="/registry/agents/revoke",
+                host=http_request.headers.get("host", ""),
+                body=request.model_dump(mode="json"),
+                headers=dict(http_request.headers),
+                public_key=old_key,
+            )
+            if not verified:
+                raise HTTPException(status_code=401, detail="SIGNATURE_INVALID")
+
+            store.revoke_agent(agent_id=request.agent_id)
+            store.set_nonce(nonce_key, datetime.now(timezone.utc) + timedelta(seconds=load_registry_allowed_skew_seconds()))
+            store.write_public_document(load_registry_public_path())
+            store.write_audit(
+                developer_id=developer.developer_id,
+                agent_id=request.agent_id,
+                action="revoke_agent",
+                result="success",
+                reason_code=None,
+                source_ip=source_ip,
+            )
+            return JSONResponse({"ok": True, "agent_id": request.agent_id})
+        except HTTPException as exc:
+            store.write_audit(
+                developer_id=getattr(developer, "developer_id", None),
+                agent_id=request.agent_id,
+                action="revoke_agent",
+                result="rejected",
+                reason_code=str(exc.detail),
+                source_ip=source_ip,
+            )
+            raise
+
     return app
 
 
@@ -287,6 +573,11 @@ def _authenticate_developer(store: RegistryStore, authorization: str | None, cli
     if is_legacy_api_key_hash(developer.api_key_hash):
         store.update_developer_api_key_hash(client_id=client_id, api_key_hash=hash_api_key(api_key))
     return developer
+
+
+def _assert_agent_active(ownership: "OwnershipRecord") -> None:
+    if ownership.status != "active":
+        raise HTTPException(status_code=410, detail="AGENT_REVOKED")
 
 
 def _validate_publish_headers(

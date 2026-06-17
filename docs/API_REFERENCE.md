@@ -1,6 +1,6 @@
 # Agent Auth SDK — 核心接口文档
 
-本文档描述 Agent Auth SDK 对开发者暴露的 6 个核心接口，包括每个接口的用途、输入参数、返回值结构和内部处理逻辑。
+本文档描述 Agent Auth SDK 对开发者暴露的 9 个核心接口，包括每个接口的用途、输入参数、返回值结构和内部处理逻辑。
 
 ---
 
@@ -242,38 +242,43 @@
 
 ### `AgentInstance.rotate_key()`
 
-**用途**：安全轮换 Registry 中的 active signing key。需要同时证明旧 key 可控（签名完整请求）和新 key 可控（签名 proof）。
+**用途**：安全轮换 Registry 中的 active signing key。将当前所有 active key 标记为 inactive，并新增一个 active key。需要同时证明旧 key 可控（签名完整请求）和新 key 可控（签名 proof）。
+
+> **提示**：若需要保留已有 active key 的同时添加新 key，请使用 [`add_key()`](#7-添加额外活跃密钥)；若需要显式撤销某个泄露的 key，请使用 [`revoke_key()`](#8-撤销密钥)。
 
 提供两种使用方式：
+
+**方式 A — 外部 signer（兼容模式）：**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `new_signer` | `Signer` | 是 | 新 key 的签名器实例 |
+| `new_public_key_pem` | `str` | 是 | 新 key 的 PEM 格式公钥 |
+| `new_kid` | `str` | 是 | 新 key 的标识符 |
+
+**方式 B — Vault 托管（推荐）：**
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `new_key_name` | `str` | 是 | 新 key 在 Vault Transit 中的名称，SDK 自动创建 ecdsa-p256 key、读取公钥、构造 signer |
+
+**公共参数：**
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `registry_url` | `str` | 是 | Registry 轮换端点 URL |
 | `client_id` | `str` | 是 | Developer client ID |
 | `api_key` | `str` | 是 | Developer API key |
-| `new_key_name` | `str` | 是 | 新 key 在 Vault Transit 中的名称，SDK 自动创建 ecdsa-p256 key、读取公钥、构造 signer |
 | `http_client` | `httpx.AsyncClient` | 否 | 复用的 HTTP 客户端 |
 | `timeout_seconds` | `float` | 否 | 请求超时，默认 10.0 |
 
-**返回值**：`dict` — Registry 返回的 JSON 响应体。
+**返回值**：`dict` — Registry 返回的 JSON 响应体，含 `ok`、`agent_id`、`current_kid`。
 
 **内部逻辑**：
-
-_SDK 自动创建新 key_：
-1. 从当前 signer 的 Vault 配置中复制连接参数
-2. 调用 `_ensure_transit_key(new_config)` 自动创建 ecdsa-p256 key
-3. 调用 `resolve_vault_public_key(new_config)` 读取公钥
-4. 构造新 `VaultTransitSigner` 和 `new_kid`
-
-_双签名 + 提交_：
-1. 构造新的 `AgentKey(new_kid, "ES256", new_public_key_pem, status="active")`
-2. 调用 `sign_registry_new_key_proof(agent_id, new_key, client_id, host, signer=new_signer)` 生成新 key 的 proof 签名——proof 的 canonical string 绑定 `agent_id`、`new_key.kid`、新公钥指纹、timestamp、nonce、`client_id` 和 `host`，由新 signer 签名证明私钥可控
-3. 构造轮换 payload：`{"agent_id", "new_key", "new_key_proof_headers"}`
-4. 调用 `sign_registry_publish_request(path, host, payload, agent_id, client_id, signer=current_signer)` 用 **旧** active key 签名完整轮换请求
-5. 附加 `Authorization: Bearer {api_key}` header
-6. POST 到 `registry_url`，携带双重签名
-7. 校验 HTTP 响应状态
-8. 成功后更新本地 `AgentInstance` 状态：更新 `kid`、`public_key_pem`、`public_key_base64url`、`signer_override`，并将 metadata 中旧 key 标记为 `inactive`
+1. 调用 `_resolve_new_key_signer(...)` 解析新 key 的 signer、公钥和 kid
+2. 构造新的 `AgentKey(kid, "ES256", public_key_pem, status="active")`
+3. 调用 `rotate_key_in_registry(...)` 执行双重签名 + Registry 通信
+4. 成功后更新本地 `AgentInstance` 状态：所有旧 active key → `inactive`，追加新 key 为 `active`
 
 **安全条件**（由 Registry 端强制）：
 - Developer API key 必须有效
@@ -282,6 +287,111 @@ _双签名 + 提交_：
 - Proof timestamp 必须在允许时间窗内
 - Proof nonce 不能重放
 - Owner 必须匹配（`agent_id → developer_id` 绑定）
+
+---
+
+## 7. 添加额外活跃密钥
+
+### `AgentInstance.add_key()`
+
+**用途**：为 Agent 添加额外活跃密钥，保留已有 active key 不变。适用于多地域部署、平滑算法迁移等场景。
+
+> **与 `rotate_key()` 的区别**：`add_key()` 不会将已有 active key 标记为 inactive，允许多个活跃 key 并存；`rotate_key()` 会将所有旧 active key 标记为 inactive 并仅保留一个 active key。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `registry_url` | `str` | 是 | Registry add-key 端点 URL |
+| `client_id` | `str` | 是 | Developer client ID |
+| `api_key` | `str` | 是 | Developer API key |
+| `new_signer` | `Signer` | 否 | 新 key 的签名器实例（方式 A） |
+| `new_public_key_pem` | `str` | 否 | 新 key 的 PEM 格式公钥（方式 A） |
+| `new_kid` | `str` | 否 | 新 key 的标识符（方式 A） |
+| `new_key_name` | `str` | 否 | Vault Transit key 名称（方式 B，SDK 自动创建） |
+| `http_client` | `httpx.AsyncClient` | 否 | 复用的 HTTP 客户端 |
+| `timeout_seconds` | `float` | 否 | 请求超时，默认 10.0 |
+
+**返回值**：`dict` — Registry 返回的 JSON 响应体，含 `ok`、`agent_id`、`added_kid`。
+
+**内部逻辑**：
+1. 调用 `_resolve_new_key_signer(...)` 解析新 key（Vault 或外部 signer）
+2. 构造新的 `AgentKey(kid, "ES256", public_key_pem, status="active")`
+3. 调用 `add_key_in_registry(...)` 执行双重签名（旧 key 签名请求 + 新 key 签名 add-key proof）并提交
+4. 成功后追加新 key 到本地 `metadata.keys`，**不修改已有 key 状态**
+
+**安全条件**：与 `rotate_key()` 相同，使用独立域名分离的 canonical string（`add-key-new-key-proof-v1`）防止跨操作重放。
+
+---
+
+## 8. 撤销密钥
+
+### `AgentInstance.revoke_key()`
+
+**用途**：显式撤销一个密钥，将其加入 `revoked_kids` 黑名单。被撤销的 key 将在后续所有验签操作中被立即拒绝。适用于密钥泄露等安全应急场景。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `registry_url` | `str` | 是 | Registry revoke-key 端点 URL |
+| `client_id` | `str` | 是 | Developer client ID |
+| `api_key` | `str` | 是 | Developer API key |
+| `kid_to_revoke` | `str` | 是 | 需要撤销的 key ID |
+| `http_client` | `httpx.AsyncClient` | 否 | 复用的 HTTP 客户端 |
+| `timeout_seconds` | `float` | 否 | 请求超时，默认 10.0 |
+
+**返回值**：`dict` — Registry 返回的 JSON 响应体，含 `ok`、`agent_id`、`revoked_kid`。
+
+**Raises**：
+- `ValueError`：若 `kid_to_revoke` 不存在于 metadata 中，或是唯一的 active key（防锁死保护）
+
+**内部逻辑**：
+1. 校验 `kid_to_revoke` 存在于 `self.metadata.keys` 中
+2. 校验不是唯一的 active key（防止锁死自己——必须先通过 `add_key()` 或 `rotate_key()` 建立新 active key）
+3. 调用 `revoke_key_in_registry(...)` 用当前 active key 签名并提交
+4. 成功后本地更新：kid 加入 `metadata.revoked_kids`，对应 key 的 `status` 改为 `"revoked"`
+
+**防锁死规则**：不能撤销最后一个 active key。如果 `kid_to_revoke` 的 `status == "active"` 且 metadata 中只有一个 active key，SDK 会在本地抛出 `ValueError`，不会发出网络请求。
+
+**安全条件**（由 Registry 端强制）：
+- Developer API key 必须有效
+- 当前 active key 签名必须通过
+- Owner 必须匹配
+- 不可撤销最后一个 active key（Registry 端同样强制检查）
+
+---
+
+## 9. 撤销 Agent
+
+### `AgentInstance.revoke_agent()`
+
+**用途**：撤销整个 Agent。撤销后 agent 从 Registry 公开文档中移除，所有后续操作（publish、rotate_key、add_key、revoke_key）均返回 410 `AGENT_REVOKED`。
+
+> **注意**：此操作不可逆。如需恢复，必须用全新的 key 重新 publish。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `registry_url` | `str` | 是 | Registry revoke 端点 URL |
+| `client_id` | `str` | 是 | Developer client ID |
+| `api_key` | `str` | 是 | Developer API key |
+| `http_client` | `httpx.AsyncClient` | 否 | 复用的 HTTP 客户端 |
+| `timeout_seconds` | `float` | 否 | 请求超时，默认 10.0 |
+
+**返回值**：`dict` — Registry 返回的 JSON 响应体，含 `ok`、`agent_id`。
+
+**内部逻辑**：
+1. 调用 `revoke_agent_in_registry(...)` 用当前 active key 签名并提交
+2. Registry 端将 ownership 状态改为 `"revoked"`，agent 从公开文档中排除
+3. 后续任何对该 agent 的操作均被 `_assert_agent_active()` 拦截
+
+**安全条件**（由 Registry 端强制）：
+- Developer API key 必须有效
+- 当前 active key 签名必须通过
+- Owner 必须匹配
+
+**Admin CLI 等效操作**：
+```bash
+source /etc/agent-auth/env.sh
+source /opt/agent_auth_sdk/.venv/bin/activate
+agent-auth-registry-admin revoke-agent --agent-id agent://<host>/<name>
+```
 
 ---
 

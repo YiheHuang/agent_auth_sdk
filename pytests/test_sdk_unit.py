@@ -494,3 +494,140 @@ def test_rotate_key_requires_mode_specification() -> None:
                 api_key="test-key",
             )
         )
+
+
+# ── add_key / revoke_key 单元测试 ──────────────────────────────────────────
+
+
+def test_agent_key_status_revoked() -> None:
+    """AgentKey 接受 status="revoked"。"""
+    key = AgentKey(
+        kid="vault:test",
+        alg="ES256",
+        public_key_pem="-----BEGIN PUBLIC KEY-----\nZmFrZQ==\n-----END PUBLIC KEY-----",
+        status="revoked",
+    )
+    assert key.status == "revoked"
+
+
+def test_select_verification_key_rejects_revoked_status() -> None:
+    """status="revoked" 的 key 被 select_verification_key 拒绝。"""
+    metadata = render_agent_metadata(
+        agent_id="agent://demo.example.com/weather",
+        domain="demo.example.com",
+        name="weather",
+        organization="Demo Org",
+        endpoint="https://demo.example.com/invoke",
+        capabilities=[],
+        keys=[
+            AgentKey(
+                kid="main",
+                public_key_pem="-----BEGIN PUBLIC KEY-----\nZmFrZQ==\n-----END PUBLIC KEY-----",
+                status="revoked",
+            )
+        ],
+    )
+    with pytest.raises(Exception):
+        select_verification_key(metadata, kid="main", now=datetime(2026, 1, 1))
+
+
+def test_select_verification_key_rejects_revoked_kid() -> None:
+    """kid 在 revoked_kids 列表中的 key 被拒绝（即使 status="active"）。"""
+    metadata = render_agent_metadata(
+        agent_id="agent://demo.example.com/weather",
+        domain="demo.example.com",
+        name="weather",
+        organization="Demo Org",
+        endpoint="https://demo.example.com/invoke",
+        capabilities=[],
+        keys=[
+            AgentKey(
+                kid="main",
+                public_key_pem="-----BEGIN PUBLIC KEY-----\nZmFrZQ==\n-----END PUBLIC KEY-----",
+                status="active",
+            )
+        ],
+        revoked_kids=["main"],
+    )
+    with pytest.raises(Exception, match="revoked"):
+        select_verification_key(metadata, kid="main", now=datetime(2026, 1, 1))
+
+
+def test_add_key_requires_mode_specification() -> None:
+    """add_key() 在两种方式都未提供时抛出 ValueError。"""
+    private_pem, public_pem = _generate_es256_pem_pair()
+    signer = _TestEs256Signer(private_pem, kid="vault:transit/weather-agent")
+    agent = AgentInstance.from_signer(
+        domain="agent.example.com",
+        name="weather",
+        organization="Example Lab",
+        endpoint="https://agent.example.com/tasks",
+        signer=signer,
+        public_key_pem=public_pem,
+        kid="vault:transit/weather-agent",
+    )
+
+    import asyncio
+
+    with pytest.raises(ValueError, match="Either new_key_name"):
+        asyncio.run(
+            agent.add_key(
+                registry_url="https://registry.example.com/registry/agents/add-key",
+                client_id="developer-a",
+                api_key="test-key",
+            )
+        )
+
+
+def test_revoke_key_raises_when_kid_not_found() -> None:
+    """revoke_key() 在 kid 不存在时抛出 ValueError。"""
+    private_pem, public_pem = _generate_es256_pem_pair()
+    signer = _TestEs256Signer(private_pem, kid="vault:transit/weather-agent")
+    agent = AgentInstance.from_signer(
+        domain="agent.example.com",
+        name="weather",
+        organization="Example Lab",
+        endpoint="https://agent.example.com/tasks",
+        signer=signer,
+        public_key_pem=public_pem,
+        kid="vault:transit/weather-agent",
+    )
+
+    import asyncio
+
+    with pytest.raises(ValueError, match="Key not found"):
+        asyncio.run(
+            agent.revoke_key(
+                registry_url="https://registry.example.com/registry/agents/revoke-key",
+                client_id="developer-a",
+                api_key="test-key",
+                kid_to_revoke="nonexistent",
+            )
+        )
+
+
+def test_revoke_key_raises_when_last_active_key() -> None:
+    """revoke_key() 拒绝撤销唯一的 active key。"""
+    private_pem, public_pem = _generate_es256_pem_pair()
+    signer = _TestEs256Signer(private_pem, kid="vault:transit/weather-agent")
+    agent = AgentInstance.from_signer(
+        domain="agent.example.com",
+        name="weather",
+        organization="Example Lab",
+        endpoint="https://agent.example.com/tasks",
+        signer=signer,
+        public_key_pem=public_pem,
+        kid="vault:transit/weather-agent",
+    )
+
+    import asyncio
+
+    with pytest.raises(ValueError, match="Cannot revoke the last active key"):
+        asyncio.run(
+            agent.revoke_key(
+                registry_url="https://registry.example.com/registry/agents/revoke-key",
+                client_id="developer-a",
+                api_key="test-key",
+                kid_to_revoke="vault:transit/weather-agent",
+            )
+        )

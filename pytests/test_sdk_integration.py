@@ -15,17 +15,16 @@ from agent_auth_registry.app import create_app as create_registry_app
 from agent_auth_registry.storage import RegistryStore
 from agent_auth_sdk import (
     AgentInstance,
-    AgentKey,
-    AgentMetadata,
     FileMetadataCache,
     InMemoryNonceStore,
     VerificationConfig,
-    render_agent_metadata,
     resolve_agent,
-    sign_http_request,
     verify_agent_message,
     verify_http_request,
 )
+from agent_auth_sdk.models import AgentKey, AgentMetadata
+from agent_auth_sdk.publish import render_agent_metadata
+from agent_auth_sdk.signing import sign_http_request
 from agent_auth_sdk.config import MetadataResolverConfig, STRICT_PROFILE, TEST_PROFILE
 from agent_auth_sdk.registry_security import hash_api_key, sign_registry_publish_request
 from agent_auth_sdk.vault_kms import VaultKmsConfig, resolve_vault_public_key
@@ -538,7 +537,7 @@ async def test_rotate_key_rejects_invalid_new_key_proof(registry_env) -> None:
         alg="ES256",
     )
     new_key = AgentKey(kid="vault:next", alg="ES256", public_key_pem=new_public_pem)
-    from agent_auth_sdk import sign_registry_new_key_proof
+    from agent_auth_sdk.registry_security import sign_registry_new_key_proof
 
     proof = await sign_registry_new_key_proof(
         agent_id=agent.agent_id,

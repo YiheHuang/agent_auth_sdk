@@ -13,7 +13,7 @@ from .messaging import sign_agent_message
 from .models import AgentAuditConfig, AgentKey, AgentMetadata, SignedAgentMessage
 from .publish import export_well_known, publish_to_registry, render_agent_metadata, rotate_key_in_registry
 from .signing import sign_http_request
-from .vault_kms import VaultKmsConfig, VaultTransitSigner, resolve_vault_public_key
+from .vault_kms import VaultKmsConfig, VaultTransitSigner, _ensure_transit_key, resolve_vault_public_key
 
 
 @dataclass(slots=True)
@@ -53,6 +53,7 @@ class AgentInstance:
         capabilities: list[str] | None = None,
         environment: str | None = None,
         kid: str | None = None,
+        auto_create_key: bool = False,
     ) -> "AgentInstance":
         config = VaultKmsConfig(
             vault_addr=vault_addr,
@@ -65,6 +66,8 @@ class AgentInstance:
             verify=verify,
             kid=kid,
         )
+        if auto_create_key:
+            _ensure_transit_key(config)
         signer = VaultTransitSigner(config)
         signer.validate_access()
         description = resolve_vault_public_key(config)
@@ -174,12 +177,41 @@ class AgentInstance:
         registry_url: str,
         client_id: str,
         api_key: str,
-        new_signer: object,
-        new_public_key_pem: str,
-        new_kid: str,
+        # 方式 A（兼容 HSM / 云 KMS）: 预创建的 signer
+        new_signer: object | None = None,
+        new_public_key_pem: str | None = None,
+        new_kid: str | None = None,
+        # 方式 B（Vault 托管）: SDK 自动在 Vault 中创建新 key
+        new_key_name: str | None = None,
         http_client: httpx.AsyncClient | None = None,
         timeout_seconds: float = 10.0,
     ) -> dict:
+        if new_key_name is not None:
+            # SDK 自动在 Vault 中创建新 key，完成读取公钥 + 构造 signer
+            current_config = self.signer._config  # type: ignore[attr-defined]
+            new_config = VaultKmsConfig(
+                vault_addr=current_config.vault_addr,
+                transit_mount=current_config.transit_mount,
+                key_name=new_key_name,
+                vault_token_file=current_config.vault_token_file,
+                vault_token=current_config.vault_token,
+                namespace=current_config.namespace,
+                verify=current_config.verify,
+                allow_insecure_raw_token=current_config.allow_insecure_raw_token,
+            )
+            _ensure_transit_key(new_config)
+            new_signer_obj: object = VaultTransitSigner(new_config)
+            new_signer_obj.validate_access()  # type: ignore[union-attr]
+            description = resolve_vault_public_key(new_config)
+            new_public_key_pem = description.public_key_pem
+            new_kid = f"vault:{current_config.transit_mount}/{new_key_name}"
+        elif new_signer is None or new_public_key_pem is None or new_kid is None:
+            raise ValueError(
+                "Either new_key_name (for Vault-managed key creation) "
+                "or all of new_signer, new_public_key_pem, new_kid must be provided."
+            )
+        else:
+            new_signer_obj = new_signer
         new_key = AgentKey(
             kid=new_kid,
             alg="ES256",
@@ -194,14 +226,14 @@ class AgentInstance:
             client_id=client_id,
             api_key=api_key,
             current_signer=self.signer,
-            new_signer=new_signer,
+            new_signer=new_signer_obj,
             http_client=http_client,
             timeout_seconds=timeout_seconds,
         )
         self.kid = new_kid
         self.public_key_pem = new_public_key_pem
         self.public_key_base64url = new_key.public_key_base64url or ""
-        self.signer_override = new_signer
+        self.signer_override = new_signer_obj
         if self.metadata is not None:
             self.metadata = self.metadata.model_copy(
                 update={

@@ -160,6 +160,28 @@ def _build_vault_client(config: VaultKmsConfig) -> Any:
     )
 
 
+def _ensure_transit_key(config: VaultKmsConfig) -> bool:
+    """确保 Vault Transit key 存在；若不存在，创建 ecdsa-p256 类型密钥。
+
+    Returns:
+        True 表示密钥是新创建的，False 表示密钥已存在。
+    """
+    client = _build_vault_client(config)
+    try:
+        client.secrets.transit.read_key(
+            name=config.key_name,
+            mount_point=config.transit_mount,
+        )
+        return False
+    except Exception:
+        client.secrets.transit.create_key(
+            name=config.key_name,
+            key_type="ecdsa-p256",
+            mount_point=config.transit_mount,
+        )
+        return True
+
+
 def read_vault_token(config: VaultKmsConfig) -> str:
     if config.vault_token_file:
         path = Path(config.vault_token_file)

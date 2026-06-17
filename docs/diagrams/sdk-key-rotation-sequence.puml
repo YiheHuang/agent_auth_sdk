@@ -1,0 +1,116 @@
+@startuml
+title Agent Key 轮换流程（rotate-key）
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+<style>
+  participant {
+    Padding 28
+  }
+  box {
+    Padding 10
+  }
+</style>
+
+autonumber
+
+actor "开发者" as Dev
+participant "SDK\n(AgentInstance)" as SDK
+participant "Vault\n(Transit)" as Vault
+participant "Registry" as Registry
+
+note over Dev, Registry
+轮换前置条件：
+• Agent 已通过 publish 在 Registry 建立 owner 绑定
+• 当前 active key 私钥仍可访问（在 Vault 中）
+• 新 key 私钥也已就绪（在 Vault 中）
+end note
+
+== 准备新密钥 ==
+
+Dev -> Vault : 创建新 Transit key\nvault write -f transit/keys/agent-v2\ntype=ecdsa-p256
+Vault --> Dev : 返回新 key 信息\nkid / public_key_pem
+note right
+新 key 私钥同样不可导出，
+仅用于后续签名。
+end note
+
+== 发起轮换请求 ==
+
+Dev -> SDK : agent.rotate_key(\n  registry_url, client_id, api_key,\n  new_signer, new_public_key_pem,\n  new_kid\n)
+
+SDK -> SDK : 构造 new_key (AgentKey)\nkid=new_kid, alg=ES256\npublic_key_pem, status=active
+
+== 步骤 1：新密钥证明 (New Key Proof) ==
+
+SDK -> Vault : sign_registry_new_key_proof\n用 new_signer 签名 proof canonical
+note over SDK, Vault
+proof canonical string 绑定：
+rotate-key-new-key-proof-v1
+x-agent-id: {agent_id}
+x-agent-kid: {new_kid}
+new-key-fingerprint: {公钥指纹}
+x-agent-timestamp: {timestamp}
+x-agent-nonce: {nonce}
+x-registry-client-id: {client_id}
+host: {registry_host}
+end note
+Vault --> SDK : 返回 proof 签名\n{new_key_proof_headers}
+
+== 步骤 2：旧密钥签名完整请求 ==
+
+SDK -> Vault : sign_registry_publish_request\n用当前 active key (旧 signer)\n签名整个 rotate payload
+note over SDK, Vault
+publish canonical string 绑定：
+method: POST
+path: /registry/agents/rotate-key
+body-digest: SHA-256(payload)
+x-agent-id / x-agent-kid (旧)
+x-agent-timestamp / x-agent-nonce
+x-registry-client-id / host
+end note
+Vault --> SDK : 返回旧 key 签名\n{x-agent-* headers}
+
+== 步骤 3：发送轮换请求 ==
+
+SDK -> Registry : POST /registry/agents/rotate-key\nAuthorization: Bearer {api_key}\n旧 key 签名 headers\npayload: {agent_id, new_key,\n         new_key_proof_headers}
+
+Registry -> Registry : 1. 校验 developer API key
+Registry -> Registry : 2. 校验旧 active key 签名\n(证明旧 key 私钥仍可控)
+Registry -> Registry : 3. 校验新 key proof 签名\n(证明新 key 私钥可控)
+Registry -> Registry : 4. 校验 agent_id -> developer_id\nowner 匹配
+Registry -> Registry : 5. 校验 timestamp 在允许偏移内
+Registry -> Registry : 6. 校验 nonce 未重放
+
+alt 全部校验通过
+    Registry -> Registry : 旧 key status → inactive\n新 key status → active\n写入 registry storage
+    Registry --> SDK : 200 OK\n轮换成功
+
+    SDK -> SDK : 更新本地 AgentInstance：\n• kid = new_kid\n• public_key_pem = new_public_key_pem\n• signer_override = new_signer\n• metadata 中旧 key 标为 inactive
+    SDK --> Dev : 返回成功响应
+
+else 任一校验失败
+    Registry --> SDK : 4xx / 5xx 拒绝轮换
+    note over SDK, Registry
+      常见拒绝 detail：
+      • INVALID_API_KEY — developer 凭证无效
+      • SIGNATURE_INVALID — 旧 key 签名无效
+      • NEW_KEY_PROOF_INVALID — 新 key proof 无效
+      • OWNER_MISMATCH — 非本 Agent 的 owner
+      • TIMESTAMP_EXPIRED — 请求过期
+      • NONCE_REPLAYED — nonce 重放
+    end note
+    SDK --> Dev : 抛出 httpx.HTTPStatusError\n本地状态不变
+end
+
+note over Dev, Registry
+轮换安全保证：
+1. 双签名证明：旧 key + 新 key 私钥均需可控
+2. 任一 key 私钥泄露无法单独完成轮换
+3. owner 绑定防止他人轮换你的 Agent key
+4. timestamp + nonce 防止重放攻击
+end note
+
+@enduml

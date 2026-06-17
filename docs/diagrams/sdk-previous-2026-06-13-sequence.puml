@@ -1,0 +1,64 @@
+@startuml
+title 2026-06-13 版本 SDK：Agent 发布、签名、验签抽象流程
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+<style>
+  participant {
+    Padding 28
+  }
+  box {
+    Padding 10
+  }
+</style>
+
+autonumber
+
+actor "开发者" as Dev
+participant "Registry" as Registry
+participant "Agent 调用者" as Caller
+participant "被调用 Agent" as Callee
+
+== Agent 身份注册 / 发布 ==
+
+Dev -> Dev : 本地生成 Agent keypair\n(private_key.pem + public_key.pem)
+Dev -> Registry : 注册 / 发布 Agent 身份\nagent_id + metadata + public_key
+Registry -> Registry : 写入或覆盖 Agent metadata
+Registry --> Dev : 发布成功\nAgent 身份进入 registry
+
+note over Dev,Registry
+旧版发布流程特征：
+1. Registry 主要接收 metadata，不验证发布请求
+   是否由 Agent 私钥签名
+2. 不建立 developer -> agent_id 的 owner 绑定
+3. 私钥由开发者本地文件或进程内管理
+4. 无 publish 签名证明 => 无密钥轮换双签名机制
+end note
+
+== 调用签名 ==
+
+Caller -> Caller : 使用本地私钥对\ncanonical request 签名
+Caller -> Callee : 发起请求\nbody + 签名 headers
+
+== 被调用方验签 ==
+
+Callee -> Registry : 查询调用方 Agent 身份\nagent_id / kid
+Registry --> Callee : 返回 metadata 与 public_key
+Callee -> Callee : 校验 timestamp / nonce / body digest
+Callee -> Callee : 使用 public_key 验证签名
+
+alt 验签通过
+    Callee --> Caller : 接受请求并处理业务
+else 验签失败
+    Callee --> Caller : 拒绝请求\n签名无效 / 未注册 / 重放 / key 不匹配
+end
+
+note over Dev,Caller
+旧版私钥由本地文件或进程内对象管理；
+当前版则改为 Vault 托管私钥并执行签名。
+详见 sdk-current-sequence.puml
+end note
+
+@enduml

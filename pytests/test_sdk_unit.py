@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from datetime import datetime
 
@@ -8,15 +9,11 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
 
-from agent_auth_sdk import (
-    AgentInstance,
-    AgentKey,
-    InMemoryNonceStore,
-    build_agent_id,
-    parse_agent_id,
-    render_agent_metadata,
-    select_verification_key,
-)
+from agent_auth_sdk import AgentInstance, InMemoryNonceStore
+from agent_auth_sdk.identity import build_agent_id, parse_agent_id
+from agent_auth_sdk.metadata import select_verification_key
+from agent_auth_sdk.models import AgentKey
+from agent_auth_sdk.publish import render_agent_metadata
 from agent_auth_sdk.config import STRICT_PROFILE, TEST_PROFILE
 from agent_auth_sdk.crypto import verify_signature
 from agent_auth_sdk.http_utils import build_canonical_request
@@ -70,6 +67,7 @@ class _FakeTransit:
             else None
         )
         self._sign_error = sign_error
+        self._created_keys: list[str] = []
 
     def read_key(self, name: str, mount_point: str = "transit"):
         return {
@@ -86,6 +84,10 @@ class _FakeTransit:
         message = base64.b64decode(kwargs["hash_input"])
         signature = self._private_key.sign(message, ec.ECDSA(hashes.SHA256()))
         return {"data": {"signature": "vault:v1:" + base64.b64encode(signature).decode("ascii")}}
+
+    def create_key(self, name: str, key_type: str = "ecdsa-p256", mount_point: str = "transit", **kwargs):
+        self._created_keys.append(name)
+        return {"data": {"name": name, "type": key_type}}
 
 
 class _FakeVaultClient:
@@ -384,3 +386,111 @@ def test_api_key_hash_uses_pbkdf2_and_verifies_legacy_hash() -> None:
     assert verify_api_key("secret-api-key", stored) is True
     assert verify_api_key("wrong", stored) is False
     assert verify_api_key("secret-api-key", legacy_hash_api_key("secret-api-key")) is True
+
+
+def test_from_vault_auto_create_key_enabled(monkeypatch) -> None:
+    """from_vault(auto_create_key=True) 在 key 不存在时自动创建。"""
+    private_pem, public_pem = _generate_es256_pem_pair()
+    fake_client = _FakeVaultClient(public_pem, private_pem)
+
+    from agent_auth_sdk import agent as agent_module
+    from agent_auth_sdk.vault_kms import _ensure_transit_key
+
+    # 记录 _ensure_transit_key 是否被调用
+    calls = []
+
+    def _tracking_ensure(config):
+        calls.append(config.key_name)
+        fake_transit = fake_client.secrets.transit
+        fake_transit.create_key(name=config.key_name, key_type="ecdsa-p256")
+
+    monkeypatch.setattr(agent_module, "_ensure_transit_key", _tracking_ensure)
+    monkeypatch.setattr(
+        agent_module,
+        "VaultTransitSigner",
+        lambda config: VaultTransitSigner(config, client=fake_client),
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "resolve_vault_public_key",
+        lambda config: VaultTransitPublicKeyResolver(config, client=fake_client).describe(),
+    )
+
+    agent = AgentInstance.from_vault(
+        domain="agent.example.com",
+        name="weather",
+        organization="Example Lab",
+        endpoint="https://agent.example.com/tasks",
+        vault_addr="http://127.0.0.1:8200",
+        vault_token="root",
+        allow_insecure_raw_token=True,
+        transit_mount="transit",
+        key_name="weather-agent",
+        auto_create_key=True,
+    )
+    assert len(calls) == 1
+    assert calls[0] == "weather-agent"
+    assert agent.metadata is not None
+    assert agent.metadata.keys[0].kid == "vault:transit/weather-agent"
+
+
+def test_from_vault_auto_create_key_default_off(monkeypatch) -> None:
+    """auto_create_key 默认 False，key 必须已存在。"""
+    private_pem, public_pem = _generate_es256_pem_pair()
+
+    from agent_auth_sdk import agent as agent_module
+
+    monkeypatch.setattr(
+        agent_module,
+        "VaultTransitSigner",
+        lambda config: VaultTransitSigner(
+            config, client=_FakeVaultClient(public_pem, private_pem)
+        ),
+    )
+    monkeypatch.setattr(
+        agent_module,
+        "resolve_vault_public_key",
+        lambda config: VaultTransitPublicKeyResolver(
+            config, client=_FakeVaultClient(public_pem, private_pem)
+        ).describe(),
+    )
+
+    agent = AgentInstance.from_vault(
+        domain="agent.example.com",
+        name="weather",
+        organization="Example Lab",
+        endpoint="https://agent.example.com/tasks",
+        vault_addr="http://127.0.0.1:8200",
+        vault_token="root",
+        allow_insecure_raw_token=True,
+        transit_mount="transit",
+        key_name="weather-agent",
+    )
+    assert agent.metadata is not None
+    assert agent.key_name == "weather-agent"
+
+
+def test_rotate_key_requires_mode_specification() -> None:
+    """rotate_key() 在两种方式都未提供时抛出 ValueError。"""
+    private_pem, public_pem = _generate_es256_pem_pair()
+    signer = _TestEs256Signer(private_pem, kid="vault:transit/weather-agent")
+    agent = AgentInstance.from_signer(
+        domain="agent.example.com",
+        name="weather",
+        organization="Example Lab",
+        endpoint="https://agent.example.com/tasks",
+        signer=signer,
+        public_key_pem=public_pem,
+        kid="vault:transit/weather-agent",
+    )
+
+    import asyncio
+
+    with pytest.raises(ValueError, match="Either new_key_name"):
+        asyncio.run(
+            agent.rotate_key(
+                registry_url="https://registry.example.com/registry/agents/rotate-key",
+                client_id="developer-a",
+                api_key="test-key",
+            )
+        )

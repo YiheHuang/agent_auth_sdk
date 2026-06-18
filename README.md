@@ -62,18 +62,21 @@ if not result.ok:
 
 ---
 
-## 六大核心接口
+## 核心接口
 
-SDK 对开发者暴露 6 个接口类别，对应以下入口：
+SDK 对开发者暴露 9 个核心接口，对应以下入口：
 
 | # | 接口 | 入口 | 说明 |
 |---|------|------|------|
 | 1 | 创建 Agent Metadata | `AgentInstance.from_vault()` | 从 Vault KMS 创建 Agent 身份 |
-| 2 | 发布到 Registry | `AgentInstance.publish()` | 将 metadata 发布到中心 Registry，含双重签名认证 |
-| 3 | 签名消息 | `AgentInstance.sign_http()` / `AgentInstance.sign_message()` | HTTP 请求签名 / 规范消息签名 |
-| 4 | 验签 | `verify_http_request()` / `verify_agent_message()` | HTTP 请求验签 / 消息验签（含 nonce 防重放） |
-| 5 | 查询 Metadata | `resolve_agent()` | 从 Registry 或 `/.well-known/agent.json` 解析 metadata |
-| 6 | 轮换密钥 | `AgentInstance.rotate_key()` | 双签名证明安全轮换 active key |
+| 2 | 导出 Metadata | `AgentInstance.export_metadata()` | 导出 `/.well-known/agent.json` 供发现 |
+| 3 | 发布到 Registry | `AgentInstance.publish()` | 将 metadata 发布到中心 Registry，含双重签名认证 |
+| 4 | 签名消息 | `AgentInstance.sign_http()` / `AgentInstance.sign_message()` | HTTP 请求签名 / 规范消息签名 |
+| 5 | 验签 | `verify_http_request()` / `verify_agent_message()` | HTTP 请求验签 / 消息验签（含 nonce 防重放） |
+| 6 | 查询 Metadata | `resolve_agent()` | 从 Registry 或 `/.well-known/agent.json` 解析 metadata |
+| 7 | 轮换密钥 | `AgentInstance.rotate_key()` | 双签名证明安全轮换 active key |
+| 8 | 添加密钥 | `AgentInstance.add_key()` | 追加额外活跃密钥，保留已有 key |
+| 9 | 撤销密钥/Agent | `AgentInstance.revoke_key()` / `AgentInstance.revoke_agent()` | 显式撤销 key 或整个 Agent |
 
 > 完整接口文档见 **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)**。Vault 环境配置指南见 **[docs/VAULT_SETUP.md](docs/VAULT_SETUP.md)**。Registry `agent.json` 结构说明见 **[docs/REGISTRY_AGENT_JSON.md](docs/REGISTRY_AGENT_JSON.md)**。
 
@@ -150,7 +153,9 @@ config = MetadataResolverConfig(profile=TEST_PROFILE, registry_url="http://127.0
 | code | 含义 |
 |------|------|
 | `INVALID_AGENT_ID` | agent_id 格式无效 |
+| `INVALID_METADATA` | metadata 格式无效或校验失败 |
 | `METADATA_FETCH_FAILED` | 无法获取或解析 metadata |
+| `METADATA_HOST_MISMATCH` | metadata 域名与 agent_id 不匹配 |
 | `KEY_NOT_FOUND` / `KEY_REVOKED` / `KEY_EXPIRED` | 验签 key 不可用 |
 | `SIGNATURE_INVALID` | 签名缺失或验签失败 |
 | `TIMESTAMP_EXPIRED` | timestamp 超出允许偏移 |
@@ -172,7 +177,7 @@ config = MetadataResolverConfig(profile=TEST_PROFILE, registry_url="http://127.0
 
 ## Demo 项目
 
-多 Agent 工单协作演示：**[agent_auth_demoproject](../agent_auth_demoproject)**，展示 4 个 Agent 完成签名、验签、攻击防御的完整流程。
+多 Agent 代码审查演示：**[agent_auth_demoproject](../agent_auth_demoproject)**，展示 5 个 Agent（Coordinator + Architecture / Security / Performance / Compliance 四个审查专家）完成签名、验签、攻击防御的完整流程。
 
 ## Changelog
 

@@ -219,7 +219,7 @@
 - `metadata: AgentMetadata` — Agent 的完整身份 metadata
 - `resolved_at: datetime` — 解析时间
 - `etag: str | None` — HTTP ETag（用于条件请求）
-- `source_url: str` — metadata 来源 URL
+- `source_url: str | None` — metadata 来源 URL
 
 **内部逻辑**：
 1. 若提供了 `cache`，检查缓存中是否有有效的 metadata，若有则携带 `If-None-Match` header

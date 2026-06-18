@@ -36,7 +36,7 @@ AgentRegistryDocument          ← 顶层，Registry 对外暴露
         ├── keys: [AgentKey]
         │   ├── kid: str
         │   ├── alg: "ES256"
-        │   ├── status: "active"|"inactive"
+        │   ├── status: "active"|"inactive"|"revoked"
         │   ├── public_key_base64url: str|null
         │   ├── public_key_pem: str|null
         │   ├── not_before: datetime|null

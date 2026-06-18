@@ -50,6 +50,7 @@ agent-auth-registry-admin create-developer --client-id <your-client-id>
 | `POST /registry/agents/rotate-key` | 轮换密钥 |
 | `POST /registry/agents/add-key` | 添加额外活跃密钥 |
 | `POST /registry/agents/revoke-key` | 撤销密钥 |
+| `POST /registry/agents/revoke` | 撤销 Agent（不可逆） |
 
 ## 日常运维
 

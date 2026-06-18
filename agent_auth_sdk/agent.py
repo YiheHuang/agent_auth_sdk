@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -421,6 +422,8 @@ class AgentInstance:
         payload_type: str = "application/json",
         recipient: str | None = None,
         message_type: str | None = None,
+        timestamp: datetime | str | None = None,
+        nonce: str | None = None,
     ) -> SignedAgentMessage:
         return await sign_agent_message(
             agent_id=self.agent_id,
@@ -429,4 +432,6 @@ class AgentInstance:
             payload_type=payload_type,
             recipient=recipient,
             message_type=message_type,
+            timestamp=timestamp,
+            nonce=nonce,
         )

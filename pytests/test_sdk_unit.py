@@ -227,6 +227,28 @@ def test_agent_instance_from_signer_builds_metadata() -> None:
     assert agent.metadata.keys[0].alg == "ES256"
 
 
+@pytest.mark.anyio
+async def test_agent_instance_sign_message_accepts_nonce() -> None:
+    private_pem, public_pem = _generate_es256_pem_pair()
+    signer = _TestEs256Signer(private_pem, kid="vault:test")
+    agent = AgentInstance.from_signer(
+        domain="agent.example.com",
+        name="weather",
+        organization="Example Lab",
+        endpoint="https://agent.example.com/tasks",
+        signer=signer,
+        public_key_pem=public_pem,
+        kid="vault:test",
+    )
+    message = await agent.sign_message(
+        payload={"hello": "world"},
+        recipient="agent://agent.example.com/coordinator",
+        message_type="demo",
+        nonce="fixed-nonce",
+    )
+    assert message.nonce == "fixed-nonce"
+
+
 def test_vault_resolver_accepts_p256_key() -> None:
     private_pem, public_pem = _generate_es256_pem_pair()
     resolver = VaultTransitPublicKeyResolver(

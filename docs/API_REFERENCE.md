@@ -120,6 +120,8 @@
 | `payload_type` | `str` | 否 | 载荷类型，默认 `"application/json"` |
 | `recipient` | `str` | 否 | 目标 Agent 的 agent_id（如 `"agent://example.com/resolver"`） |
 | `message_type` | `str` | 否 | 消息类型标识（如 `"ticket.update"`） |
+| `timestamp` | `datetime \| str` | 否 | 指定签名时间；默认使用当前 UTC 时间 |
+| `nonce` | `str` | 否 | 指定 nonce；默认自动生成 UUID4。测试重放攻击或接入外部编排器时可显式传入 |
 
 **返回值**：`SignedAgentMessage` 对象，包含 `agent_id`、`kid`、`alg`、`timestamp`、`nonce`、`payload_type`、`payload`、`signature`、`recipient`、`message_type` 等字段。
 

@@ -1,18 +1,191 @@
 # Agent Auth SDK
 
-`agent-auth-sdk` 是一个 Python SDK，为多 Agent 系统提供从身份声明到跨 Agent 调用认证的最小可用协议。核心能力包括 Agent 身份创建、Registry 发布、HTTP 请求签名与验签、规范消息签名与验签，以及密钥安全轮换。
+`agent-auth-sdk` 是一个面向多 Agent 系统的身份认证 SDK。它提供 Agent metadata 发布、Vault Transit 私钥托管、Registry 公钥发现、HTTP/消息签名验签、nonce 防重放、key rotation/revoke，以及面向 OpenAI Agents SDK 的轻量显式接入层。
 
 当前版本：`1.0.0b1`
 
-## Quick Start
+## 适用场景
 
-### 安装
+- 为每个 Agent 建立稳定身份：`agent://{domain}/{role}`
+- 将 Agent metadata 和公钥发布到中心 Registry
+- 私钥保留在开发者本地 Vault Transit 中，不导出
+- 在跨 Agent 调用边界验证“谁调用了谁、payload 是否被篡改、结果是否可信”
+- 在 OpenAI Agents SDK 项目里，用很少的代码改动接入认证
+
+## 安装
 
 ```powershell
+cd D:\FDU\agent_auth\agent_auth_sdk
 pip install -e .
 ```
 
-### 创建 Agent（Vault Transit）
+安装后可使用 CLI：
+
+```powershell
+agent-auth --help
+agent-auth integrate-openai-agents --help
+```
+
+## 文档地图
+
+- [API_REFERENCE.md](docs/API_REFERENCE.md): 核心 SDK API 和 OpenAI Agents 集成接口
+- [OPENAI_AGENTS_INTEGRATION.md](docs/OPENAI_AGENTS_INTEGRATION.md): OpenAI Agents SDK 轻量接入指南
+- [VAULT_SETUP.md](docs/VAULT_SETUP.md): Vault Transit 环境配置
+- [REGISTRY_AGENT_JSON.md](docs/REGISTRY_AGENT_JSON.md): Registry `agent.json` 文档结构
+- [agent_auth_demo_simple_integration](../agent_auth_demo_simple_integration): 三个轻量接入 demo
+- [agent_auth_agents_demoproject](../agent_auth_agents_demoproject): 更完整的 OpenAI Agents SDK 认证 demo
+
+## 核心概念
+
+### Agent 身份
+
+每个 Agent 都有一个稳定 ID：
+
+```text
+agent://127.0.0.1:8711/security
+```
+
+其中 host/domain 用于 metadata 发现，path 末尾通常对应 role 名。
+
+### Metadata 与 Registry
+
+Agent metadata 包含：
+
+- `agent_id`
+- domain/name/organization/endpoint
+- capabilities
+- public keys
+- signing/verification policy
+
+开发者将 metadata 发布到中心 Registry 后，其他 Agent 可以通过 Registry 解析发送方公钥并完成验签。
+
+### Vault Transit
+
+生产/真实模式下，私钥由 Vault Transit 管理：
+
+- SDK 只读取公钥
+- 签名通过 Vault Transit API 完成
+- 私钥不可导出
+
+### 跨 Agent 调用认证
+
+原始跨 Agent 调用：
+
+```text
+Runner.run(target_agent, payload)
+```
+
+接入后：
+
+```text
+source 签名请求
+target 验证请求
+Runner.run(target_agent, payload)
+target 签名结果
+source 验证结果
+返回可信 payload
+```
+
+开发者不需要手写签名协议，OpenAI Agents SDK 项目只需要在跨 Agent tool 边界调用 `auth.call_agent(...)`。
+
+## OpenAI Agents SDK 轻量接入
+
+### 1. 生成接入脚手架
+
+```powershell
+agent-auth integrate-openai-agents `
+  --project-root . `
+  --roles coordinator,security,architecture `
+  --mode vault `
+  --domain 127.0.0.1:8711 `
+  --organization "Agent Auth Simple Original" `
+  --registry-url http://192.144.228.237/.well-known/agent.json `
+  --registry-publish-url http://192.144.228.237/registry/agents/publish `
+  --role-capability coordinator:review.coordinate `
+  --role-capability security:review.security `
+  --role-capability architecture:review.architecture
+```
+
+CLI 会生成：
+
+```text
+.agent-auth/
+  agent-auth.toml
+  auth_adapter.py
+  env.local.example
+  env.vault.example
+  INTEGRATION_REPORT.md
+```
+
+CLI 不修改业务源码。
+
+### 2. 填写真实环境
+
+在项目中新增或复制环境文件，例如 `.agent-auth/env.vault.ps1`：
+
+```powershell
+$env:AGENT_AUTH_ENABLED = "1"
+$env:AGENT_AUTH_MODE = "vault"
+
+$env:AGENT_AUTH_REGISTRY_CLIENT_ID = "your-client-id"
+$env:AGENT_AUTH_REGISTRY_API_KEY = "your-api-key"
+
+$env:AGENT_AUTH_VAULT_ADDR = "http://127.0.0.1:8300"
+$env:AGENT_AUTH_VAULT_TOKEN_FILE = "D:\path\to\vault-token.txt"
+$env:AGENT_AUTH_VAULT_TRANSIT_MOUNT = "transit"
+
+$env:AGENT_AUTH_COORDINATOR_KEY_NAME = "my-coordinator-key"
+$env:AGENT_AUTH_SECURITY_KEY_NAME = "my-security-key"
+```
+
+### 3. 在 tool 边界显式接入
+
+原始代码：
+
+```python
+@function_tool
+async def run_security_review(payload: dict) -> dict:
+    return await Runner.run(security, payload)
+```
+
+接入后：
+
+```python
+auth = await get_auth_adapter()
+
+@function_tool
+async def run_security_review(payload: dict) -> dict:
+    return await auth.call_agent(
+        source_role="coordinator",
+        target_role="security",
+        target_agent=security,
+        payload=payload,
+        runner=Runner.run,
+    )
+```
+
+这就是主要改动。Agent 定义、`function_tool`、`Runner.run`、payload 结构和业务 handler 都保持原样。
+
+### 4. 运行
+
+```powershell
+. .\.agent-auth\env.vault.ps1
+python -m your_project.app
+```
+
+输出中可以记录：
+
+```json
+"trusted_interactions": [
+  "coordinator -> security -> coordinator verified"
+]
+```
+
+详细说明见 [OPENAI_AGENTS_INTEGRATION.md](docs/OPENAI_AGENTS_INTEGRATION.md)。
+
+## 核心 SDK 快速示例
+
+### 创建 Agent
 
 ```python
 from agent_auth_sdk import AgentInstance
@@ -27,160 +200,70 @@ agent = AgentInstance.from_vault(
     transit_mount="transit",
     key_name="weather-agent",
     capabilities=["weather.query", "sign", "verify"],
+    auto_create_key=True,
 )
-print(agent.agent_id)  # agent://agent.example.com/weather
 ```
 
-### 签名 HTTP 请求
+### 发布到 Registry
 
 ```python
-signed = await agent.sign_http(method="POST", url="https://peer.example.com/tasks", body={"task": "hello"})
-headers = signed.headers  # 附加到出站请求
-```
-
-### 验证 HTTP 请求
-
-```python
-from agent_auth_sdk import (
-    FileMetadataCache,
-    InMemoryNonceStore,
-    MetadataResolverConfig,
-    VerificationConfig,
-    verify_http_request,
+await agent.publish(
+    registry_url="https://registry.example.com/registry/agents/publish",
+    client_id="developer-a",
+    api_key="your-api-key",
 )
-
-result = await verify_http_request(
-    method="POST", url="...", headers=request_headers, body=request_body,
-    nonce_store=InMemoryNonceStore(),
-    cache=FileMetadataCache("runtime/metadata-cache.sqlite3"),
-    http_client=http_client,
-    resolver_config=MetadataResolverConfig(registry_url="https://registry.example.com/.well-known/agent.json"),
-)
-if not result.ok:
-    raise PermissionError(f"{result.code}: {result.reason}")
 ```
-
----
-
-## 核心接口
-
-SDK 对开发者暴露 9 个核心接口，对应以下入口：
-
-| # | 接口 | 入口 | 说明 |
-|---|------|------|------|
-| 1 | 创建 Agent Metadata | `AgentInstance.from_vault()` | 从 Vault KMS 创建 Agent 身份 |
-| 2 | 导出 Metadata | `AgentInstance.export_metadata()` | 导出 `/.well-known/agent.json` 供发现 |
-| 3 | 发布到 Registry | `AgentInstance.publish()` | 将 metadata 发布到中心 Registry，含双重签名认证 |
-| 4 | 签名消息 | `AgentInstance.sign_http()` / `AgentInstance.sign_message()` | HTTP 请求签名 / 规范消息签名 |
-| 5 | 验签 | `verify_http_request()` / `verify_agent_message()` | HTTP 请求验签 / 消息验签（含 nonce 防重放） |
-| 6 | 查询 Metadata | `resolve_agent()` | 从 Registry 或 `/.well-known/agent.json` 解析 metadata |
-| 7 | 轮换密钥 | `AgentInstance.rotate_key()` | 双签名证明安全轮换 active key |
-| 8 | 添加密钥 | `AgentInstance.add_key()` | 追加额外活跃密钥，保留已有 key |
-| 9 | 撤销密钥/Agent | `AgentInstance.revoke_key()` / `AgentInstance.revoke_agent()` | 显式撤销 key 或整个 Agent |
-
-> 完整接口文档见 **[docs/API_REFERENCE.md](docs/API_REFERENCE.md)**。Vault 环境配置指南见 **[docs/VAULT_SETUP.md](docs/VAULT_SETUP.md)**。Registry `agent.json` 结构说明见 **[docs/REGISTRY_AGENT_JSON.md](docs/REGISTRY_AGENT_JSON.md)**。
 
 ### 签名与验签消息
 
 ```python
-# 签名
 msg = await agent.sign_message(
     payload={"ticket_id": "T-1001", "status": "triaged"},
     recipient="agent://agent.example.com/resolver",
     message_type="ticket.update",
 )
 
-# 验签
-result = await verify_agent_message(message=msg, nonce_store=nonce_store, http_client=http_client)
-```
-
-### 轮换 Agent Key
-
-```python
-result = await agent.rotate_key(
-    registry_url="https://registry.example.com/registry/agents/rotate-key",
-    client_id="developer-a", api_key="your-api-key",
-    new_signer=new_signer, new_public_key_pem=new_pem, new_kid="vault:transit/weather-agent-v2",
+result = await verify_agent_message(
+    message=msg,
+    nonce_store=nonce_store,
+    http_client=http_client,
 )
+if not result.ok:
+    raise PermissionError(f"{result.code}: {result.reason}")
 ```
 
-### 本地测试环境
+## 运行测试
 
-```python
-from agent_auth_sdk.config import TEST_PROFILE
-from agent_auth_sdk import MetadataResolverConfig, VerificationConfig
-
-config = MetadataResolverConfig(profile=TEST_PROFILE, registry_url="http://127.0.0.1:8008/.well-known/agent.json")
+```powershell
+cd D:\FDU\agent_auth\agent_auth_sdk
+python -m pytest -q
 ```
 
----
+当前验证结果：
 
-## Core Concepts
+```text
+55 passed, 1 skipped
+```
 
-### Agent ID
+## 安全建议
 
-格式：`agent://{host}/{name}`。`host` 用于定位 metadata well-known URL；strict profile 下要求 HTTPS 并拒绝 IP host。
-
-### Metadata
-
-单个 Agent 的 `/.well-known/agent.json` 包含身份、endpoint、capabilities、public keys、签名/验签策略。中心 Registry 的 `/.well-known/agent.json` 是聚合文档。
-
-### Registry Publish
-
-发布流程：(1) Agent key 签名 publish canonical string，(2) Registry 校验 developer API key，(3) 首次发布建立 `agent_id → developer_id` owner 绑定，(4) 后续发布必须同一 owner 且不能偷换 key。
-
-### Key Rotation
-
-必须走 `POST /registry/agents/rotate-key`。安全条件：developer API key 有效 + 旧 key 签名完整请求 + 新 key 签名 proof + timestamp 未过期 + nonce 不重放 + owner 匹配。
-
-### Nonce & Timestamp
-
-所有签名请求包含 timestamp 和 nonce：timestamp 拒绝过期请求，nonce 拒绝重放。生产多实例应使用共享 nonce store（如 Redis）。时序偏移由 profile 的 `clock_skew_seconds` 控制。
-
----
-
-## Runtime Profiles
-
-| Profile | HTTP | IP Host | 用途 |
-|---------|------|---------|------|
-| `STRICT_PROFILE`（默认） | 禁止 | 禁止 | 生产环境 |
-| `TEST_PROFILE` | 允许 | 允许 | 本地测试与 demo |
-
----
-
-## 常见验签错误码
-
-| code | 含义 |
-|------|------|
-| `INVALID_AGENT_ID` | agent_id 格式无效 |
-| `INVALID_METADATA` | metadata 格式无效或校验失败 |
-| `METADATA_FETCH_FAILED` | 无法获取或解析 metadata |
-| `METADATA_HOST_MISMATCH` | metadata 域名与 agent_id 不匹配 |
-| `KEY_NOT_FOUND` / `KEY_REVOKED` / `KEY_EXPIRED` | 验签 key 不可用 |
-| `SIGNATURE_INVALID` | 签名缺失或验签失败 |
-| `TIMESTAMP_EXPIRED` | timestamp 超出允许偏移 |
-| `NONCE_REPLAYED` | nonce 已使用（重放攻击） |
-| `POLICY_REJECTED` | 当前 profile 或策略拒绝请求 |
-
----
-
-## Security
-
-- 使用 HTTPS registry 和 HTTPS Vault（生产）
-- 使用 `STRICT_PROFILE`，不在公网使用 HTTP 或 IP host
-- 使用 `vault_token_file`，不传 raw token
-- Vault Transit key 使用 `ecdsa-p256`，私钥不可导出
-- Registry API key 只保存 PBKDF2-HMAC-SHA256 hash
-- 多实例部署使用共享 nonce store（如 Redis）
-
----
-
-## Demo 项目
-
-多 Agent 代码审查演示：**[agent_auth_demoproject](../agent_auth_demoproject)**，展示 5 个 Agent（Coordinator + Architecture / Security / Performance / Compliance 四个审查专家）完成签名、验签、攻击防御的完整流程。
+- 生产环境使用 HTTPS Registry 和 HTTPS Vault
+- 生产环境使用 `STRICT_PROFILE`
+- 使用 `vault_token_file`，不要把 raw token 写进代码
+- Vault Transit key 使用 `ecdsa-p256`
+- Registry API key 应由 Registry 端以 PBKDF2-HMAC-SHA256 hash 保存
+- 多实例部署时使用共享 nonce store，例如 Redis
+- 不要在公开仓库提交真实 API key、Vault token 或生产 registry 凭证
 
 ## Changelog
 
 ### 1.0.0b1
 
-首次 beta 版本：Agent metadata、Registry 发布与 owner 绑定、Vault Transit ES256 签名、HTTP 请求/规范消息的签名与验签、timestamp + nonce 防重放、STRICT/TEST profile、rotate-key 双签名证明。
+- Agent metadata、Registry 发布与 owner 绑定
+- Vault Transit ES256 签名
+- HTTP 请求签名与验签
+- 规范消息签名与验签
+- timestamp + nonce 防重放
+- STRICT/TEST runtime profile
+- key rotation、add-key、revoke-key、revoke-agent
+- OpenAI Agents SDK 显式轻量接入 CLI 与 runtime

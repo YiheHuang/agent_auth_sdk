@@ -43,6 +43,7 @@ dev = [
 ]
 
 [project.scripts]
+agent-auth = "agent_auth_sdk.cli:app"
 agent-auth-registry = "agent_auth_registry.run:main"
 agent-auth-registry-admin = "agent_auth_registry.admin:app"
 

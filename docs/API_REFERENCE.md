@@ -425,4 +425,179 @@ agent-auth-registry-admin revoke-agent --agent-id agent://<host>/<name>
 
 基于 SQLite 文件的持久化 metadata 缓存，适用于生产单实例部署。
 
+---
+
+## 10. OpenAI Agents SDK 显式集成
+
+该集成位于：
+
+```python
+from agent_auth_sdk.integrations.openai_agents import (
+    AuthenticatedOpenAIAgents,
+    OpenAIAgentsAuthConfig,
+    OpenAIAgentsAuthRuntime,
+)
+```
+
+设计原则：不 monkey patch OpenAI Agents SDK；开发者在跨 Agent tool 边界显式调用 `auth.call_agent(...)`。
+
+### `OpenAIAgentsAuthConfig`
+
+**用途**：保存 OpenAI Agents SDK 接入所需配置，包括 roles、capabilities、registry、vault、runtime profile 和 runtime 目录。
+
+常用字段：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `roles` | `tuple[str, ...]` | 项目中的 Agent role 列表 |
+| `mode` | `str` | `"local"` 或 `"vault"` |
+| `domain` | `str` | 构造 `agent://{domain}/{role}` 的 domain |
+| `organization` | `str` | 写入 Agent metadata 的组织名 |
+| `runtime_dir` | `Path` | metadata cache / runtime 输出目录 |
+| `registry_url` | `str \| None` | Registry 聚合文档地址 |
+| `registry_publish_url` | `str \| None` | Registry publish endpoint |
+| `registry_client_id` | `str \| None` | Developer client id |
+| `registry_api_key` | `str \| None` | Developer API key |
+| `profile` | `str` | `"test"` 或 `"strict"` |
+| `capabilities` | `dict[str, str]` | role -> capability |
+| `vault_addr` | `str \| None` | Vault 地址 |
+| `vault_token_file` | `str \| None` | Vault token 文件 |
+| `vault_transit_mount` | `str` | Transit mount，默认 `"transit"` |
+| `vault_key_names` | `dict[str, str]` | role -> Transit key name |
+| `auto_create_vault_keys` | `bool` | 是否自动创建 Vault Transit key |
+
+#### `OpenAIAgentsAuthConfig.from_file(path)`
+
+从 `.agent-auth/agent-auth.toml` 读取配置，并展开环境变量。
+
+```python
+config = OpenAIAgentsAuthConfig.from_file(".agent-auth/agent-auth.toml")
+```
+
+### `OpenAIAgentsAuthRuntime`
+
+**用途**：根据 config 创建每个 role 对应的 `AgentInstance`，维护 nonce store，并负责签名、验签、Registry 解析。
+
+#### `OpenAIAgentsAuthRuntime.create(config)`
+
+```python
+runtime = await OpenAIAgentsAuthRuntime.create(config)
+```
+
+- `mode="local"`：创建本地 ES256 signer 和 mock registry
+- `mode="vault"`：从 Vault Transit 创建/读取 key，并发布 metadata 到真实 Registry
+
+#### `runtime.sign_for_role(source_role, payload, recipient_role, message_type)`
+
+使用 `source_role` 对 payload 签名，返回 `SignedAgentMessage`。
+
+#### `runtime.verify_for_role(receiver_role, message, required_sender_capability=None)`
+
+以 `receiver_role` 身份验证 signed message，检查签名、recipient、nonce、timestamp 和 capability。
+
+### `AuthenticatedOpenAIAgents`
+
+**用途**：面向业务项目的主入口，开发者通常只需要使用这个类。
+
+#### `AuthenticatedOpenAIAgents.from_config(config)`
+
+创建认证 adapter：
+
+```python
+auth = await AuthenticatedOpenAIAgents.from_config(config)
+```
+
+#### `AuthenticatedOpenAIAgents.from_config_file(path)`
+
+从配置文件创建认证 adapter：
+
+```python
+auth = await AuthenticatedOpenAIAgents.from_config_file(".agent-auth/agent-auth.toml")
+```
+
+#### `auth.call_agent(...)`
+
+核心轻量接入接口。
+
+```python
+result = await auth.call_agent(
+    source_role="coordinator",
+    target_role="security",
+    target_agent=security,
+    payload=payload,
+    runner=Runner.run,
+    message_type="agent.call",
+)
+```
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `source_role` | `str` | 是 | 发起调用的 role |
+| `target_role` | `str` | 是 | 接收调用的 role |
+| `target_agent` | `Any` | 是 | 原 OpenAI Agents SDK Agent 对象 |
+| `payload` | `Any` | 是 | 原始业务 payload |
+| `runner` | callable | 是 | 通常传 `Runner.run` |
+| `message_type` | `str` | 否 | 消息类型前缀，默认 `"agent.call"` |
+
+内部流程：
+
+1. source role 签名请求 payload
+2. target role 验证请求
+3. 调用 `runner(target_agent, verified_payload)`
+4. target role 签名结果 payload
+5. source role 验证结果
+6. 返回已验签的 payload
+
+当 `AGENT_AUTH_ENABLED=0` 时，该方法直接调用 `runner(target_agent, payload)`，不执行签名验签。
+
+#### `auth.wrap_tool(...)`
+
+返回一个已经包好认证的 async callable：
+
+```python
+run_security_review = auth.wrap_tool(
+    source_role="coordinator",
+    target_role="security",
+    target_agent=security,
+    runner=Runner.run,
+)
+```
+
+#### `auth.trusted_events()`
+
+返回认证成功的交互记录：
+
+```python
+[
+    "coordinator -> security -> coordinator verified",
+]
+```
+
+### CLI: `agent-auth integrate-openai-agents`
+
+生成 `.agent-auth` 接入脚手架：
+
+```powershell
+agent-auth integrate-openai-agents `
+  --project-root . `
+  --roles coordinator,security,architecture `
+  --mode vault `
+  --domain 127.0.0.1:8711 `
+  --organization "Agent Auth App" `
+  --registry-url http://registry.example.com/.well-known/agent.json `
+  --registry-publish-url http://registry.example.com/registry/agents/publish `
+  --role-capability coordinator:review.coordinate `
+  --role-capability security:review.security
+```
+
+生成文件：
+
+- `.agent-auth/agent-auth.toml`
+- `.agent-auth/auth_adapter.py`
+- `.agent-auth/env.local.example`
+- `.agent-auth/env.vault.example`
+- `.agent-auth/INTEGRATION_REPORT.md`
+
+更多说明见 [OPENAI_AGENTS_INTEGRATION.md](OPENAI_AGENTS_INTEGRATION.md)。
+
 > **注意**：其他存储实现（`RedisNonceStore`、`InMemoryMetadataCache`）、协议类（`NonceStore`、`MetadataCache`、`Signer`）、数据模型等可通过子模块路径访问，详见 [README.md](../README.md) 和模块源码。

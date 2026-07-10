@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -11,10 +11,11 @@ import httpx
 from .config import MetadataResolverConfig, VerificationConfig
 from .crypto import verify_signature
 from .errors import VerificationErrorCode
-from .http_utils import build_canonical_request, canonicalize_headers
+from .http_utils import build_canonical_request, canonicalize_headers, parse_rfc3339_utc_seconds
 from .identity import parse_agent_id
 from .metadata import resolve_agent, select_verification_key
 from .models import VerificationFailure, VerificationSuccess
+from .signing import SIGNATURE_INPUT
 from .stores import MetadataCache, NonceStore
 
 
@@ -45,29 +46,30 @@ async def verify_http_request(
     nonce = normalized_headers.get("x-agent-nonce")
     signature = normalized_headers.get("x-agent-signature")
 
-    if config.require_signature_input_header and "x-agent-signature-input" not in normalized_headers:
-        return _failure(VerificationErrorCode.SIGNATURE_INVALID, "Missing x-agent-signature-input")
+    if config.require_signature_input_header:
+        signature_input = normalized_headers.get("x-agent-signature-input")
+        if signature_input != SIGNATURE_INPUT:
+            return _failure(VerificationErrorCode.SIGNATURE_INVALID, "Invalid x-agent-signature-input")
 
-    if not all([agent_id, kid, timestamp, nonce, signature]):
+    if not agent_id or not kid or not timestamp or not nonce or not signature:
         return _failure(VerificationErrorCode.SIGNATURE_INVALID, "Missing required signature headers")
 
     try:
         parse_agent_id(agent_id)
-    except Exception as exc:
-        return _failure(VerificationErrorCode.INVALID_AGENT_ID, str(exc))
+    except Exception:
+        return _failure(VerificationErrorCode.INVALID_AGENT_ID, "Invalid sender agent_id")
 
-    current = now or datetime.now(timezone.utc)
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None or current.utcoffset() is None:
+        return _failure(VerificationErrorCode.TIMESTAMP_EXPIRED, "Reference time must include a timezone")
+    current = current.astimezone(UTC)
     try:
-        request_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    except ValueError:
-        return _failure(VerificationErrorCode.TIMESTAMP_EXPIRED, "Invalid timestamp format")
+        request_time = parse_rfc3339_utc_seconds(timestamp)
+    except (TypeError, ValueError):
+        return _failure(VerificationErrorCode.TIMESTAMP_EXPIRED, "Invalid request timestamp")
 
     if abs((current - request_time).total_seconds()) > profile.clock_skew_seconds:
         return _failure(VerificationErrorCode.TIMESTAMP_EXPIRED, "Request timestamp is outside allowed skew")
-
-    nonce_key = f"{agent_id}:{nonce}"
-    if await nonce_store.has(nonce_key):
-        return _failure(VerificationErrorCode.NONCE_REPLAYED, "Nonce has already been used")
 
     try:
         resolved = await resolve_agent(
@@ -77,40 +79,48 @@ async def verify_http_request(
             cache=cache,
             config=resolver_config,
         )
-    except Exception as exc:
-        return _failure(VerificationErrorCode.METADATA_FETCH_FAILED, str(exc))
+    except Exception:
+        return _failure(VerificationErrorCode.METADATA_FETCH_FAILED, "Unable to resolve sender metadata")
 
     try:
         key = select_verification_key(resolved.metadata, kid=kid, now=current)
     except Exception as exc:
         reason = str(exc)
         if "revoked" in reason:
-            return _failure(VerificationErrorCode.KEY_REVOKED, reason)
+            return _failure(VerificationErrorCode.KEY_REVOKED, "Signing key is revoked")
         if "expired" in reason:
-            return _failure(VerificationErrorCode.KEY_EXPIRED, reason)
-        return _failure(VerificationErrorCode.KEY_NOT_FOUND, reason)
+            return _failure(VerificationErrorCode.KEY_EXPIRED, "Signing key is expired")
+        return _failure(VerificationErrorCode.KEY_NOT_FOUND, "Signing key is unavailable")
 
-    canonical, _ = build_canonical_request(
-        method=method,
-        url=url,
-        body=body,
-        agent_id=agent_id,
-        kid=kid,
-        timestamp=timestamp,
-        nonce=nonce,
-        host=normalized_headers.get("host"),
-    )
-    verified = verify_signature(
-        public_key_pem=key.public_key_pem,
-        public_key_base64url=key.public_key_base64url,
-        data=canonical.encode("utf-8"),
-        signature_base64url=signature,
-        alg=key.alg,
-    )
+    try:
+        canonical, _ = build_canonical_request(
+            method=method,
+            url=url,
+            body=body,
+            agent_id=agent_id,
+            kid=kid,
+            timestamp=timestamp,
+            nonce=nonce,
+            host=normalized_headers.get("host"),
+        )
+    except (TypeError, ValueError):
+        return _failure(VerificationErrorCode.SIGNATURE_INVALID, "Request body is not canonical JSON")
+    try:
+        verified = verify_signature(
+            public_key_pem=key.public_key_pem,
+            public_key_base64url=key.public_key_base64url,
+            data=canonical.encode("utf-8"),
+            signature_base64url=signature,
+            alg=key.alg,
+        )
+    except Exception:
+        return _failure(VerificationErrorCode.INVALID_METADATA, "Verification key material is invalid")
     if not verified:
         return _failure(VerificationErrorCode.SIGNATURE_INVALID, "Signature verification failed")
 
-    await nonce_store.set(nonce_key, profile.nonce_ttl_seconds)
+    nonce_key = f"http:{agent_id}:{nonce}"
+    if not await nonce_store.consume(nonce_key, profile.nonce_ttl_seconds):
+        return _failure(VerificationErrorCode.NONCE_REPLAYED, "Nonce has already been used")
     return VerificationSuccess(
         agent_id=agent_id,
         kid=kid,

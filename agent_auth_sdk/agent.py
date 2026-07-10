@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
-from .crypto import public_key_to_base64url
+from .config import SigningConfig
+from .crypto import Signer, public_key_to_base64url
 from .identity import build_agent_id
 from .messaging import sign_agent_message
-from .models import AgentAuditConfig, AgentKey, AgentMetadata, SignedAgentMessage
+from .models import AgentAuditConfig, AgentKey, AgentMetadata, SignatureHeaders, SignedAgentMessage
 from .publish import (
     add_key_in_registry,
     export_well_known,
@@ -22,7 +24,13 @@ from .publish import (
     rotate_key_in_registry,
 )
 from .signing import sign_http_request
-from .vault_kms import VaultKmsConfig, VaultTransitSigner, _ensure_transit_key, resolve_vault_public_key
+from .vault_kms import (
+    VaultKmsConfig,
+    VaultTransitPublicKeyResolver,
+    VaultTransitSigner,
+    _build_vault_client,
+    _ensure_transit_key,
+)
 
 
 @dataclass(slots=True)
@@ -40,7 +48,7 @@ class AgentInstance:
     capabilities: list[str]
     environment: str | None = None
     metadata: AgentMetadata | None = None
-    signer_override: object | None = None
+    signer_override: Signer | None = None
     key_name: str | None = None
 
     @classmethod
@@ -63,7 +71,7 @@ class AgentInstance:
         environment: str | None = None,
         kid: str | None = None,
         auto_create_key: bool = False,
-    ) -> "AgentInstance":
+    ) -> AgentInstance:
         config = VaultKmsConfig(
             vault_addr=vault_addr,
             transit_mount=transit_mount,
@@ -75,11 +83,14 @@ class AgentInstance:
             verify=verify,
             kid=kid,
         )
+        client = _build_vault_client(config)
         if auto_create_key:
-            _ensure_transit_key(config)
-        signer = VaultTransitSigner(config)
+            _ensure_transit_key(config, client=client)
+        description = VaultTransitPublicKeyResolver(config, client=client).describe()
+        resolved_kid = kid or f"vault:{transit_mount}/{key_name}:v{description.latest_version}"
+        pinned_config = replace(config, kid=resolved_kid, key_version=description.latest_version)
+        signer = VaultTransitSigner(pinned_config, client=client)
         signer.validate_access()
-        description = resolve_vault_public_key(config)
         return cls.from_signer(
             domain=domain,
             name=name,
@@ -87,7 +98,7 @@ class AgentInstance:
             endpoint=endpoint,
             signer=signer,
             public_key_pem=description.public_key_pem,
-            kid=kid or f"vault:{transit_mount}/{key_name}",
+            kid=resolved_kid,
             capabilities=capabilities,
             environment=environment,
             alg="ES256",
@@ -102,14 +113,14 @@ class AgentInstance:
         name: str,
         organization: str,
         endpoint: str,
-        signer: object,
+        signer: Signer,
         public_key_pem: str,
         kid: str,
         capabilities: list[str] | None = None,
         environment: str | None = None,
-        alg: str = "ES256",
+        alg: Literal["ES256"] = "ES256",
         key_name: str | None = None,
-    ) -> "AgentInstance":
+    ) -> AgentInstance:
         agent_id = build_agent_id(domain, name)
         metadata = render_agent_metadata(
             agent_id=agent_id,
@@ -149,7 +160,7 @@ class AgentInstance:
         )
 
     @property
-    def signer(self):
+    def signer(self) -> Signer:
         if self.signer_override is None:
             raise ValueError("signer is not available; use from_vault() or from_signer()")
         return self.signer_override
@@ -184,10 +195,10 @@ class AgentInstance:
         self,
         *,
         new_key_name: str | None = None,
-        new_signer: object | None = None,
+        new_signer: Signer | None = None,
         new_public_key_pem: str | None = None,
         new_kid: str | None = None,
-    ) -> tuple[object, str, str]:
+    ) -> tuple[Signer, str, str]:
         """解析新 key 的 signer、公钥 PEM 和 kid。
 
         支持两种模式：
@@ -198,7 +209,9 @@ class AgentInstance:
             (new_signer_obj, new_public_key_pem, new_kid) 三元组。
         """
         if new_key_name is not None:
-            current_config = self.signer._config  # type: ignore[attr-defined]
+            if not isinstance(self.signer, VaultTransitSigner):
+                raise ValueError("new_key_name requires a VaultTransitSigner")
+            current_config = self.signer.config
             new_config = VaultKmsConfig(
                 vault_addr=current_config.vault_addr,
                 transit_mount=current_config.transit_mount,
@@ -209,14 +222,17 @@ class AgentInstance:
                 verify=current_config.verify,
                 allow_insecure_raw_token=current_config.allow_insecure_raw_token,
             )
-            _ensure_transit_key(new_config)
-            new_signer_obj: object = VaultTransitSigner(new_config)
-            new_signer_obj.validate_access()  # type: ignore[union-attr]
-            description = resolve_vault_public_key(new_config)
+            client = self.signer.client
+            _ensure_transit_key(new_config, client=client)
+            description = VaultTransitPublicKeyResolver(new_config, client=client).describe()
+            resolved_kid = f"vault:{current_config.transit_mount}/{new_key_name}:v{description.latest_version}"
+            pinned_config = replace(new_config, kid=resolved_kid, key_version=description.latest_version)
+            new_signer_obj = VaultTransitSigner(pinned_config, client=client)
+            new_signer_obj.validate_access()
             return (
                 new_signer_obj,
                 description.public_key_pem,
-                f"vault:{current_config.transit_mount}/{new_key_name}",
+                resolved_kid,
             )
 
         if new_signer is None or new_public_key_pem is None or new_kid is None:
@@ -233,7 +249,7 @@ class AgentInstance:
         client_id: str,
         api_key: str,
         # 方式 A（兼容）: 预创建的 signer（new_signer + new_public_key_pem + new_kid）
-        new_signer: object | None = None,
+        new_signer: Signer | None = None,
         new_public_key_pem: str | None = None,
         new_kid: str | None = None,
         # 方式 B（Vault 托管）: SDK 自动在 Vault 中创建新 key
@@ -254,6 +270,11 @@ class AgentInstance:
             public_key_base64url=public_key_to_base64url(new_public_key_pem),
             status="active",
         )
+        if self.metadata is not None and (
+            new_kid in {key.kid for key in self.metadata.keys} or new_kid in self.metadata.revoked_kids
+        ):
+            raise ValueError(f"kid has already been used: {new_kid}")
+        old_kid = self.kid
         result = await rotate_key_in_registry(
             agent_id=self.agent_id,
             new_key=new_key,
@@ -273,11 +294,16 @@ class AgentInstance:
             self.metadata = self.metadata.model_copy(
                 update={
                     "keys": [
-                        *(key.model_copy(update={"status": "inactive"}) if key.status == "active" else key for key in self.metadata.keys),
+                        *(
+                            key.model_copy(update={"status": "inactive"}) if key.kid == old_kid else key
+                            for key in self.metadata.keys
+                        ),
                         new_key,
                     ],
+                    "updated_at": datetime.now(UTC),
                 },
             )
+        self.key_name = new_key_name or self.key_name
         return result
 
     async def add_key(
@@ -287,7 +313,7 @@ class AgentInstance:
         client_id: str,
         api_key: str,
         # 方式 A（兼容）: 预创建的 signer
-        new_signer: object | None = None,
+        new_signer: Signer | None = None,
         new_public_key_pem: str | None = None,
         new_kid: str | None = None,
         # 方式 B（Vault 托管）: SDK 自动在 Vault 中创建新 key
@@ -313,6 +339,10 @@ class AgentInstance:
             public_key_base64url=public_key_to_base64url(new_public_key_pem),
             status="active",
         )
+        if self.metadata is not None and (
+            new_kid in {key.kid for key in self.metadata.keys} or new_kid in self.metadata.revoked_kids
+        ):
+            raise ValueError(f"kid has already been used: {new_kid}")
         result = await add_key_in_registry(
             agent_id=self.agent_id,
             new_key=new_key,
@@ -326,7 +356,7 @@ class AgentInstance:
         )
         if self.metadata is not None:
             self.metadata = self.metadata.model_copy(
-                update={"keys": [*self.metadata.keys, new_key]},
+                update={"keys": [*self.metadata.keys, new_key], "updated_at": datetime.now(UTC)},
             )
         return result
 
@@ -360,6 +390,9 @@ class AgentInstance:
         if target_key is None:
             raise ValueError(f"Key not found in metadata: {kid_to_revoke}")
 
+        if kid_to_revoke == self.kid:
+            raise ValueError("Cannot revoke the current signing key; rotate_key() first.")
+
         # 防锁死：不能撤销唯一的 active key
         if target_key.status == "active" and active_count <= 1:
             raise ValueError(
@@ -384,7 +417,11 @@ class AgentInstance:
             for key in self.metadata.keys
         ]
         self.metadata = self.metadata.model_copy(
-            update={"revoked_kids": updated_revoked, "keys": updated_keys},
+            update={
+                "revoked_kids": updated_revoked,
+                "keys": updated_keys,
+                "updated_at": datetime.now(UTC),
+            },
         )
         return result
 
@@ -412,8 +449,28 @@ class AgentInstance:
         )
         return result
 
-    async def sign_http(self, **kwargs: object):
-        return await sign_http_request(agent_id=self.agent_id, signer=self.signer, **kwargs)
+    async def sign_http(
+        self,
+        *,
+        method: str,
+        url: str,
+        body: bytes | str | dict | list | None,
+        headers: dict[str, str] | None = None,
+        config: SigningConfig | None = None,
+        timestamp: str | None = None,
+        nonce: str | None = None,
+    ) -> SignatureHeaders:
+        return await sign_http_request(
+            method=method,
+            url=url,
+            body=body,
+            agent_id=self.agent_id,
+            signer=self.signer,
+            headers=headers,
+            config=config,
+            timestamp=timestamp,
+            nonce=nonce,
+        )
 
     async def sign_message(
         self,

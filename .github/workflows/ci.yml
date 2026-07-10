@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[all,dev]"
+      - run: python -m pip install -e "packages/agent-auth-registry[dev]"
+      - run: python -m pytest -q
+
+  quality-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[all,dev]"
+      - run: python -m pip install -e "packages/agent-auth-registry[dev]"
+      - run: python -m ruff check agent_auth_sdk packages/agent-auth-registry/src pytests
+      - run: python -m ruff format --check agent_auth_sdk packages/agent-auth-registry/src pytests
+      - run: python -m mypy agent_auth_sdk
+      - name: Full project branch coverage
+        run: >-
+          python -m pytest
+          --cov=agent_auth_sdk
+          --cov=packages/agent-auth-registry/src/agent_auth_registry
+          --cov-branch --cov-report=term-missing --cov-fail-under=70
+      - name: Security core branch coverage
+        run: >-
+          python -m pytest
+          --cov=agent_auth_sdk.messaging
+          --cov=agent_auth_sdk.verification
+          --cov=agent_auth_sdk.stores
+          --cov=agent_auth_sdk.registry_security
+          --cov-branch --cov-report=term-missing --cov-fail-under=90
+      - run: python -m pip_audit --skip-editable
+      - run: python -m build --sdist --wheel
+      - run: python -m build --sdist --wheel packages/agent-auth-registry
+      - run: python -m twine check --strict dist/* packages/agent-auth-registry/dist/*
+
+  openai-agents-contract:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        openai_agents: ["openai-agents==0.2.0", "openai-agents<1"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]" "${{ matrix.openai_agents }}"
+      - run: python -m pytest -q pytests/test_openai_agents_contract.py pytests/test_openai_agents_integration.py

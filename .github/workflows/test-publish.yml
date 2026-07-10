@@ -1,0 +1,66 @@
+name: Publish to TestPyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact SDK and Registry version to verify
+        required: true
+        default: 0.1.0b1
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade build twine
+      - run: python -m build --sdist --wheel
+      - run: python -m build --sdist --wheel packages/agent-auth-registry
+      - run: cp packages/agent-auth-registry/dist/* dist/
+      - run: python -m twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: testpypi-distributions
+          path: dist/
+
+  publish-testpypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/agent-auth-sdk/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: testpypi-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  clean-install:
+    needs: publish-testpypi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install --upgrade pip
+      - name: Install both TestPyPI distributions
+        run: >-
+          python -m pip install
+          --index-url https://test.pypi.org/simple/
+          --extra-index-url https://pypi.org/simple/
+          "agent-auth-sdk==${{ inputs.version }}"
+          "agent-auth-registry==${{ inputs.version }}"
+      - run: agent-auth --help
+      - run: agent-auth-registry --help
+      - run: agent-auth-registry-admin --help

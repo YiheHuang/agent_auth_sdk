@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -107,6 +108,9 @@ security = "review.security"
 [registry]
 url = "http://127.0.0.1:8700/.well-known/agent.json"
 client_id = "${AGENT_AUTH_REGISTRY_CLIENT_ID}"
+
+[vault]
+token_file = "vault/token"
 """,
         encoding="utf-8",
     )
@@ -116,6 +120,7 @@ client_id = "${AGENT_AUTH_REGISTRY_CLIENT_ID}"
     assert config.roles == ("coordinator", "security")
     assert config.registry_client_id == "dev-client"
     assert config.runtime_dir == config_path.parent / "runtime"
+    assert config.vault_token_file == str(config_path.parent / "vault" / "token")
     assert config.capability_for("security") == "review.security"
 
 
@@ -142,4 +147,4 @@ def test_cli_generates_explicit_integration_files(tmp_path: Path) -> None:
     report = (auth_dir / "INTEGRATION_REPORT.md").read_text(encoding="utf-8")
     assert "No business source files were modified" in report
     config_text = (auth_dir / "agent-auth.toml").read_text(encoding="utf-8")
-    assert 'security = "review.security"' in config_text
+    assert '"security" = "review.security"' in config_text

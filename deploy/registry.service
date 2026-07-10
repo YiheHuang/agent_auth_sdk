@@ -4,13 +4,29 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=agent-auth
+Group=agent-auth
 WorkingDirectory=/opt/agent_auth_sdk
 EnvironmentFile=/etc/agent-auth/registry.env
 ExecStart=/opt/agent_auth_sdk/.venv/bin/python -m agent_auth_registry.run
 Restart=always
 RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LockPersonality=true
+ReadWritePaths=/opt/agent_auth_sdk/runtime
 
 [Install]
 WantedBy=multi-user.target

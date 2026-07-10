@@ -1,6 +1,22 @@
 # Changelog
 
-## 1.0.0b1 - 2026-06-12
+## 0.1.0b1 - 2026-07-10
+
+首个准备公开发布的安全重构 beta：
+
+- 修复首次发布可覆盖既有 Agent owner 的身份接管漏洞
+- developer 绑定不可重叠的 domain/path namespace
+- SDK、Redis、Registry SQLite 使用原子 nonce 消费
+- strict timestamp、canonical JSON、DER ES256 与协议 golden vectors
+- Registry 默认失败关闭，直接发现增加 DNS IP pinning 与 SSRF 防护
+- Registry 写操作以 SQLite 事务提交 nonce、状态和审计，并拒绝过期并发更新
+- HTTP/Registry 签名覆盖实际 body bytes，验签失败不泄漏底层解析异常
+- 新增 `AgentVerifier`、`RegistryClient`、`RemoteAgentClient` 与 ASGI middleware
+- Vault signer 固定 key version，token 隐藏且读取规则收紧
+- 拆分 `agent-auth-sdk` 与 `agent-auth-registry` 两个发行包
+- Registry HTTPS、非 root systemd、单 worker 和速率限制部署基线
+
+## 1.0.0b1 - 2026-06-12（未公开发布的内部 beta）
 
 首次 beta 版本，包含以下主要功能：
 

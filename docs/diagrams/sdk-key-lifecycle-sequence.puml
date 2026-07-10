@@ -24,7 +24,7 @@ SDK -> Vault : 创建 ecdsa-p256 key + 读取公钥
 Vault --> SDK : public_key
 SDK -> Vault : 新 key 签名 proof\n旧 active key 签名完整请求
 Vault --> SDK : 双重签名 headers
-SDK -> Registry : POST /registry/agents/add-key\nAPI key + 旧签名 + proof
+SDK -> Registry : POST /v1/agents/add-key\nAPI key + current key 签名 + proof
 Registry -> Registry : 校验 developer + 旧签名 + proof\n+ owner + timestamp + nonce
 Registry --> SDK : 追加 active key，已有 key 状态不变
 SDK --> Dev : ok（多个 active key 并存）
@@ -42,14 +42,15 @@ SDK -> Vault : 创建 ecdsa-p256 key + 读取公钥
 Vault --> SDK : public_key
 SDK -> Vault : 双签名（新 proof + 旧完整请求）
 Vault --> SDK : 签名 headers
-SDK -> Registry : POST /registry/agents/rotate-key\nAPI key + 旧签名 + proof
+SDK -> Registry : POST /v1/agents/rotate-key\nAPI key + current key 签名 + proof
 Registry -> Registry : 校验 developer + 旧签名 + proof\n+ owner + timestamp + nonce
 Registry --> SDK : 旧 key → inactive，新 key → active
 SDK -> SDK : 更新本地 kid / signer / metadata
 SDK --> Dev : ok
 
 note over SDK, Registry
-与 add_key 的关键区别：rotate_key 将所有旧 active key 标为 inactive。
+与 add_key 的关键区别：rotate_key 只将 designated current key 标为 inactive，
+其他通过 add_key 引入的 active key 保持不变。
 end note
 
 == revoke_key — 撤销单个密钥 ==
@@ -57,8 +58,8 @@ end note
 Dev -> SDK : revoke_key(kid_to_revoke="agent-v1")
 SDK -> Vault : 旧 active key 签名请求
 Vault --> SDK : signature
-SDK -> Registry : POST /registry/agents/revoke-key\nAPI key + 签名 + kid_to_revoke
-Registry -> Registry : 校验 developer + 签名 + owner\n+ 防锁死（不可撤销唯一的 active key）
+SDK -> Registry : POST /v1/agents/revoke-key\nAPI key + 签名 + kid_to_revoke
+Registry -> Registry : 校验 developer + namespace + 签名 + owner\n+ 禁止直接撤销 designated current key
 Registry --> SDK : kid 加入 revoked_kids，status → revoked
 SDK -> SDK : 本地更新 metadata
 SDK --> Dev : ok
@@ -68,7 +69,7 @@ SDK --> Dev : ok
 Dev -> SDK : revoke_agent(registry_url, client_id, api_key)
 SDK -> Vault : active key 签名请求
 Vault --> SDK : signature
-SDK -> Registry : POST /registry/agents/revoke\nAPI key + 签名
+SDK -> Registry : POST /v1/agents/revoke\nAPI key + current key 签名
 Registry -> Registry : 校验 developer + 签名 + owner
 Registry --> SDK : ownership → revoked，agent 从公开文档移除
 SDK --> Dev : ok（agent 不可恢复）

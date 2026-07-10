@@ -26,6 +26,8 @@ Dev -> Admin : create-developer --client-id <id>
 Admin -> Registry : 存储 developer + API key hash
 Registry --> Admin : developer_id + api_key
 Admin --> Dev : 交付 client_id + api_key
+Dev -> Admin : grant-namespace --domain <domain> --path-prefix <prefix>
+Admin -> Registry : 写入不可重叠 namespace
 
 note over Dev, Registry
 开发者凭 client_id + api_key 认证所有 publish / key 管理操作。
@@ -41,8 +43,8 @@ SDK -> SDK : 构建 AgentInstance\n(含 metadata + signer)
 Dev -> SDK : publish(registry_url, client_id, api_key)
 SDK -> Vault : 签名 publish 请求
 Vault --> SDK : signature
-SDK -> Registry : POST /registry/agents/publish\nBearer api_key + x-agent-* headers
-Registry -> Registry : 校验 developer + Agent 签名\n+ agent_id 合法性
+SDK -> Registry : POST /v1/agents/publish\nBearer api_key + x-agent-* headers
+Registry -> Registry : 校验 developer + namespace + Agent 签名\n+ 三处 agent_id 完全一致
 Registry --> SDK : 发布成功，建立 owner 绑定
 SDK --> Dev : ok
 
@@ -60,10 +62,10 @@ SDK --> Caller : x-agent-* headers
 
 Caller -> Callee : HTTP 请求 + 签名 headers
 
-Callee -> SDK : verify_http_request(method, url, headers, body)
-SDK -> Registry : resolve_agent(agent_id)
+Callee -> SDK : AgentVerifier.verify_http(method, url, headers, body)
+SDK -> Registry : GET /v1/agents/resolve?agent_id=...
 Registry --> SDK : AgentMetadata + public_key
-SDK -> SDK : 校验 timestamp / nonce / signature
+SDK -> SDK : 校验 timestamp / signature\n原子 consume nonce
 
 alt 验签通过
     SDK --> Callee : ok + agent_id + metadata

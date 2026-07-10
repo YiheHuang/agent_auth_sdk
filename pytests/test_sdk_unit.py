@@ -2,21 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from datetime import datetime
+import json
+from datetime import UTC, datetime
 
 import pytest
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import hashes
 
 from agent_auth_sdk import AgentInstance, InMemoryNonceStore
-from agent_auth_sdk.identity import build_agent_id, parse_agent_id
-from agent_auth_sdk.metadata import select_verification_key
-from agent_auth_sdk.models import AgentKey
-from agent_auth_sdk.publish import render_agent_metadata
 from agent_auth_sdk.config import STRICT_PROFILE, TEST_PROFILE
 from agent_auth_sdk.crypto import verify_signature
+from agent_auth_sdk.errors import MetadataValidationError
 from agent_auth_sdk.http_utils import build_canonical_request
+from agent_auth_sdk.identity import assert_strict_agent_id, build_agent_id, parse_agent_id
+from agent_auth_sdk.metadata import select_verification_key
+from agent_auth_sdk.models import AgentKey, AgentRegistryDocument
+from agent_auth_sdk.publish import render_agent_metadata
+from agent_auth_sdk.registry_client import RegistryClient
 from agent_auth_sdk.registry_security import hash_api_key, legacy_hash_api_key, verify_api_key
 from agent_auth_sdk.signing import sign_http_request
 from agent_auth_sdk.vault_kms import (
@@ -62,9 +64,7 @@ class _FakeTransit:
     def __init__(self, public_pem: str, private_pem: str | None = None, *, sign_error: Exception | None = None) -> None:
         self._public_pem = public_pem
         self._private_key = (
-            serialization.load_pem_private_key(private_pem.encode("utf-8"), password=None)
-            if private_pem
-            else None
+            serialization.load_pem_private_key(private_pem.encode("utf-8"), password=None) if private_pem else None
         )
         self._sign_error = sign_error
         self._created_keys: list[str] = []
@@ -108,6 +108,34 @@ def test_parse_agent_id_supports_host_port_and_nested_path() -> None:
 
 def test_build_agent_id() -> None:
     assert build_agent_id("localhost:9000", "assistant") == "agent://localhost:9000/assistant"
+
+
+def test_strict_agent_id_rejects_ip_and_reserved_hosts() -> None:
+    assert_strict_agent_id("agent://public.example/assistant")
+    for agent_id in (
+        "agent://127.0.0.1/assistant",
+        "agent://[::1]/assistant",
+        "agent://localhost/assistant",
+        "agent://service.internal/assistant",
+    ):
+        with pytest.raises(ValueError, match="strict"):
+            assert_strict_agent_id(agent_id)
+
+
+def test_registry_client_requires_https_by_default() -> None:
+    with pytest.raises(ValueError, match="HTTPS"):
+        RegistryClient(base_url="http://registry.local", client_id="dev", api_key="secret")
+    client = RegistryClient(
+        base_url="http://registry.local",
+        client_id="dev",
+        api_key="secret",
+        allow_insecure_http=True,
+    )
+    assert client.base_url == "http://registry.local"
+    with pytest.raises(ValueError, match="userinfo"):
+        RegistryClient(base_url="https://user@registry.example", client_id="dev", api_key="secret")
+    with pytest.raises(ValueError, match="positive"):
+        RegistryClient(base_url="https://registry.example", client_id="dev", api_key="secret", timeout_seconds=0)
 
 
 def test_vault_kms_config_requires_required_fields() -> None:
@@ -174,6 +202,7 @@ def test_canonical_request_stability() -> None:
 
 
 def test_select_verification_key_rejects_expired_key() -> None:
+    _, public_pem = _generate_es256_pem_pair()
     metadata = render_agent_metadata(
         agent_id="agent://demo.example.com/weather",
         domain="demo.example.com",
@@ -184,14 +213,14 @@ def test_select_verification_key_rejects_expired_key() -> None:
         keys=[
             AgentKey(
                 kid="main",
-                public_key_pem="-----BEGIN PUBLIC KEY-----\nZmFrZQ==\n-----END PUBLIC KEY-----",
+                public_key_pem=public_pem,
                 status="active",
-                not_after=datetime(2020, 1, 1),
+                not_after=datetime(2020, 1, 1, tzinfo=UTC),
             )
         ],
     )
-    with pytest.raises(Exception):
-        select_verification_key(metadata, kid="main", now=datetime(2026, 1, 1))
+    with pytest.raises(MetadataValidationError):
+        select_verification_key(metadata, kid="main", now=datetime(2026, 1, 1, tzinfo=UTC))
 
 
 def test_profiles_have_expected_policy() -> None:
@@ -225,6 +254,33 @@ def test_agent_instance_from_signer_builds_metadata() -> None:
     assert agent.metadata.domain == "192.144.228.237"
     assert agent.metadata.keys[0].kid == "vault:test"
     assert agent.metadata.keys[0].alg == "ES256"
+
+
+def test_export_well_known_merges_multiple_agents(tmp_path) -> None:
+    agents = []
+    for name in ("coordinator", "security"):
+        private_pem, public_pem = _generate_es256_pem_pair()
+        agents.append(
+            AgentInstance.from_signer(
+                domain="demo.example.com",
+                name=name,
+                organization="Demo",
+                endpoint=f"https://demo.example.com/{name}",
+                signer=_TestEs256Signer(private_pem, kid=f"key-{name}"),
+                public_key_pem=public_pem,
+                kid=f"key-{name}",
+            )
+        )
+
+    for agent in agents:
+        agent.export_metadata(tmp_path)
+
+    payload = json.loads((tmp_path / ".well-known" / "agent.json").read_text(encoding="utf-8"))
+    document = AgentRegistryDocument.model_validate(payload)
+    assert [entry.agent_id for entry in document.agents] == [
+        "agent://demo.example.com/coordinator",
+        "agent://demo.example.com/security",
+    ]
 
 
 @pytest.mark.anyio
@@ -269,10 +325,14 @@ def test_vault_resolver_accepts_p256_key() -> None:
 
 def test_vault_resolver_rejects_non_p256_key() -> None:
     private_key = ec.generate_private_key(ec.SECP384R1())
-    public_pem = private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode("utf-8")
+    public_pem = (
+        private_key.public_key()
+        .public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode("utf-8")
+    )
     resolver = VaultTransitPublicKeyResolver(
         VaultKmsConfig(
             vault_addr="http://127.0.0.1:8200",
@@ -325,19 +385,11 @@ async def test_vault_signer_default_kid_and_signature_parse() -> None:
 
 def test_agent_instance_from_vault_builds_es256_metadata(monkeypatch) -> None:
     private_pem, public_pem = _generate_es256_pem_pair()
+    fake_client = _FakeVaultClient(public_pem, private_pem)
 
     from agent_auth_sdk import agent as agent_module
 
-    monkeypatch.setattr(
-        agent_module,
-        "VaultTransitSigner",
-        lambda config: VaultTransitSigner(config, client=_FakeVaultClient(public_pem, private_pem)),
-    )
-    monkeypatch.setattr(
-        agent_module,
-        "resolve_vault_public_key",
-        lambda config: VaultTransitPublicKeyResolver(config, client=_FakeVaultClient(public_pem, private_pem)).describe(),
-    )
+    monkeypatch.setattr(agent_module, "_build_vault_client", lambda config: fake_client)
     agent = AgentInstance.from_vault(
         domain="192.144.228.237",
         name="publisher",
@@ -352,7 +404,7 @@ def test_agent_instance_from_vault_builds_es256_metadata(monkeypatch) -> None:
         environment="prod",
     )
     assert agent.metadata is not None
-    assert agent.metadata.keys[0].kid == "vault:transit/publisher-key"
+    assert agent.metadata.keys[0].kid == "vault:transit/publisher-key:v1"
     assert agent.metadata.keys[0].alg == "ES256"
 
 
@@ -361,6 +413,14 @@ def test_vault_config_rejects_raw_token_in_production() -> None:
         VaultKmsConfig(
             vault_addr="https://vault.example.com",
             vault_token="raw-token",
+            transit_mount="transit",
+            key_name="agent-key",
+        )
+
+    with pytest.raises(ValueError, match="HTTPS"):
+        VaultKmsConfig(
+            vault_addr="http://vault.example.com",
+            vault_token_file="/run/secrets/vault-token",
             transit_mount="transit",
             key_name="agent-key",
         )
@@ -416,27 +476,17 @@ def test_from_vault_auto_create_key_enabled(monkeypatch) -> None:
     fake_client = _FakeVaultClient(public_pem, private_pem)
 
     from agent_auth_sdk import agent as agent_module
-    from agent_auth_sdk.vault_kms import _ensure_transit_key
 
     # 记录 _ensure_transit_key 是否被调用
     calls = []
 
-    def _tracking_ensure(config):
+    def _tracking_ensure(config, client=None):
         calls.append(config.key_name)
         fake_transit = fake_client.secrets.transit
         fake_transit.create_key(name=config.key_name, key_type="ecdsa-p256")
 
     monkeypatch.setattr(agent_module, "_ensure_transit_key", _tracking_ensure)
-    monkeypatch.setattr(
-        agent_module,
-        "VaultTransitSigner",
-        lambda config: VaultTransitSigner(config, client=fake_client),
-    )
-    monkeypatch.setattr(
-        agent_module,
-        "resolve_vault_public_key",
-        lambda config: VaultTransitPublicKeyResolver(config, client=fake_client).describe(),
-    )
+    monkeypatch.setattr(agent_module, "_build_vault_client", lambda config: fake_client)
 
     agent = AgentInstance.from_vault(
         domain="agent.example.com",
@@ -453,7 +503,7 @@ def test_from_vault_auto_create_key_enabled(monkeypatch) -> None:
     assert len(calls) == 1
     assert calls[0] == "weather-agent"
     assert agent.metadata is not None
-    assert agent.metadata.keys[0].kid == "vault:transit/weather-agent"
+    assert agent.metadata.keys[0].kid == "vault:transit/weather-agent:v1"
 
 
 def test_from_vault_auto_create_key_default_off(monkeypatch) -> None:
@@ -462,20 +512,8 @@ def test_from_vault_auto_create_key_default_off(monkeypatch) -> None:
 
     from agent_auth_sdk import agent as agent_module
 
-    monkeypatch.setattr(
-        agent_module,
-        "VaultTransitSigner",
-        lambda config: VaultTransitSigner(
-            config, client=_FakeVaultClient(public_pem, private_pem)
-        ),
-    )
-    monkeypatch.setattr(
-        agent_module,
-        "resolve_vault_public_key",
-        lambda config: VaultTransitPublicKeyResolver(
-            config, client=_FakeVaultClient(public_pem, private_pem)
-        ).describe(),
-    )
+    fake_client = _FakeVaultClient(public_pem, private_pem)
+    monkeypatch.setattr(agent_module, "_build_vault_client", lambda config: fake_client)
 
     agent = AgentInstance.from_vault(
         domain="agent.example.com",
@@ -506,8 +544,6 @@ def test_rotate_key_requires_mode_specification() -> None:
         kid="vault:transit/weather-agent",
     )
 
-    import asyncio
-
     with pytest.raises(ValueError, match="Either new_key_name"):
         asyncio.run(
             agent.rotate_key(
@@ -523,10 +559,11 @@ def test_rotate_key_requires_mode_specification() -> None:
 
 def test_agent_key_status_revoked() -> None:
     """AgentKey 接受 status="revoked"。"""
+    _, public_pem = _generate_es256_pem_pair()
     key = AgentKey(
         kid="vault:test",
         alg="ES256",
-        public_key_pem="-----BEGIN PUBLIC KEY-----\nZmFrZQ==\n-----END PUBLIC KEY-----",
+        public_key_pem=public_pem,
         status="revoked",
     )
     assert key.status == "revoked"
@@ -534,6 +571,7 @@ def test_agent_key_status_revoked() -> None:
 
 def test_select_verification_key_rejects_revoked_status() -> None:
     """status="revoked" 的 key 被 select_verification_key 拒绝。"""
+    _, public_pem = _generate_es256_pem_pair()
     metadata = render_agent_metadata(
         agent_id="agent://demo.example.com/weather",
         domain="demo.example.com",
@@ -544,17 +582,18 @@ def test_select_verification_key_rejects_revoked_status() -> None:
         keys=[
             AgentKey(
                 kid="main",
-                public_key_pem="-----BEGIN PUBLIC KEY-----\nZmFrZQ==\n-----END PUBLIC KEY-----",
+                public_key_pem=public_pem,
                 status="revoked",
             )
         ],
     )
-    with pytest.raises(Exception):
-        select_verification_key(metadata, kid="main", now=datetime(2026, 1, 1))
+    with pytest.raises(MetadataValidationError):
+        select_verification_key(metadata, kid="main", now=datetime(2026, 1, 1, tzinfo=UTC))
 
 
 def test_select_verification_key_rejects_revoked_kid() -> None:
     """kid 在 revoked_kids 列表中的 key 被拒绝（即使 status="active"）。"""
+    _, public_pem = _generate_es256_pem_pair()
     metadata = render_agent_metadata(
         agent_id="agent://demo.example.com/weather",
         domain="demo.example.com",
@@ -565,14 +604,14 @@ def test_select_verification_key_rejects_revoked_kid() -> None:
         keys=[
             AgentKey(
                 kid="main",
-                public_key_pem="-----BEGIN PUBLIC KEY-----\nZmFrZQ==\n-----END PUBLIC KEY-----",
+                public_key_pem=public_pem,
                 status="active",
             )
         ],
         revoked_kids=["main"],
     )
     with pytest.raises(Exception, match="revoked"):
-        select_verification_key(metadata, kid="main", now=datetime(2026, 1, 1))
+        select_verification_key(metadata, kid="main", now=datetime(2026, 1, 1, tzinfo=UTC))
 
 
 def test_add_key_requires_mode_specification() -> None:
@@ -588,8 +627,6 @@ def test_add_key_requires_mode_specification() -> None:
         public_key_pem=public_pem,
         kid="vault:transit/weather-agent",
     )
-
-    import asyncio
 
     with pytest.raises(ValueError, match="Either new_key_name"):
         asyncio.run(
@@ -614,8 +651,6 @@ def test_revoke_key_raises_when_kid_not_found() -> None:
         public_key_pem=public_pem,
         kid="vault:transit/weather-agent",
     )
-
-    import asyncio
 
     with pytest.raises(ValueError, match="Key not found"):
         asyncio.run(
@@ -642,9 +677,7 @@ def test_revoke_key_raises_when_last_active_key() -> None:
         kid="vault:transit/weather-agent",
     )
 
-    import asyncio
-
-    with pytest.raises(ValueError, match="Cannot revoke the last active key"):
+    with pytest.raises(ValueError, match="Cannot revoke the current signing key"):
         asyncio.run(
             agent.revoke_key(
                 registry_url="https://registry.example.com/registry/agents/revoke-key",

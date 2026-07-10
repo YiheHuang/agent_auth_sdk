@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Annotated
 
 import typer
-
 
 app = typer.Typer(help="Agent Auth SDK developer tools")
 
@@ -16,13 +16,78 @@ def _main() -> None:
     """Agent Auth SDK developer tools."""
 
 
+@app.command("init")
+def init_project(
+    project_root: Annotated[Path, typer.Option(help="Project root.")],
+    roles: Annotated[str, typer.Option(help="Comma-separated Agent roles.")],
+    framework: Annotated[str, typer.Option(help="Framework name.")] = "openai-agents",
+    mode: Annotated[str, typer.Option(help="Integration mode: local or vault.")] = "local",
+    domain: Annotated[str, typer.Option(help="Agent identity domain.")] = "127.0.0.1:8700",
+    organization: Annotated[str, typer.Option(help="Organization name.")] = "Agent Auth Application",
+) -> None:
+    """初始化一个显式 Agent 认证集成。"""
+
+    if framework != "openai-agents":
+        raise typer.BadParameter("--framework currently supports only openai-agents")
+    integrate_openai_agents(
+        project_root=project_root,
+        roles=roles,
+        mode=mode,
+        domain=domain,
+        organization=organization,
+        registry_url=None,
+        registry_publish_url=None,
+        role_capability=None,
+    )
+
+
+@app.command("doctor")
+def doctor(
+    config_path: Annotated[Path, typer.Option("--config", help="Path to agent-auth.toml.")] = Path(
+        ".agent-auth/agent-auth.toml"
+    ),
+) -> None:
+    """只读检查配置、identity、Vault token 文件和 Registry TLS 策略。"""
+
+    from .config import get_runtime_profile
+    from .identity import build_agent_id
+    from .integrations.openai_agents import OpenAIAgentsAuthConfig
+
+    config = OpenAIAgentsAuthConfig.from_file(config_path)
+    profile = get_runtime_profile(config.profile)
+    checks: dict[str, str] = {}
+    for role in config.roles:
+        checks[f"identity:{role}"] = build_agent_id(config.domain, role)
+    if profile.allow_http is False:
+        for name, value in {
+            "registry.url": config.registry_url,
+            "registry.publish_url": config.registry_publish_url,
+            "vault.addr": config.vault_addr,
+        }.items():
+            if value and not value.startswith("https://"):
+                raise typer.BadParameter(f"{name} must use https in strict profile")
+    if config.mode == "vault":
+        if not config.vault_token_file:
+            raise typer.BadParameter("vault.token_file is required in vault mode")
+        token_path = Path(config.vault_token_file)
+        if not token_path.is_file():
+            raise typer.BadParameter(f"Vault token file does not exist: {token_path}")
+        checks["vault.token_file"] = "readable"
+    checks["profile"] = profile.name
+    checks["mode"] = config.mode
+    typer.echo(json.dumps({"ok": True, "checks": checks}, ensure_ascii=False, indent=2))
+
+
 @app.command("integrate-openai-agents")
 def integrate_openai_agents(
     project_root: Annotated[Path, typer.Option(help="Project root where .agent-auth will be created.")],
     roles: Annotated[str, typer.Option(help="Comma-separated role names, e.g. coordinator,security.")],
     mode: Annotated[str, typer.Option(help="Integration mode: local or vault.")] = "local",
     domain: Annotated[str, typer.Option(help="Agent identity domain.")] = "127.0.0.1:8700",
-    organization: Annotated[str, typer.Option(help="Organization name written to agent metadata.")] = "Agent Auth Application",
+    organization: Annotated[
+        str,
+        typer.Option(help="Organization name written to agent metadata."),
+    ] = "Agent Auth Application",
     registry_url: Annotated[str | None, typer.Option(help="Registry document URL.")] = None,
     registry_publish_url: Annotated[str | None, typer.Option(help="Registry publish endpoint URL.")] = None,
     role_capability: Annotated[
@@ -36,6 +101,17 @@ def integrate_openai_agents(
     normalized_mode = mode.lower().strip()
     if normalized_mode not in {"local", "vault"}:
         raise typer.BadParameter("--mode must be local or vault")
+    from .identity import build_agent_id
+
+    for role in parsed_roles:
+        try:
+            build_agent_id(domain, role)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    if normalized_mode == "vault":
+        for name, value in (("--registry-url", registry_url), ("--registry-publish-url", registry_publish_url)):
+            if value and not value.startswith("https://"):
+                raise typer.BadParameter(f"{name} must use https in vault mode")
 
     root = project_root.resolve()
     auth_dir = root / ".agent-auth"
@@ -92,19 +168,20 @@ def _render_config(
     registry_publish_url: str | None,
     capabilities: dict[str, str],
 ) -> str:
-    registry_document = registry_url or f"http://{domain}/.well-known/agent.json"
-    registry_publish = registry_publish_url or f"http://{domain}/registry/agents/publish"
+    scheme = "http" if mode == "local" else "https"
+    registry_document = registry_url or f"{scheme}://{domain}/.well-known/agent.json"
+    registry_publish = registry_publish_url or f"{scheme}://{domain}/v1/agents/publish"
     lines = [
         f'mode = "{_escape(mode)}"',
         f'domain = "{_escape(domain)}"',
         f'organization = "{_escape(organization)}"',
-        'environment = "local"',
-        'profile = "test"',
+        f'environment = "{"local" if mode == "local" else "production"}"',
+        f'profile = "{"test" if mode == "local" else "strict"}"',
         'runtime_dir = "runtime"',
         "roles = [" + ", ".join(f'"{_escape(role)}"' for role in roles) + "]",
         "",
         "[capabilities]",
-        *[f'{role} = "{_escape(capability)}"' for role, capability in capabilities.items()],
+        *[f'"{_escape(role)}" = "{_escape(capability)}"' for role, capability in capabilities.items()],
         "",
         "[registry]",
         f'url = "{_escape(registry_document)}"',
@@ -119,14 +196,14 @@ def _render_config(
         "auto_create_keys = true",
         "",
         "[vault.key_names]",
-        *[f'{role} = "${{AGENT_AUTH_{_env_token(role)}_KEY_NAME}}"' for role in roles],
+        *[f'"{_escape(role)}" = "${{AGENT_AUTH_{_env_token(role)}_KEY_NAME}}"' for role in roles],
         "",
     ]
     return "\n".join(lines)
 
 
 def _render_adapter() -> str:
-    return '''from __future__ import annotations
+    return """from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
@@ -152,7 +229,7 @@ async def call_agent(**kwargs: Any) -> Any:
 
 def trusted_events() -> list[str]:
     return [] if _AUTH is None else _AUTH.trusted_events()
-'''
+"""
 
 
 def _render_local_env() -> str:
@@ -215,7 +292,8 @@ async def run_{first_target}(payload: dict) -> dict:
     )
 ```
 
-You can also load `.agent-auth/auth_adapter.py` directly with `importlib` if you do not want to place a small loader in your package.
+You can also load `.agent-auth/auth_adapter.py` directly with `importlib`
+if you do not want to place a small loader in your package.
 """
 
 

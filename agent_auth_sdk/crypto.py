@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Awaitable, Callable, Protocol
+from collections.abc import Awaitable, Callable
+from typing import Protocol
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -68,6 +69,8 @@ def verify_signature(
         public_key = serialization.load_der_public_key(raw)
     else:
         raise ValueError("public key is required")
+    if not isinstance(public_key, ec.EllipticCurvePublicKey) or not isinstance(public_key.curve, ec.SECP256R1):
+        raise ValueError("ES256 requires a P-256 EC public key")
 
     try:
         signature = from_base64url(signature_base64url)

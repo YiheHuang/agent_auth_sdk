@@ -1,0 +1,28 @@
+{
+  "description": "Agent Auth custom wire protocol v1 canonicalization vectors",
+  "json_payload": {"b": 2, "a": 1},
+  "canonical_json_utf8_hex": "7b2261223a312c2262223a327d",
+  "payload_sha256_base64url": "QyWM_3g_5wNtikMDP4MK38YOwDc4JHNUisdCuIgpJ3c",
+  "crypto": {
+    "curve": "P-256",
+    "signature_encoding": "ASN.1 DER",
+    "public_key_spki_der_base64url": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2Cg2hfVou9PWl26Q--Y1KPsPc5iS0iwAMCtmXmYOyC25ygX6PMZo7IaJvZrFRcfZhnZUOBK4wXYhCpveojlgrA",
+    "public_key_fingerprint_sha256_hex": "d3df1b8f5a90cc9b5879a26a2828cf0c26b7937bb38f97cefb4a7803e4bcd49a",
+    "http_canonical_signature_der_base64url": "MEYCIQCGEGbszi5fpL4ypR9qntrFCQKFu73qtms_9ncwQBOslQIhANZWABRVRpptw74o92XZyKZ4LojHLWm-h2AwgtvtTvfB"
+  },
+  "http": {
+    "method": "POST",
+    "url": "https://receiver.example/v1/tasks?mode=fast",
+    "agent_id": "agent://sender.example/worker",
+    "kid": "key-1",
+    "timestamp": "2026-07-10T12:00:00Z",
+    "nonce": "nonce-1",
+    "canonical": "POST\n/v1/tasks?mode=fast\nQyWM_3g_5wNtikMDP4MK38YOwDc4JHNUisdCuIgpJ3c\nx-agent-id:agent://sender.example/worker\nx-agent-kid:key-1\nx-agent-timestamp:2026-07-10T12:00:00Z\nx-agent-nonce:nonce-1\nhost:receiver.example"
+  },
+  "message": {
+    "payload_type": "application/json",
+    "recipient": "agent://receiver.example/worker",
+    "message_type": "task.request",
+    "canonical": "agent-message-v1\nagent_id:agent://sender.example/worker\nkid:key-1\ntimestamp:2026-07-10T12:00:00Z\nnonce:nonce-1\npayload_type:application/json\npayload_digest:QyWM_3g_5wNtikMDP4MK38YOwDc4JHNUisdCuIgpJ3c\nrecipient:agent://receiver.example/worker\nmessage_type:task.request"
+  }
+}

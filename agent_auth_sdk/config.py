@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 
 @dataclass(slots=True, frozen=True)
@@ -15,6 +16,14 @@ class RuntimeProfile:
     clock_skew_seconds: int
     metadata_cache_ttl_seconds: int
     nonce_ttl_seconds: int
+
+
+class DiscoveryMode(StrEnum):
+    """Metadata 信任源策略。"""
+
+    REGISTRY_ONLY = "registry_only"
+    DIRECT_ONLY = "direct_only"
+    REGISTRY_THEN_DIRECT = "registry_then_direct"
 
 
 STRICT_PROFILE = RuntimeProfile(
@@ -62,3 +71,18 @@ class MetadataResolverConfig:
     cache_ttl_seconds: int | None = None
     request_timeout_seconds: float = 10.0
     registry_url: str | None = None
+    discovery_mode: DiscoveryMode | None = None
+
+    def __post_init__(self) -> None:
+        if self.cache_ttl_seconds is not None and self.cache_ttl_seconds <= 0:
+            raise ValueError("cache_ttl_seconds must be positive")
+        if self.request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+        if self.discovery_mode == DiscoveryMode.REGISTRY_ONLY and not self.registry_url:
+            raise ValueError("registry_url is required for registry_only discovery")
+
+    @property
+    def effective_discovery_mode(self) -> DiscoveryMode:
+        if self.discovery_mode is not None:
+            return self.discovery_mode
+        return DiscoveryMode.REGISTRY_ONLY if self.registry_url else DiscoveryMode.DIRECT_ONLY

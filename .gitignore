@@ -1,7 +1,13 @@
 .venv/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 __pycache__/
 *.pyc
 runtime/
 .pkgtest/
 dist/
+.pkg-audit/
+.coverage
+coverage.xml
+next_step

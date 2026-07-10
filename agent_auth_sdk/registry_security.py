@@ -8,19 +8,22 @@ import secrets
 from dataclasses import dataclass
 from uuid import uuid4
 
-from .crypto import Signer, verify_signature
-from .http_utils import canonicalize_headers, ensure_bytes, sha256_base64url, to_iso_z, utc_now
-from .models import AgentKey
+from cryptography.hazmat.primitives import serialization
 
+from .crypto import Signer, verify_signature
+from .http_utils import canonicalize_headers, ensure_bytes, from_base64url, sha256_base64url, to_iso_z, utc_now
+from .models import AgentKey
 
 REGISTRY_SIGNATURE_INPUT = (
     "method path body-digest x-agent-id x-agent-kid x-agent-timestamp x-agent-nonce x-registry-client-id host"
 )
 NEW_KEY_PROOF_SIGNATURE_INPUT = (
-    "rotate-key-new-key-proof-v1 x-agent-id x-agent-kid new-key-fingerprint x-agent-timestamp x-agent-nonce x-registry-client-id host"
+    "rotate-key-new-key-proof-v1 x-agent-id x-agent-kid new-key-fingerprint "
+    "x-agent-timestamp x-agent-nonce x-registry-client-id host"
 )
 ADD_KEY_PROOF_SIGNATURE_INPUT = (
-    "add-key-new-key-proof-v1 x-agent-id x-agent-kid new-key-fingerprint x-agent-timestamp x-agent-nonce x-registry-client-id host"
+    "add-key-new-key-proof-v1 x-agent-id x-agent-kid new-key-fingerprint "
+    "x-agent-timestamp x-agent-nonce x-registry-client-id host"
 )
 API_KEY_HASH_PREFIX = "pbkdf2_sha256"
 API_KEY_HASH_ITERATIONS = 210_000
@@ -61,6 +64,8 @@ def verify_api_key(api_key: str, stored_hash: str) -> bool:
         if prefix != API_KEY_HASH_PREFIX:
             return False
         iterations = int(iterations_raw)
+        if iterations < 100_000 or iterations > 2_000_000:
+            return False
     except ValueError:
         return False
 
@@ -74,14 +79,21 @@ def verify_api_key(api_key: str, stored_hash: str) -> bool:
 
 
 def public_key_fingerprint(public_key_pem: str) -> str:
-    return hashlib.sha256(public_key_pem.encode("utf-8")).hexdigest()
+    key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
+    der = key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    return hashlib.sha256(der).hexdigest()
 
 
 def agent_key_fingerprint(key: AgentKey) -> str:
-    material = key.public_key_pem or key.public_key_base64url
-    if not material:
+    if key.public_key_pem:
+        public_key = serialization.load_pem_public_key(key.public_key_pem.encode("utf-8"))
+        material = public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    elif key.public_key_base64url:
+        public_key = serialization.load_der_public_key(from_base64url(key.public_key_base64url))
+        material = public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    else:
         raise ValueError("new key public material is required")
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return hashlib.sha256(material).hexdigest()
 
 
 def build_registry_publish_canonical(
@@ -173,7 +185,9 @@ def verify_registry_publish_signature(
     timestamp = normalized.get("x-agent-timestamp")
     nonce = normalized.get("x-agent-nonce")
     client_id = normalized.get("x-registry-client-id")
-    if not all([signature, agent_id, kid, timestamp, nonce, client_id]):
+    if normalized.get("x-agent-signature-input") != REGISTRY_SIGNATURE_INPUT:
+        return False
+    if not signature or not agent_id or not kid or not timestamp or not nonce or not client_id:
         return False
     canonical, _ = build_registry_publish_canonical(
         method="POST",
@@ -275,9 +289,11 @@ def verify_registry_new_key_proof(
     timestamp = normalized.get("x-agent-timestamp")
     nonce = normalized.get("x-agent-nonce")
     client_id = normalized.get("x-registry-client-id")
+    if normalized.get("x-agent-signature-input") != NEW_KEY_PROOF_SIGNATURE_INPUT:
+        return False
     if signed_agent_id != agent_id or kid != new_key.kid:
         return False
-    if not all([signature, timestamp, nonce, client_id]):
+    if not signature or not timestamp or not nonce or not client_id:
         return False
     canonical = build_new_key_proof_canonical(
         agent_id=agent_id,
@@ -379,9 +395,11 @@ def verify_registry_add_key_proof(
     timestamp = normalized.get("x-agent-timestamp")
     nonce = normalized.get("x-agent-nonce")
     client_id = normalized.get("x-registry-client-id")
+    if normalized.get("x-agent-signature-input") != ADD_KEY_PROOF_SIGNATURE_INPUT:
+        return False
     if signed_agent_id != agent_id or kid != new_key.kid:
         return False
-    if not all([signature, timestamp, nonce, client_id]):
+    if not signature or not timestamp or not nonce or not client_id:
         return False
     canonical = build_add_key_proof_canonical(
         agent_id=agent_id,

@@ -7,14 +7,18 @@ from uuid import uuid4
 
 from .config import SigningConfig
 from .crypto import Signer
-from .http_utils import _to_base64url, build_canonical_request, canonicalize_headers, to_iso_z, utc_now
+from .http_utils import (
+    _to_base64url,
+    build_canonical_request,
+    canonicalize_headers,
+    parse_rfc3339_utc_seconds,
+    to_iso_z,
+    utc_now,
+)
 from .identity import parse_agent_id
 from .models import SignatureHeaders
 
-
-SIGNATURE_INPUT = (
-    "method path body-digest x-agent-id x-agent-kid x-agent-timestamp x-agent-nonce host"
-)
+SIGNATURE_INPUT = "method path body-digest x-agent-id x-agent-kid x-agent-timestamp x-agent-nonce host"
 
 
 async def sign_http_request(
@@ -39,6 +43,7 @@ async def sign_http_request(
         raise ValueError("Only ES256 is supported in beta-v1")
 
     request_timestamp = timestamp or to_iso_z(utc_now())
+    parse_rfc3339_utc_seconds(request_timestamp)
     request_nonce = nonce or str(uuid4())
     canonical, body_digest = build_canonical_request(
         method=method,
@@ -66,6 +71,28 @@ async def sign_http_request(
     return SignatureHeaders(headers=normalized_headers, canonical=canonical, body_digest=body_digest)
 
 
-def sign_http_request_sync(**kwargs: object) -> SignatureHeaders:
-    return asyncio.run(sign_http_request(**kwargs))
-
+def sign_http_request_sync(
+    *,
+    method: str,
+    url: str,
+    body: bytes | str | dict | list | None,
+    agent_id: str,
+    signer: Signer,
+    headers: dict[str, str] | None = None,
+    config: SigningConfig | None = None,
+    timestamp: str | None = None,
+    nonce: str | None = None,
+) -> SignatureHeaders:
+    return asyncio.run(
+        sign_http_request(
+            method=method,
+            url=url,
+            body=body,
+            agent_id=agent_id,
+            signer=signer,
+            headers=headers,
+            config=config,
+            timestamp=timestamp,
+            nonce=nonce,
+        )
+    )

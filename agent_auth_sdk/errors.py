@@ -6,6 +6,7 @@ from enum import StrEnum
 class VerificationErrorCode(StrEnum):
     INVALID_AGENT_ID = "INVALID_AGENT_ID"
     INVALID_METADATA = "INVALID_METADATA"
+    MESSAGE_INVALID = "MESSAGE_INVALID"
     METADATA_FETCH_FAILED = "METADATA_FETCH_FAILED"
     METADATA_HOST_MISMATCH = "METADATA_HOST_MISMATCH"
     KEY_NOT_FOUND = "KEY_NOT_FOUND"
@@ -15,6 +16,7 @@ class VerificationErrorCode(StrEnum):
     TIMESTAMP_EXPIRED = "TIMESTAMP_EXPIRED"
     NONCE_REPLAYED = "NONCE_REPLAYED"
     POLICY_REJECTED = "POLICY_REJECTED"
+    RECIPIENT_MISMATCH = "RECIPIENT_MISMATCH"
 
 
 class AgentIdentityError(ValueError):
@@ -23,4 +25,3 @@ class AgentIdentityError(ValueError):
 
 class MetadataValidationError(ValueError):
     """metadata 内容不合法时抛出。"""
-

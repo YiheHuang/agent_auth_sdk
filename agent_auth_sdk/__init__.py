@@ -1,29 +1,23 @@
-"""Agent Auth SDK — Agent 身份发布、请求签名、消息签名与验签。
+"""Agent identity、签名验签、Registry client、Vault 与框架适配 SDK。"""
 
-提供 6 个核心接口：
+from importlib.metadata import PackageNotFoundError, version
 
-1. 创建 Agent Metadata — AgentInstance.from_vault()
-2. 发布 Agent 到 Registry — AgentInstance.publish()
-3. 签名消息        — AgentInstance.sign_http() / AgentInstance.sign_message()
-4. 验签            — verify_http_request() / verify_agent_message()
-5. 查询 Metadata 表 — resolve_agent()
-6. 轮换 Agent Key  — AgentInstance.rotate_key()
-
-完整接口文档见 docs/API_REFERENCE.md。
-"""
-
+from .agent import AgentInstance
 from .config import (
+    DiscoveryMode,
     MetadataResolverConfig,
     VerificationConfig,
 )
-from .agent import AgentInstance
 from .messaging import verify_agent_message
 from .metadata import resolve_agent
+from .registry_client import RegistryClient
+from .remote import AgentAuthASGIMiddleware, RemoteAgentClient
 from .stores import (
     FileMetadataCache,
     InMemoryNonceStore,
 )
 from .verification import verify_http_request
+from .verifier import AgentVerifier, AuthorizationPolicy
 
 __all__ = [
     # 核心接口
@@ -31,10 +25,22 @@ __all__ = [
     "verify_http_request",
     "verify_agent_message",
     "resolve_agent",
+    "AgentVerifier",
+    "AuthorizationPolicy",
+    "RegistryClient",
+    "RemoteAgentClient",
+    "AgentAuthASGIMiddleware",
     # 必需配置
     "VerificationConfig",
     "MetadataResolverConfig",
+    "DiscoveryMode",
     # 必需存储实现
     "InMemoryNonceStore",
     "FileMetadataCache",
+    "__version__",
 ]
+
+try:
+    __version__ = version("agent-auth-sdk")
+except PackageNotFoundError:  # 源码树运行
+    __version__ = "0.1.0b1"

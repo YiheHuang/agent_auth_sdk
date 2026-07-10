@@ -2,25 +2,29 @@
 
 from __future__ import annotations
 
-import json
+import asyncio
 import sqlite3
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-try:
+if TYPE_CHECKING:
     from redis.asyncio import Redis
-except ModuleNotFoundError:  # pragma: no cover - 可选依赖
-    Redis = Any
+else:
+    try:
+        from redis.asyncio import Redis
+    except ModuleNotFoundError:  # pragma: no cover - 可选依赖
+        Redis = Any
 
 from .models import AgentMetadata, ResolveResult
 
 
 class NonceStore(Protocol):
-    async def has(self, key: str) -> bool: ...
+    async def consume(self, key: str, ttl_seconds: int) -> bool:
+        """原子消费 nonce；首次消费返回 True，已存在返回 False。"""
 
-    async def set(self, key: str, ttl_seconds: int) -> None: ...
+        ...
 
 
 class MetadataCache(Protocol):
@@ -32,17 +36,29 @@ class MetadataCache(Protocol):
 class InMemoryNonceStore(NonceStore):
     def __init__(self) -> None:
         self._entries: dict[str, datetime] = {}
+        self._lock = asyncio.Lock()
+
+    async def consume(self, key: str, ttl_seconds: int) -> bool:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        async with self._lock:
+            self._sweep()
+            if key in self._entries:
+                return False
+            self._entries[key] = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
+            return True
 
     async def has(self, key: str) -> bool:
         self._sweep()
         return key in self._entries
 
     async def set(self, key: str, ttl_seconds: int) -> None:
-        self._entries[key] = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
-        self._sweep()
+        async with self._lock:
+            self._entries[key] = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
+            self._sweep()
 
     def _sweep(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         expired = [key for key, expires_at in self._entries.items() if expires_at <= now]
         for key in expired:
             self._entries.pop(key, None)
@@ -52,6 +68,12 @@ class RedisNonceStore(NonceStore):
     def __init__(self, redis_client: Redis, *, prefix: str = "agent_identity:nonce:") -> None:
         self._redis = redis_client
         self._prefix = prefix
+
+    async def consume(self, key: str, ttl_seconds: int) -> bool:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        result = await self._redis.set(self._prefix + key, "1", ex=ttl_seconds, nx=True)
+        return bool(result)
 
     async def has(self, key: str) -> bool:
         return bool(await self._redis.exists(self._prefix + key))
@@ -74,12 +96,12 @@ class InMemoryMetadataCache(MetadataCache):
     async def set(self, agent_id: str, result: ResolveResult, ttl_seconds: int) -> None:
         self._entries[agent_id] = (
             result,
-            datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds),
+            datetime.now(UTC) + timedelta(seconds=ttl_seconds),
         )
         self._sweep()
 
     def _sweep(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         expired = [key for key, (_, expires_at) in self._entries.items() if expires_at <= now]
         for key in expired:
             self._entries.pop(key, None)
@@ -94,7 +116,7 @@ class FileMetadataCache(MetadataCache):
         self._init_db()
 
     def _init_db(self) -> None:
-        with sqlite3.connect(self._db_path) as conn:
+        with closing(sqlite3.connect(self._db_path)) as conn, conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS metadata_cache (
@@ -109,7 +131,7 @@ class FileMetadataCache(MetadataCache):
             )
 
     async def get(self, agent_id: str) -> ResolveResult | None:
-        with sqlite3.connect(self._db_path) as conn:
+        with closing(sqlite3.connect(self._db_path)) as conn, conn:
             row = conn.execute(
                 """
                 SELECT payload, resolved_at, expires_at, etag, source_url
@@ -121,7 +143,7 @@ class FileMetadataCache(MetadataCache):
         if not row:
             return None
         payload, resolved_at, expires_at, etag, source_url = row
-        if datetime.fromisoformat(expires_at) <= datetime.now(timezone.utc):
+        if datetime.fromisoformat(expires_at) <= datetime.now(UTC):
             return None
         return ResolveResult(
             metadata=AgentMetadata.model_validate_json(payload),
@@ -131,8 +153,8 @@ class FileMetadataCache(MetadataCache):
         )
 
     async def set(self, agent_id: str, result: ResolveResult, ttl_seconds: int) -> None:
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
-        with sqlite3.connect(self._db_path) as conn:
+        expires_at = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
+        with closing(sqlite3.connect(self._db_path)) as conn, conn:
             conn.execute(
                 """
                 INSERT INTO metadata_cache(agent_id, payload, resolved_at, expires_at, etag, source_url)
@@ -153,4 +175,3 @@ class FileMetadataCache(MetadataCache):
                     result.source_url,
                 ),
             )
-

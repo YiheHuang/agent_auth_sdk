@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -20,22 +23,32 @@ class VaultKmsConfig:
     transit_mount: str
     key_name: str
     vault_token_file: str | Path | None = None
-    vault_token: str | None = None
+    vault_token: str | None = field(default=None, repr=False)
     namespace: str | None = None
     verify: bool | str = True
     kid: str | None = None
+    key_version: int | None = None
     allow_insecure_raw_token: bool = False
 
     def __post_init__(self) -> None:
         for field_name in ("vault_addr", "transit_mount", "key_name"):
             if not getattr(self, field_name):
                 raise ValueError(f"{field_name} is required")
+        parsed_addr = urlparse(self.vault_addr)
+        if parsed_addr.scheme not in {"http", "https"} or not parsed_addr.netloc:
+            raise ValueError("vault_addr must be an absolute HTTP(S) URL")
+        if parsed_addr.username is not None or parsed_addr.password is not None:
+            raise ValueError("vault_addr must not contain userinfo")
+        if parsed_addr.scheme != "https" and not self.allow_insecure_raw_token:
+            raise ValueError("vault_addr must use HTTPS outside explicit dev/test mode")
         if self.verify is False and not self.allow_insecure_raw_token:
             raise ValueError("Disabling Vault TLS verification is only allowed in explicit dev/test mode.")
         if self.vault_token and not self.allow_insecure_raw_token:
             raise ValueError("Raw vault_token is dev/test-only. Use vault_token_file in production.")
         if not self.vault_token_file and not self.vault_token:
             raise ValueError("vault_token_file is required in production.")
+        if self.key_version is not None and self.key_version <= 0:
+            raise ValueError("key_version must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,7 +106,16 @@ class VaultTransitSigner(Signer):
     def __init__(self, config: VaultKmsConfig, client: Any | None = None) -> None:
         self._config = config
         self._client = client or _build_vault_client(config)
-        self._kid = config.kid or f"vault:{config.transit_mount}/{config.key_name}"
+        version_suffix = f":v{config.key_version}" if config.key_version is not None else ""
+        self._kid = config.kid or f"vault:{config.transit_mount}/{config.key_name}{version_suffix}"
+
+    @property
+    def config(self) -> VaultKmsConfig:
+        return self._config
+
+    @property
+    def client(self) -> Any:
+        return self._client
 
     async def kid(self) -> str:
         return self._kid
@@ -102,12 +124,19 @@ class VaultTransitSigner(Signer):
         return "ES256"
 
     async def sign(self, data: bytes) -> bytes:
+        return await asyncio.to_thread(self._sign_sync, data)
+
+    def _sign_sync(self, data: bytes) -> bytes:
+        kwargs: dict[str, Any] = {}
+        if self._config.key_version is not None:
+            kwargs["key_version"] = self._config.key_version
         response = self._client.secrets.transit.sign_data(
             name=self._config.key_name,
             hash_input=_base64(data),
             hash_algorithm="sha2-256",
             marshaling_algorithm="asn1",
             mount_point=self._config.transit_mount,
+            **kwargs,
         )
         signature = response.get("data", {}).get("signature")
         if not signature:
@@ -115,12 +144,16 @@ class VaultTransitSigner(Signer):
         return parse_vault_signature(signature)
 
     def validate_access(self) -> None:
+        kwargs: dict[str, Any] = {}
+        if self._config.key_version is not None:
+            kwargs["key_version"] = self._config.key_version
         response = self._client.secrets.transit.sign_data(
             name=self._config.key_name,
             hash_input=_base64(b"agent-auth-sdk:vault-transit-probe"),
             hash_algorithm="sha2-256",
             marshaling_algorithm="asn1",
             mount_point=self._config.transit_mount,
+            **kwargs,
         )
         if not response.get("data", {}).get("signature"):
             raise ValueError("Vault Transit probe signing returned an empty signature.")
@@ -160,20 +193,23 @@ def _build_vault_client(config: VaultKmsConfig) -> Any:
     )
 
 
-def _ensure_transit_key(config: VaultKmsConfig) -> bool:
+def _ensure_transit_key(config: VaultKmsConfig, client: Any | None = None) -> bool:
     """确保 Vault Transit key 存在；若不存在，创建 ecdsa-p256 类型密钥。
 
     Returns:
         True 表示密钥是新创建的，False 表示密钥已存在。
     """
-    client = _build_vault_client(config)
+    client = client or _build_vault_client(config)
     try:
         client.secrets.transit.read_key(
             name=config.key_name,
             mount_point=config.transit_mount,
         )
         return False
-    except Exception:
+    except Exception as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if exc.__class__.__name__ != "InvalidPath" and status_code != 404:
+            raise
         client.secrets.transit.create_key(
             name=config.key_name,
             key_type="ecdsa-p256",
@@ -186,9 +222,15 @@ def read_vault_token(config: VaultKmsConfig) -> str:
     if config.vault_token_file:
         path = Path(config.vault_token_file)
         try:
-            token = path.read_text(encoding="utf-8").strip()
+            content = path.read_text(encoding="utf-8")
         except OSError as exc:
             raise ValueError(f"Unable to read Vault token file: {path}") from exc
+        if os.name != "nt" and path.stat().st_mode & 0o077:
+            raise ValueError(f"Vault token file permissions are too broad: {path}")
+        lines = content.splitlines()
+        token = lines[0].strip() if lines else ""
+        if any(line.strip() for line in lines[1:]):
+            raise ValueError(f"Vault token file must contain exactly one token line: {path}")
         if not token:
             raise ValueError(f"Vault token file is empty: {path}")
         return token
@@ -205,7 +247,7 @@ def _select_public_key(keys: dict, latest_version: int) -> str:
     for version in (str(latest_version), latest_version):
         value = keys.get(version)
         if isinstance(value, dict) and value.get("public_key"):
-            return value["public_key"]
+            return str(value["public_key"])
     raise ValueError("Vault Transit key metadata does not contain a public key for the latest version.")
 
 

@@ -1,37 +1,36 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import serialization
+from agent_auth_registry.app import create_app as create_registry_app
+from agent_auth_registry.storage import RegistryStore
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from agent_auth_registry.app import create_app as create_registry_app
-from agent_auth_registry.storage import RegistryStore
 from agent_auth_sdk import (
     AgentInstance,
-    FileMetadataCache,
     InMemoryNonceStore,
     VerificationConfig,
     resolve_agent,
     verify_agent_message,
     verify_http_request,
 )
+from agent_auth_sdk.config import STRICT_PROFILE, TEST_PROFILE, MetadataResolverConfig
+from agent_auth_sdk.http_utils import canonical_json_bytes
 from agent_auth_sdk.models import AgentKey, AgentMetadata
 from agent_auth_sdk.publish import render_agent_metadata
-from agent_auth_sdk.signing import sign_http_request
-from agent_auth_sdk.config import MetadataResolverConfig, STRICT_PROFILE, TEST_PROFILE
 from agent_auth_sdk.registry_security import (
     hash_api_key,
     sign_registry_add_key_proof,
     sign_registry_new_key_proof,
     sign_registry_publish_request,
 )
+from agent_auth_sdk.signing import sign_http_request
 from agent_auth_sdk.vault_kms import VaultKmsConfig, resolve_vault_public_key
 
 
@@ -82,15 +81,28 @@ def registry_env(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_REGISTRY_DB_PATH", str(db_path))
     monkeypatch.setenv("AGENT_REGISTRY_PATH", str(public_path))
     monkeypatch.setenv("AGENT_REGISTRY_ALLOWED_SKEW_SECONDS", "300")
+    monkeypatch.setenv("AGENT_REGISTRY_STRICT_IDENTITIES", "0")
     return db_path, public_path
 
 
-def seed_developer(db_path, *, developer_id: str = "dev-1", client_id: str = "developer-a", api_key: str = "secret-api-key") -> None:
-    RegistryStore(db_path).create_developer(
+def seed_developer(
+    db_path,
+    *,
+    developer_id: str = "dev-1",
+    client_id: str = "developer-a",
+    api_key: str = "secret-api-key",
+    grant_namespaces: bool | None = None,
+) -> None:
+    store = RegistryStore(db_path)
+    store.create_developer(
         developer_id=developer_id,
         client_id=client_id,
         api_key_hash=hash_api_key(api_key),
     )
+    should_grant = grant_namespaces if grant_namespaces is not None else developer_id == "dev-1"
+    if should_grant:
+        for domain in ("192.144.228.237", "agent.example.com", "demo.example.com"):
+            store.create_namespace(developer_id=developer_id, domain=domain, path_prefix="/")
 
 
 def maybe_kms_test_config() -> VaultKmsConfig | None:
@@ -144,9 +156,9 @@ async def test_metadata_discovery_and_verification_success() -> None:
             body={"hello": "world"},
             nonce_store=InMemoryNonceStore(),
             http_client=client,
-            cache=FileMetadataCache("runtime/test_metadata_cache.sqlite3"),
+            cache=None,
             config=VerificationConfig(profile=TEST_PROFILE),
-            now=datetime.now(timezone.utc),
+            now=datetime.now(UTC),
         )
         assert result.ok is True
 
@@ -262,7 +274,7 @@ async def test_signed_agent_message_can_be_verified_via_well_known_metadata() ->
             nonce_store=InMemoryNonceStore(),
             http_client=client,
             config=VerificationConfig(profile=TEST_PROFILE),
-            now=datetime.now(timezone.utc),
+            now=datetime.now(UTC),
         )
         assert result.ok is True
         assert result.message is not None
@@ -335,29 +347,26 @@ async def test_publish_rejects_wrong_owner(registry_env) -> None:
             api_key="secret-a",
             http_client=client,
         )
+        payload = {
+            "agent_id": agent.agent_id,
+            "metadata": agent.metadata.model_dump(mode="json"),
+            "publish_intent": "upsert_metadata",
+        }
+        signed = await sign_registry_publish_request(
+            path="/registry/agents/publish",
+            host="registry.local",
+            body=payload,
+            agent_id=agent.agent_id,
+            client_id="developer-b",
+            signer=agent.signer,
+        )
         response = await client.post(
             "http://registry.local/registry/agents/publish",
-            json={
-                "agent_id": agent.agent_id,
-                "metadata": agent.metadata.model_dump(mode="json"),
-                "publish_intent": "upsert_metadata",
-            },
+            content=canonical_json_bytes(payload),
             headers={
                 "authorization": "Bearer secret-b",
-                **(
-                    await sign_registry_publish_request(
-                        path="/registry/agents/publish",
-                        host="registry.local",
-                        body={
-                            "agent_id": agent.agent_id,
-                            "metadata": agent.metadata.model_dump(mode="json"),
-                            "publish_intent": "upsert_metadata",
-                        },
-                        agent_id=agent.agent_id,
-                        client_id="developer-b",
-                        signer=agent.signer,
-                    )
-                ).headers,
+                "content-type": "application/json",
+                **signed.headers,
             },
         )
         assert response.status_code == 403
@@ -402,29 +411,26 @@ async def test_publish_rejects_when_only_api_key_is_stolen(registry_env) -> None
             api_key="secret-api-key",
             http_client=client,
         )
+        payload = {
+            "agent_id": legit_agent.agent_id,
+            "metadata": rogue_agent.metadata.model_dump(mode="json"),
+            "publish_intent": "upsert_metadata",
+        }
+        signed = await sign_registry_publish_request(
+            path="/registry/agents/publish",
+            host="registry.local",
+            body=payload,
+            agent_id=legit_agent.agent_id,
+            client_id="developer-a",
+            signer=rogue_agent.signer,
+        )
         response = await client.post(
             "http://registry.local/registry/agents/publish",
-            json={
-                "agent_id": legit_agent.agent_id,
-                "metadata": rogue_agent.metadata.model_dump(mode="json"),
-                "publish_intent": "upsert_metadata",
-            },
+            content=canonical_json_bytes(payload),
             headers={
                 "authorization": "Bearer secret-api-key",
-                **(
-                    await sign_registry_publish_request(
-                        path="/registry/agents/publish",
-                        host="registry.local",
-                        body={
-                            "agent_id": legit_agent.agent_id,
-                            "metadata": rogue_agent.metadata.model_dump(mode="json"),
-                            "publish_intent": "upsert_metadata",
-                        },
-                        agent_id=legit_agent.agent_id,
-                        client_id="developer-a",
-                        signer=rogue_agent.signer,
-                    )
-                ).headers,
+                "content-type": "application/json",
+                **signed.headers,
             },
         )
         assert response.status_code in {401, 409}
@@ -515,8 +521,8 @@ async def test_rotate_key_rejects_missing_new_key_proof(registry_env) -> None:
         )
         response = await client.post(
             "http://registry.local/registry/agents/rotate-key",
-            json=payload,
-            headers={"authorization": "Bearer secret-api-key", **signed.headers},
+            content=canonical_json_bytes(payload),
+            headers={"authorization": "Bearer secret-api-key", "content-type": "application/json", **signed.headers},
         )
         assert response.status_code == 400
         assert response.json()["detail"] == "NEW_KEY_PROOF_REQUIRED"
@@ -542,7 +548,6 @@ async def test_rotate_key_rejects_invalid_new_key_proof(registry_env) -> None:
         alg="ES256",
     )
     new_key = AgentKey(kid="vault:next", alg="ES256", public_key_pem=new_public_pem)
-    from agent_auth_sdk.registry_security import sign_registry_new_key_proof
 
     proof = await sign_registry_new_key_proof(
         agent_id=agent.agent_id,
@@ -574,8 +579,8 @@ async def test_rotate_key_rejects_invalid_new_key_proof(registry_env) -> None:
         )
         response = await client.post(
             "http://registry.local/registry/agents/rotate-key",
-            json=payload,
-            headers={"authorization": "Bearer secret-api-key", **signed.headers},
+            content=canonical_json_bytes(payload),
+            headers={"authorization": "Bearer secret-api-key", "content-type": "application/json", **signed.headers},
         )
         assert response.status_code == 401
         assert response.json()["detail"] == "NEW_KEY_PROOF_INVALID"
@@ -611,13 +616,13 @@ async def test_publish_timestamp_expired_is_rejected(registry_env) -> None:
         agent_id=agent.agent_id,
         client_id="developer-a",
         signer=agent.signer,
-        timestamp=(datetime.now(timezone.utc) - timedelta(minutes=10)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        timestamp=(datetime.now(UTC) - timedelta(minutes=10)).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     )
     async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
         response = await client.post(
             "http://registry.local/registry/agents/publish",
-            json=payload,
-            headers={"authorization": "Bearer secret-api-key", **signed.headers},
+            content=canonical_json_bytes(payload),
+            headers={"authorization": "Bearer secret-api-key", "content-type": "application/json", **signed.headers},
         )
         assert response.status_code == 401
         assert response.json()["detail"] == "TIMESTAMP_EXPIRED"
@@ -628,7 +633,8 @@ async def test_real_vault_publish_and_resolve_from_registry(registry_env) -> Non
     kms_config = maybe_kms_test_config()
     if kms_config is None:
         pytest.skip(
-            "Real Vault integration requires AGENT_AUTH_TEST_VAULT_ADDR, AGENT_AUTH_TEST_VAULT_TOKEN_FILE, and AGENT_AUTH_TEST_VAULT_KEY_NAME",
+            "Real Vault integration requires AGENT_AUTH_TEST_VAULT_ADDR, "
+            "AGENT_AUTH_TEST_VAULT_TOKEN_FILE, and AGENT_AUTH_TEST_VAULT_KEY_NAME",
         )
     db_path, _ = registry_env
     seed_developer(db_path)
@@ -772,8 +778,8 @@ async def test_add_key_rejects_wrong_owner(registry_env) -> None:
         )
         response = await client.post(
             "http://registry.local/registry/agents/add-key",
-            json=payload,
-            headers={"authorization": "Bearer secret-b", **signed.headers},
+            content=canonical_json_bytes(payload),
+            headers={"authorization": "Bearer secret-b", "content-type": "application/json", **signed.headers},
         )
         assert response.status_code == 403
         assert response.json()["detail"] == "OWNER_MISMATCH"
@@ -830,8 +836,8 @@ async def test_add_key_rejects_invalid_proof(registry_env) -> None:
         )
         response = await client.post(
             "http://registry.local/registry/agents/add-key",
-            json=payload,
-            headers={"authorization": "Bearer secret-api-key", **signed.headers},
+            content=canonical_json_bytes(payload),
+            headers={"authorization": "Bearer secret-api-key", "content-type": "application/json", **signed.headers},
         )
         assert response.status_code == 401
         assert response.json()["detail"] == "NEW_KEY_PROOF_INVALID"
@@ -946,8 +952,8 @@ async def test_revoke_key_rejects_wrong_owner(registry_env) -> None:
         )
         response = await client.post(
             "http://registry.local/registry/agents/revoke-key",
-            json=payload,
-            headers={"authorization": "Bearer secret-b", **signed.headers},
+            content=canonical_json_bytes(payload),
+            headers={"authorization": "Bearer secret-b", "content-type": "application/json", **signed.headers},
         )
         assert response.status_code == 403
         assert response.json()["detail"] == "OWNER_MISMATCH"
@@ -990,11 +996,11 @@ async def test_revoke_key_rejects_last_active(registry_env) -> None:
         )
         response = await client.post(
             "http://registry.local/registry/agents/revoke-key",
-            json=payload,
-            headers={"authorization": "Bearer secret-api-key", **signed.headers},
+            content=canonical_json_bytes(payload),
+            headers={"authorization": "Bearer secret-api-key", "content-type": "application/json", **signed.headers},
         )
         assert response.status_code == 409
-        assert response.json()["detail"] == "CANNOT_REVOKE_LAST_ACTIVE_KEY"
+        assert response.json()["detail"] == "CANNOT_REVOKE_CURRENT_KEY"
 
 
 @pytest.mark.anyio
@@ -1108,7 +1114,9 @@ async def test_revoke_agent_succeeds_and_agent_disappears(registry_env) -> None:
         # 1. publish
         await agent.publish(
             registry_url="http://registry.local/registry/agents/publish",
-            client_id="developer-a", api_key="secret-api-key", http_client=client,
+            client_id="developer-a",
+            api_key="secret-api-key",
+            http_client=client,
         )
         # 确认在公开文档中
         doc = (await client.get("http://registry.local/.well-known/agent.json")).json()
@@ -1117,7 +1125,9 @@ async def test_revoke_agent_succeeds_and_agent_disappears(registry_env) -> None:
         # 2. revoke_agent
         result = await agent.revoke_agent(
             registry_url="http://registry.local/registry/agents/revoke",
-            client_id="developer-a", api_key="secret-api-key", http_client=client,
+            client_id="developer-a",
+            api_key="secret-api-key",
+            http_client=client,
         )
         assert result["ok"] is True
 
@@ -1132,29 +1142,26 @@ async def test_revoke_agent_succeeds_and_agent_disappears(registry_env) -> None:
         assert ownership.status == "revoked"
 
         # 5. 后续 publish 被拒绝 (410 AGENT_REVOKED)
+        payload = {
+            "agent_id": agent.agent_id,
+            "metadata": agent.metadata.model_dump(mode="json"),
+            "publish_intent": "upsert_metadata",
+        }
+        signed = await sign_registry_publish_request(
+            path="/registry/agents/publish",
+            host="registry.local",
+            body=payload,
+            agent_id=agent.agent_id,
+            client_id="developer-a",
+            signer=agent.signer,
+        )
         response = await client.post(
             "http://registry.local/registry/agents/publish",
-            json={
-                "agent_id": agent.agent_id,
-                "metadata": agent.metadata.model_dump(mode="json"),
-                "publish_intent": "upsert_metadata",
-            },
+            content=canonical_json_bytes(payload),
             headers={
                 "authorization": "Bearer secret-api-key",
-                **(
-                    await sign_registry_publish_request(
-                        path="/registry/agents/publish",
-                        host="registry.local",
-                        body={
-                            "agent_id": agent.agent_id,
-                            "metadata": agent.metadata.model_dump(mode="json"),
-                            "publish_intent": "upsert_metadata",
-                        },
-                        agent_id=agent.agent_id,
-                        client_id="developer-a",
-                        signer=agent.signer,
-                    )
-                ).headers,
+                "content-type": "application/json",
+                **signed.headers,
             },
         )
         assert response.status_code == 410
@@ -1184,7 +1191,9 @@ async def test_revoke_agent_rejects_wrong_owner(registry_env) -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://registry.local") as client:
         await agent.publish(
             registry_url="http://registry.local/registry/agents/publish",
-            client_id="developer-a", api_key="secret-a", http_client=client,
+            client_id="developer-a",
+            api_key="secret-a",
+            http_client=client,
         )
         payload = {"agent_id": agent.agent_id}
         signed = await sign_registry_publish_request(
@@ -1197,8 +1206,8 @@ async def test_revoke_agent_rejects_wrong_owner(registry_env) -> None:
         )
         response = await client.post(
             "http://registry.local/registry/agents/revoke",
-            json=payload,
-            headers={"authorization": "Bearer secret-b", **signed.headers},
+            content=canonical_json_bytes(payload),
+            headers={"authorization": "Bearer secret-b", "content-type": "application/json", **signed.headers},
         )
         assert response.status_code == 403
         assert response.json()["detail"] == "OWNER_MISMATCH"

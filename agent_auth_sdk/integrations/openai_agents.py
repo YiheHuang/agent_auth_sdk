@@ -7,22 +7,37 @@ cross-agent boundary by calling ``auth.call_agent(...)`` or wrapping a tool with
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from agent_auth_sdk import AgentInstance, InMemoryNonceStore, MetadataResolverConfig, VerificationConfig, verify_agent_message
+from agent_auth_sdk import (
+    AgentInstance,
+    AgentVerifier,
+    InMemoryNonceStore,
+    MetadataResolverConfig,
+    RemoteAgentClient,
+    VerificationConfig,
+    verify_agent_message,
+)
 from agent_auth_sdk.config import get_runtime_profile
-from agent_auth_sdk.models import AgentRegistryDocument, AgentRegistryEntry, SignedAgentMessage, VerificationFailure, VerificationSuccess
-
+from agent_auth_sdk.models import (
+    AgentRegistryDocument,
+    AgentRegistryEntry,
+    SignedAgentMessage,
+    VerificationFailure,
+    VerificationSuccess,
+)
 
 RunnerCallable = Callable[[Any, Any], Any | Awaitable[Any]]
 
@@ -44,10 +59,14 @@ class LocalEs256Signer:
         return self._private_key.sign(data, ec.ECDSA(hashes.SHA256()))
 
     def public_key_pem(self) -> str:
-        return self._private_key.public_key().public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        ).decode("utf-8")
+        return (
+            self._private_key.public_key()
+            .public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            .decode("utf-8")
+        )
 
 
 @dataclass(slots=True, frozen=True)
@@ -61,7 +80,7 @@ class OpenAIAgentsAuthConfig:
     registry_url: str | None = None
     registry_publish_url: str | None = None
     registry_client_id: str | None = None
-    registry_api_key: str | None = None
+    registry_api_key: str | None = field(default=None, repr=False)
     profile: str = "test"
     capabilities: dict[str, str] = field(default_factory=dict)
     vault_addr: str | None = None
@@ -73,7 +92,7 @@ class OpenAIAgentsAuthConfig:
     auto_create_vault_keys: bool = True
 
     @classmethod
-    def from_file(cls, path: str | Path) -> "OpenAIAgentsAuthConfig":
+    def from_file(cls, path: str | Path) -> OpenAIAgentsAuthConfig:
         config_path = Path(path)
         try:
             import tomllib
@@ -94,6 +113,12 @@ class OpenAIAgentsAuthConfig:
         vault = raw.get("vault", {})
         capabilities = {str(k): str(v) for k, v in raw.get("capabilities", {}).items()}
         vault_key_names = {str(k): str(_expand(v)) for k, v in vault.get("key_names", {}).items()}
+        vault_token_file = _optional_str(_expand(vault.get("token_file")))
+        if vault_token_file is not None:
+            token_path = Path(vault_token_file)
+            if not token_path.is_absolute():
+                token_path = base_dir / token_path
+            vault_token_file = str(token_path)
         return cls(
             roles=roles,
             mode=os.getenv("AGENT_AUTH_MODE", str(_expand(raw.get("mode", "local")))).lower(),
@@ -108,7 +133,7 @@ class OpenAIAgentsAuthConfig:
             profile=str(_expand(raw.get("profile", "test"))),
             capabilities=capabilities,
             vault_addr=_optional_str(_expand(vault.get("addr"))),
-            vault_token_file=_optional_str(_expand(vault.get("token_file"))),
+            vault_token_file=vault_token_file,
             vault_transit_mount=str(_expand(vault.get("transit_mount", "transit"))),
             vault_namespace=_optional_str(_expand(vault.get("namespace"))),
             vault_verify=_parse_vault_verify(_expand(vault.get("verify", True))),
@@ -130,7 +155,7 @@ class OpenAIAgentsAuthRuntime:
     nonce_stores: dict[str, InMemoryNonceStore] = field(default_factory=dict)
 
     @classmethod
-    async def create(cls, config: OpenAIAgentsAuthConfig) -> "OpenAIAgentsAuthRuntime":
+    async def create(cls, config: OpenAIAgentsAuthConfig) -> OpenAIAgentsAuthRuntime:
         runtime = cls(config=config)
         config.runtime_dir.mkdir(parents=True, exist_ok=True)
         if config.mode == "local":
@@ -179,14 +204,12 @@ class OpenAIAgentsAuthRuntime:
                     profile=profile,
                     registry_url=self.config.registry_document_url(),
                 ),
-                now=datetime.now(timezone.utc),
+                now=datetime.now(UTC),
+                expected_recipient=self.agent(receiver_role).agent_id,
             )
         if not result.ok:
             return result
 
-        expected_recipient = self.agent(receiver_role).agent_id
-        if result.message and result.message.recipient and result.message.recipient != expected_recipient:
-            return VerificationFailure(code="RECIPIENT_MISMATCH", reason="Signed message recipient does not match receiver")
         if required_sender_capability:
             capabilities = result.metadata.capabilities if result.metadata else []
             if required_sender_capability not in capabilities:
@@ -201,13 +224,13 @@ class OpenAIAgentsAuthRuntime:
             AgentRegistryEntry(
                 agent_id=agent.agent_id,
                 metadata=agent.metadata,
-                published_at=datetime.now(timezone.utc),
+                published_at=datetime.now(UTC),
                 publisher="agent-auth-local",
             )
             for agent in self.agents.values()
             if agent.metadata is not None
         ]
-        return AgentRegistryDocument(updated_at=datetime.now(timezone.utc), agents=entries)
+        return AgentRegistryDocument(updated_at=datetime.now(UTC), agents=entries)
 
     def _create_local_agents(self) -> None:
         for role in self.config.roles:
@@ -245,7 +268,8 @@ class OpenAIAgentsAuthRuntime:
         async with httpx.AsyncClient() as client:
             for role in self.config.roles:
                 key_name = self.config.vault_key_names.get(role, f"agent-auth-{role}")
-                agent = AgentInstance.from_vault(
+                agent = await asyncio.to_thread(
+                    AgentInstance.from_vault,
                     domain=self.config.domain,
                     name=role,
                     organization=self.config.organization,
@@ -292,11 +316,11 @@ class AuthenticatedOpenAIAgents:
     _trusted_events: list[str] = field(default_factory=list)
 
     @classmethod
-    async def from_config(cls, config: OpenAIAgentsAuthConfig) -> "AuthenticatedOpenAIAgents":
+    async def from_config(cls, config: OpenAIAgentsAuthConfig) -> AuthenticatedOpenAIAgents:
         return cls(runtime=await OpenAIAgentsAuthRuntime.create(config))
 
     @classmethod
-    async def from_config_file(cls, path: str | Path) -> "AuthenticatedOpenAIAgents":
+    async def from_config_file(cls, path: str | Path) -> AuthenticatedOpenAIAgents:
         return await cls.from_config(OpenAIAgentsAuthConfig.from_file(path))
 
     def is_enabled(self) -> bool:
@@ -304,7 +328,7 @@ class AuthenticatedOpenAIAgents:
             return self.enabled
         return os.getenv("AGENT_AUTH_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 
-    async def call_agent(
+    async def call_local_agent(
         self,
         *,
         source_role: str,
@@ -315,7 +339,7 @@ class AuthenticatedOpenAIAgents:
         message_type: str = "agent.call",
     ) -> Any:
         if not self.is_enabled():
-            return await _maybe_await(runner(target_agent, payload))
+            return await _maybe_await(runner(target_agent, _runner_input(runner, payload)))
 
         signed_request = await self.runtime.sign_for_role(
             source_role,
@@ -323,14 +347,16 @@ class AuthenticatedOpenAIAgents:
             recipient_role=target_role,
             message_type=f"{message_type}.request",
         )
-        verified_request = await self.runtime.verify_for_role(
-            target_role,
-            signed_request,
-            required_sender_capability=self.runtime.config.capability_for(source_role),
+        verified_request = _require_verified(
+            await self.runtime.verify_for_role(
+                target_role,
+                signed_request,
+                required_sender_capability=self.runtime.config.capability_for(source_role),
+            )
         )
-        _raise_if_failed(verified_request)
+        assert verified_request.message is not None
 
-        raw_result = await _maybe_await(runner(target_agent, verified_request.message.payload))
+        raw_result = await _maybe_await(runner(target_agent, _runner_input(runner, verified_request.message.payload)))
         result_payload = _to_payload(raw_result)
         signed_result = await self.runtime.sign_for_role(
             target_role,
@@ -338,18 +364,75 @@ class AuthenticatedOpenAIAgents:
             recipient_role=source_role,
             message_type=f"{message_type}.result",
         )
-        verified_result = await self.runtime.verify_for_role(
-            source_role,
-            signed_result,
-            required_sender_capability=self.runtime.config.capability_for(target_role),
+        verified_result = _require_verified(
+            await self.runtime.verify_for_role(
+                source_role,
+                signed_result,
+                required_sender_capability=self.runtime.config.capability_for(target_role),
+            )
         )
-        _raise_if_failed(verified_result)
+        assert verified_result.message is not None
 
         self._trusted_events.append(f"{source_role} -> {target_role} -> {source_role} verified")
         return verified_result.message.payload
 
+    async def call_agent(self, **kwargs: Any) -> Any:
+        """兼容入口；同进程调用请优先使用 call_local_agent()。"""
+
+        return await self.call_local_agent(**kwargs)
+
+    async def call_remote_agent(
+        self,
+        *,
+        source_role: str,
+        target_agent_id: str,
+        target_url: str,
+        payload: Any,
+        message_type: str = "agent.call.result",
+    ) -> Any:
+        """在真实 HTTP 边界发送签名请求并验证目标 Agent 的签名响应。"""
+
+        profile = get_runtime_profile(self.runtime.config.profile)
+        async with self.runtime._http_client() as client:
+            verifier = AgentVerifier(
+                nonce_store=self.runtime.nonce_stores[source_role],
+                verification_config=VerificationConfig(profile=profile),
+                resolver_config=MetadataResolverConfig(
+                    profile=profile,
+                    registry_url=self.runtime.config.registry_document_url(),
+                ),
+                http_client=client,
+            )
+            remote = RemoteAgentClient(
+                sender=self.runtime.agent(source_role),
+                verifier=verifier,
+                http_client=client,
+            )
+            result = await remote.call(
+                target_url=target_url,
+                target_agent_id=target_agent_id,
+                payload=_to_payload(payload),
+                message_type=message_type,
+            )
+        self._trusted_events.append(f"{source_role} -> {target_agent_id} remote verified")
+        return result
+
+    async def sign_remote_result(
+        self,
+        *,
+        target_role: str,
+        recipient_agent_id: str,
+        payload: Any,
+        message_type: str = "agent.call.result",
+    ) -> SignedAgentMessage:
+        return await self.runtime.agent(target_role).sign_message(
+            payload=_to_payload(payload),
+            recipient=recipient_agent_id,
+            message_type=message_type,
+        )
+
     async def call_tool(self, **kwargs: Any) -> Any:
-        return await self.call_agent(**kwargs)
+        return await self.call_local_agent(**kwargs)
 
     def wrap_tool(
         self,
@@ -361,12 +444,33 @@ class AuthenticatedOpenAIAgents:
         message_type: str = "agent.call",
     ) -> Callable[[Any], Awaitable[Any]]:
         async def wrapped(payload: Any) -> Any:
-            return await self.call_agent(
+            return await self.call_local_agent(
                 source_role=source_role,
                 target_role=target_role,
                 target_agent=target_agent,
                 payload=payload,
                 runner=runner,
+                message_type=message_type,
+            )
+
+        return wrapped
+
+    def wrap_remote_tool(
+        self,
+        *,
+        source_role: str,
+        target_agent_id: str,
+        target_url: str,
+        message_type: str = "agent.call.result",
+    ) -> Callable[[Any], Awaitable[Any]]:
+        """返回可直接交给 function_tool 的远程认证 callable。"""
+
+        async def wrapped(payload: Any) -> Any:
+            return await self.call_remote_agent(
+                source_role=source_role,
+                target_agent_id=target_agent_id,
+                target_url=target_url,
+                payload=payload,
                 message_type=message_type,
             )
 
@@ -410,9 +514,12 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-def _raise_if_failed(result: VerificationSuccess | VerificationFailure) -> None:
-    if not result.ok:
+def _require_verified(result: VerificationSuccess | VerificationFailure) -> VerificationSuccess:
+    if isinstance(result, VerificationFailure):
         raise PermissionError(f"{result.code}: {result.reason}")
+    if result.message is None:
+        raise PermissionError("Verification succeeded without a signed message")
+    return result
 
 
 def _to_payload(value: Any) -> Any:
@@ -421,6 +528,17 @@ def _to_payload(value: Any) -> Any:
     if hasattr(value, "final_output"):
         return _to_payload(value.final_output)
     return value
+
+
+def _runner_input(runner: RunnerCallable, payload: Any) -> Any:
+    """真实 OpenAI Runner 仅接受 str/Response input；本地 fake runner 保持原值。"""
+
+    runner_module = getattr(runner, "__module__", "")
+    if runner_module.startswith("agents."):
+        if isinstance(payload, str):
+            return payload
+        return json.dumps(_to_payload(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return payload
 
 
 def _expand(value: Any) -> Any:

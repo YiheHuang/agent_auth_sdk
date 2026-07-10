@@ -1,79 +1,39 @@
-# Registry 部署说明
+# Registry Beta v1 部署
 
-在 CentOS / OpenCloudOS 服务器上部署 Agent Auth Registry。
+Registry v1 仅支持单节点、单 worker SQLite，并且只应监听 loopback。
 
-## 前置条件
-
-- Python ≥ 3.11
-- Nginx（可选，用于反向代理）
-- `curl`、`git`
-
-## 一键部署
+## 安装
 
 ```bash
-# 将项目放到 /opt/agent_auth_sdk 后：
-sudo bash /opt/agent_auth_sdk/deploy/deploy-registry.sh
-
-# 如需完全清除旧数据后重装：
-sudo bash /opt/agent_auth_sdk/deploy/deploy-registry.sh --purge
+export AGENT_REGISTRY_SERVER_NAME=registry.example.com
+export AGENT_REGISTRY_TLS_CERT=/etc/letsencrypt/live/registry.example.com/fullchain.pem
+export AGENT_REGISTRY_TLS_KEY=/etc/letsencrypt/live/registry.example.com/privkey.pem
+sudo -E bash /opt/agent_auth_sdk/deploy/deploy-registry.sh
 ```
 
-脚本自动完成：停止旧服务 → 安装依赖 → 创建运行时目录 → 写环境文件 → 安装 systemd 服务 → 启动 → 更新 Nginx → 健康检查。
+缺少有效 TLS 参数时，脚本不会安装公网 Nginx 入口。
 
-## 创建 Developer 凭证
+## Developer 与 namespace
 
 ```bash
 source /opt/agent_auth_sdk/.venv/bin/activate
-agent-auth-registry-admin create-developer --client-id <your-client-id>
-
-# 保存输出的 api_key，交给对应开发者
+agent-auth-registry-admin create-developer --client-id developer-a
+agent-auth-registry-admin grant-namespace \
+  --client-id developer-a \
+  --domain agents.example.com \
+  --path-prefix /team-a
 ```
 
-## 环境变量
+保存仅显示一次的 API key。日后使用 `rotate-api-key` 轮换。
 
-自动写入 `/etc/agent-auth/registry.env`：
-
-| 变量 | 默认值 |
-|------|--------|
-| `AGENT_REGISTRY_HOST` | `127.0.0.1` |
-| `AGENT_REGISTRY_PORT` | `8008` |
-| `AGENT_REGISTRY_DB_PATH` | `/opt/agent_auth_sdk/runtime/registry/registry.sqlite3` |
-| `AGENT_REGISTRY_PATH` | `…/runtime/registry/.well-known/agent.json` |
-| `AGENT_REGISTRY_ALLOWED_SKEW_SECONDS` | `300` |
-
-## 公开端点
-
-| 端点 | 用途 |
-|------|------|
-| `GET /.well-known/agent.json` | 注册表公开文档 |
-| `POST /registry/agents/publish` | 发布 / 更新 Agent metadata |
-| `POST /registry/agents/rotate-key` | 轮换密钥 |
-| `POST /registry/agents/add-key` | 添加额外活跃密钥 |
-| `POST /registry/agents/revoke-key` | 撤销密钥 |
-| `POST /registry/agents/revoke` | 撤销 Agent（不可逆） |
-
-## 日常运维
+## 运维
 
 ```bash
-# 查看状态
 sudo systemctl status agent-auth-registry
-
-# 查看日志
 sudo journalctl -u agent-auth-registry -f
-
-# 重启
-sudo systemctl restart agent-auth-registry
-
-# 查看已注册 developer
-agent-auth-registry-admin list-developers
-
-# 查看 Agent owner
-agent-auth-registry-admin inspect-agent --agent-id agent://<host>/<name>
+curl --fail https://registry.example.com/healthz
 ```
 
-## 备份
+备份时停服复制 SQLite 文件，或使用 SQLite backup API。不要在写入期间直接复制数据库。
 
-需要备份两个文件：
-
-- `/opt/agent_auth_sdk/runtime/registry/registry.sqlite3`
-- `/opt/agent_auth_sdk/runtime/registry/.well-known/agent.json`
+完整说明见 [`docs/REGISTRY_OPERATIONS.md`](../docs/REGISTRY_OPERATIONS.md)。

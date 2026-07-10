@@ -20,6 +20,10 @@ SERVICE_NAME="agent-auth-registry"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 NGINX_CONF="/etc/nginx/conf.d/agent-auth.conf"
 ALLOWED_SKEW="${AGENT_REGISTRY_ALLOWED_SKEW_SECONDS:-300}"
+STRICT_IDENTITIES="${AGENT_REGISTRY_STRICT_IDENTITIES:-1}"
+SERVER_NAME="${AGENT_REGISTRY_SERVER_NAME:-}"
+TLS_CERT="${AGENT_REGISTRY_TLS_CERT:-}"
+TLS_KEY="${AGENT_REGISTRY_TLS_KEY:-}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -53,14 +57,19 @@ if [[ ! -d "$VENV_DIR" ]]; then
     python3 -m venv "$VENV_DIR"
 fi
 
-log "安装 SDK（开发模式） ..."
+log "安装 Registry 发行依赖 ..."
 "$VENV_DIR/bin/pip" install -q --upgrade pip
-"$VENV_DIR/bin/pip" install -q -e "$PROJECT_DIR"[dev]
+"$VENV_DIR/bin/pip" install -q -e "$PROJECT_DIR"
+"$VENV_DIR/bin/pip" install -q -e "$PROJECT_DIR/packages/agent-auth-registry"
 
 # ── 运行时目录 ──────────────────────────────────────────────────────────────
 log "准备运行时目录 ..."
 mkdir -p "$RUNTIME_DIR/.well-known"
-# sqlite3 需要目录可写；因为 systemd 以 root 运行，保持 root 即可
+if ! id -u agent-auth >/dev/null 2>&1; then
+    useradd --system --home-dir "$RUNTIME_DIR" --shell /sbin/nologin agent-auth
+fi
+chown -R agent-auth:agent-auth "$RUNTIME_DIR"
+chmod 0700 "$RUNTIME_DIR"
 
 # ── 环境文件 ────────────────────────────────────────────────────────────────
 mkdir -p "$(dirname "$ENV_FILE")"
@@ -70,8 +79,11 @@ AGENT_REGISTRY_HOST=127.0.0.1
 AGENT_REGISTRY_PORT=8008
 AGENT_REGISTRY_DB_PATH=$DB_PATH
 AGENT_REGISTRY_PATH=$PUBLIC_PATH
-AGENT_REGISTRY_ALLOWED_SKEW_SECONDS=300
+AGENT_REGISTRY_ALLOWED_SKEW_SECONDS=$ALLOWED_SKEW
+AGENT_REGISTRY_WORKERS=1
+AGENT_REGISTRY_STRICT_IDENTITIES=$STRICT_IDENTITIES
 EOF
+chmod 0600 "$ENV_FILE"
 
 # systemd EnvironmentFile 需要 KEY=VALUE，bash source 需要 export 才能被子进程继承。
 # 写一个辅助脚本，用户 source 它即可。两个文件放同一目录。
@@ -109,10 +121,20 @@ for i in $(seq 1 20); do
 done
 
 # ── Nginx ────────────────────────────────────────────────────────────────────
-if command -v nginx &>/dev/null; then
+if command -v nginx &>/dev/null && [[ -n "$SERVER_NAME" && -n "$TLS_CERT" && -n "$TLS_KEY" ]]; then
+    if [[ ! "$SERVER_NAME" =~ ^[A-Za-z0-9.-]+$ ]] || [[ ! -f "$TLS_CERT" ]] || [[ ! -f "$TLS_KEY" ]]; then
+        warn "Registry TLS 配置无效；拒绝安装公网 Nginx 配置"
+        exit 1
+    fi
     log "更新 Nginx 配置 ..."
-    cp "$PROJECT_DIR/deploy/nginx.agent-auth.conf" "$NGINX_CONF"
+    sed \
+        -e "s/registry.example.com/$SERVER_NAME/g" \
+        -e "s#/etc/letsencrypt/live/$SERVER_NAME/fullchain.pem#$TLS_CERT#g" \
+        -e "s#/etc/letsencrypt/live/$SERVER_NAME/privkey.pem#$TLS_KEY#g" \
+        "$PROJECT_DIR/deploy/nginx.agent-auth.conf" > "$NGINX_CONF"
     nginx -t && systemctl reload nginx
+else
+    warn "未配置 AGENT_REGISTRY_SERVER_NAME/TLS_CERT/TLS_KEY；Registry 仅监听 loopback，不会明文暴露"
 fi
 
 # ── 最终状态 ─────────────────────────────────────────────────────────────────
@@ -125,13 +147,14 @@ echo -e "${GREEN}  Registry 部署完成${NC}"
 echo ""
 echo -e "  状态:         ${CYAN}sudo systemctl status $SERVICE_NAME${NC}"
 echo -e "  日志:         ${CYAN}sudo journalctl -u $SERVICE_NAME -f${NC}"
-echo -e "  公开文档:     ${CYAN}http://192.144.228.237/.well-known/agent.json${NC}"
+PUBLIC_ORIGIN="https://${SERVER_NAME:-registry.example.com}"
+echo -e "  公开文档:     ${CYAN}$PUBLIC_ORIGIN/.well-known/agent.json${NC}"
 echo -e "  端点:"
-echo -e "    publish:    ${CYAN}http://192.144.228.237/registry/agents/publish${NC}"
-echo -e "    rotate-key: ${CYAN}http://192.144.228.237/registry/agents/rotate-key${NC}"
-echo -e "    add-key:    ${CYAN}http://192.144.228.237/registry/agents/add-key${NC}"
-echo -e "    revoke-key: ${CYAN}http://192.144.228.237/registry/agents/revoke-key${NC}"
-echo -e "    revoke:     ${CYAN}http://192.144.228.237/registry/agents/revoke${NC}"
+echo -e "    publish:    ${CYAN}$PUBLIC_ORIGIN/v1/agents/publish${NC}"
+echo -e "    rotate-key: ${CYAN}$PUBLIC_ORIGIN/v1/agents/rotate-key${NC}"
+echo -e "    add-key:    ${CYAN}$PUBLIC_ORIGIN/v1/agents/add-key${NC}"
+echo -e "    revoke-key: ${CYAN}$PUBLIC_ORIGIN/v1/agents/revoke-key${NC}"
+echo -e "    revoke:     ${CYAN}$PUBLIC_ORIGIN/v1/agents/revoke${NC}"
 echo ""
 echo -e "  创建 developer:"
 echo -e "    ${CYAN}source $ENV_SH${NC}"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 from datetime import UTC, datetime
 
 import pytest
@@ -429,6 +430,7 @@ def test_vault_config_rejects_raw_token_in_production() -> None:
 def test_vault_config_reads_token_file(tmp_path) -> None:
     token_file = tmp_path / "vault-token"
     token_file.write_text("token-from-agent\n", encoding="utf-8")
+    token_file.chmod(0o600)
     config = VaultKmsConfig(
         vault_addr="https://vault.example.com",
         vault_token_file=token_file,
@@ -441,6 +443,7 @@ def test_vault_config_reads_token_file(tmp_path) -> None:
 def test_vault_config_rejects_empty_token_file(tmp_path) -> None:
     token_file = tmp_path / "vault-token"
     token_file.write_text("\n", encoding="utf-8")
+    token_file.chmod(0o600)
     config = VaultKmsConfig(
         vault_addr="https://vault.example.com",
         vault_token_file=token_file,
@@ -448,6 +451,21 @@ def test_vault_config_rejects_empty_token_file(tmp_path) -> None:
         key_name="agent-key",
     )
     with pytest.raises(ValueError, match="empty"):
+        read_vault_token(config)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not enforced on Windows")
+def test_vault_config_rejects_broad_token_file_permissions(tmp_path) -> None:
+    token_file = tmp_path / "vault-token"
+    token_file.write_text("token-from-agent\n", encoding="utf-8")
+    token_file.chmod(0o644)
+    config = VaultKmsConfig(
+        vault_addr="https://vault.example.com",
+        vault_token_file=token_file,
+        transit_mount="transit",
+        key_name="agent-key",
+    )
+    with pytest.raises(ValueError, match="permissions are too broad"):
         read_vault_token(config)
 
 

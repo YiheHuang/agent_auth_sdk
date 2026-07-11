@@ -18,14 +18,17 @@ jobs:
       - run: python -m pip install --upgrade build twine
       - run: python -m build --sdist --wheel
       - run: python -m build --sdist --wheel packages/agent-auth-registry
-      - run: cp packages/agent-auth-registry/dist/* dist/
-      - run: python -m twine check --strict dist/*
+      - run: python -m twine check --strict dist/* packages/agent-auth-registry/dist/*
       - uses: actions/upload-artifact@v4
         with:
-          name: python-distributions
+          name: sdk-distributions
           path: dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: registry-distributions
+          path: packages/agent-auth-registry/dist/
 
-  publish:
+  publish-sdk:
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -36,6 +39,21 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: python-distributions
+          name: sdk-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-registry:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-registry
+      url: https://pypi.org/project/agent-auth-registry/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: registry-distributions
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1

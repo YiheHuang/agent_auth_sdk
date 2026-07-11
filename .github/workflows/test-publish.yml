@@ -22,14 +22,17 @@ jobs:
       - run: python -m pip install --upgrade build twine
       - run: python -m build --sdist --wheel
       - run: python -m build --sdist --wheel packages/agent-auth-registry
-      - run: cp packages/agent-auth-registry/dist/* dist/
-      - run: python -m twine check --strict dist/*
+      - run: python -m twine check --strict dist/* packages/agent-auth-registry/dist/*
       - uses: actions/upload-artifact@v4
         with:
-          name: testpypi-distributions
+          name: testpypi-sdk-distributions
           path: dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: testpypi-registry-distributions
+          path: packages/agent-auth-registry/dist/
 
-  publish-testpypi:
+  publish-sdk-testpypi:
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -40,14 +43,31 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: testpypi-distributions
+          name: testpypi-sdk-distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-registry-testpypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi-registry
+      url: https://test.pypi.org/project/agent-auth-registry/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: testpypi-registry-distributions
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
 
   clean-install:
-    needs: publish-testpypi
+    needs: [publish-sdk-testpypi, publish-registry-testpypi]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5

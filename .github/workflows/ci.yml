@@ -70,7 +70,7 @@ jobs:
           python-version: "3.11"
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[dev]" "${{ matrix.openai_agents }}"
+      - run: python -m pip install -e ".[dev,openai-fastapi]" "${{ matrix.openai_agents }}"
       - run: >-
           python -m pytest -q
           pytests/test_openai_facade.py

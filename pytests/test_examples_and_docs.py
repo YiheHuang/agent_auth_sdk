@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import re
 import subprocess
 import sys
@@ -13,6 +14,8 @@ ROOT = Path(__file__).parents[1]
 
 
 def _run_module(module: str, *args: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
     return subprocess.run(
         [sys.executable, "-m", module, *args],
         cwd=ROOT,
@@ -20,6 +23,7 @@ def _run_module(module: str, *args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         timeout=30,
+        env=env,
     )
 
 

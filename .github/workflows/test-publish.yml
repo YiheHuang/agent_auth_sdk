@@ -7,12 +7,18 @@ on:
         description: Exact SDK and Registry version to verify
         required: true
         default: 0.1.0b1
+      upload_packages:
+        description: Build and upload packages before verification
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: ${{ inputs.upload_packages }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,19 +74,36 @@ jobs:
 
   clean-install:
     needs: [publish-sdk-testpypi, publish-registry-testpypi]
+    if: "${{ always() && (!inputs.upload_packages || (needs.publish-sdk-testpypi.result == 'success' && needs.publish-registry-testpypi.result == 'success')) }}"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - run: python -m pip install --upgrade pip
-      - name: Install both TestPyPI distributions
-        run: >-
-          python -m pip install
-          --index-url https://test.pypi.org/simple/
-          --extra-index-url https://pypi.org/simple/
-          "verifiable-agent-auth-sdk==${{ inputs.version }}"
-          "verifiable-agent-auth-registry==${{ inputs.version }}"
+      - name: Download exact wheels from TestPyPI without third-party dependencies
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            rm -rf testpypi-dist
+            mkdir -p testpypi-dist
+            if python -m pip download \
+              --no-deps \
+              --only-binary=:all: \
+              --index-url https://test.pypi.org/simple/ \
+              --dest testpypi-dist \
+              "verifiable-agent-auth-sdk==${{ inputs.version }}" \
+              "verifiable-agent-auth-registry==${{ inputs.version }}"; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 6 ]; then
+              echo "TestPyPI index has not propagated yet; retrying in 10 seconds."
+              sleep 10
+            fi
+          done
+          exit 1
+      - name: Install downloaded wheels with dependencies from PyPI
+        run: python -m pip install testpypi-dist/*.whl
       - run: agent-auth --help
       - run: agent-auth-registry --help
       - run: agent-auth-registry-admin --help

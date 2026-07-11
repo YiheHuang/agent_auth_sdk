@@ -34,9 +34,10 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[all,dev]"
       - run: python -m pip install -e "packages/agent-auth-registry[dev]"
-      - run: python -m ruff check agent_auth_sdk packages/agent-auth-registry/src pytests
-      - run: python -m ruff format --check agent_auth_sdk packages/agent-auth-registry/src pytests
+      - run: python -m ruff check agent_auth_sdk packages/agent-auth-registry/src pytests examples
+      - run: python -m ruff format --check agent_auth_sdk packages/agent-auth-registry/src pytests examples
       - run: python -m mypy agent_auth_sdk
+      - run: bash -n deploy/deploy-registry.sh
       - name: Full project branch coverage
         run: >-
           python -m pytest
@@ -61,7 +62,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        openai_agents: ["openai-agents==0.2.0", "openai-agents<1"]
+        openai_agents: ["openai-agents==0.2.0", "openai-agents==0.18.2"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -70,4 +71,9 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]" "${{ matrix.openai_agents }}"
-      - run: python -m pytest -q pytests/test_openai_agents_contract.py pytests/test_openai_agents_integration.py
+      - run: >-
+          python -m pytest -q
+          pytests/test_openai_facade.py
+          pytests/test_openai_agents_contract.py
+          pytests/test_openai_agents_integration.py
+          pytests/test_examples_and_docs.py::test_openai_offline_example_executes

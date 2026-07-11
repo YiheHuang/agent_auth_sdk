@@ -5,6 +5,8 @@ Registry v1 仅支持单节点、单 worker SQLite，并且只应监听 loopback
 ## 安装
 
 ```bash
+export AGENT_AUTH_VERSION=0.2.0b1
+export AGENT_AUTH_INSTALL_MODE=pypi
 export AGENT_REGISTRY_SERVER_NAME=registry.example.com
 export AGENT_REGISTRY_TLS_CERT=/etc/letsencrypt/live/registry.example.com/fullchain.pem
 export AGENT_REGISTRY_TLS_KEY=/etc/letsencrypt/live/registry.example.com/privkey.pem
@@ -36,4 +38,5 @@ curl --fail https://registry.example.com/healthz
 
 备份时停服复制 SQLite 文件，或使用 SQLite backup API。不要在写入期间直接复制数据库。
 
-完整说明见 [`docs/REGISTRY_OPERATIONS.md`](../docs/REGISTRY_OPERATIONS.md)。
+完整的 PyPI 安装、systemd/Nginx、API、备份恢复、升级和排障说明见
+[`docs/REGISTRY_OPERATIONS.md`](../docs/REGISTRY_OPERATIONS.md)。

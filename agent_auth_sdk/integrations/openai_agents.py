@@ -21,23 +21,19 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from agent_auth_sdk import (
-    AgentInstance,
-    AgentVerifier,
-    InMemoryNonceStore,
-    MetadataResolverConfig,
-    RemoteAgentClient,
-    VerificationConfig,
-    verify_agent_message,
-)
-from agent_auth_sdk.config import get_runtime_profile
-from agent_auth_sdk.models import (
+from ..agent import AgentInstance
+from ..config import MetadataResolverConfig, VerificationConfig, get_runtime_profile
+from ..messaging import verify_agent_message
+from ..models import (
     AgentRegistryDocument,
     AgentRegistryEntry,
     SignedAgentMessage,
     VerificationFailure,
     VerificationSuccess,
 )
+from ..remote import RemoteAgentClient
+from ..stores import InMemoryNonceStore
+from ..verifier import AgentVerifier
 
 RunnerCallable = Callable[[Any, Any], Any | Awaitable[Any]]
 
@@ -311,6 +307,12 @@ class OpenAIAgentsAuthRuntime:
 
 @dataclass(slots=True)
 class AuthenticatedOpenAIAgents:
+    """兼容的 multi-role 适配器。
+
+    .. deprecated:: 0.2.0b1
+       新项目使用 :class:`OpenAIAgentAuth`。该类至少保留一个 beta 发布周期。
+    """
+
     runtime: OpenAIAgentsAuthRuntime
     enabled: bool | None = None
     _trusted_events: list[str] = field(default_factory=list)
@@ -325,8 +327,12 @@ class AuthenticatedOpenAIAgents:
 
     def is_enabled(self) -> bool:
         if self.enabled is not None:
-            return self.enabled
-        return os.getenv("AGENT_AUTH_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+            enabled = self.enabled
+        else:
+            enabled = os.getenv("AGENT_AUTH_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+        if not enabled and self.runtime.config.profile == "strict":
+            raise RuntimeError("AGENT_AUTH_ENABLED cannot disable authentication in strict profile")
+        return enabled
 
     async def call_local_agent(
         self,

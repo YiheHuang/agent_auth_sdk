@@ -6,7 +6,7 @@ on:
       version:
         description: Exact SDK and Registry version to verify
         required: true
-        default: 0.1.0b1
+        default: 0.2.0b1
       upload_packages:
         description: Build and upload packages before verification
         required: true

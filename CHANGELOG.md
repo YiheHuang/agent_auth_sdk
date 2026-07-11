@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.0b1 - 2026-07-11
+
+OpenAI Agents 开发体验版本：
+
+- 新增单身份 `OpenAIAgentAuth`，运行时加载不再隐式创建 key 或发布身份
+- 新增保留原生 schema/metadata 的 `protect_tool()`、`agent_as_tool()` 和 `authenticated_handoff()`
+- 新增类型化 `remote_agent_tool()` 与自动验签/签名响应的 `AgentAuthRouter`
+- 新增 `AuthenticatedAgentContext`、稳定异常层级和无敏感 payload 的结构化事件
+- 新增显式 `agent-auth provision`，strict profile 禁止认证旁路
+- 新增只读 `agent-auth openai inspect` 和幂等 migration report
+- OpenAI Agents CI 兼容范围固定为 `0.2.0` 至 `0.18.2`
+- 旧 `AuthenticatedOpenAIAgents` 接口保留为兼容层
+
+## 0.1.0b2 - 2026-07-11
+
+文档、示例和公开 API 可用性版本：
+
+- 重写 PyPI README，新增 Vault + HTTPS Registry 可运行 Quick Start
+- 新增 SDK 全公开面 API Reference 和按任务组织的使用指南
+- 新增本地消息/HTTP、Vault 发布、密钥生命周期和远程 ASGI examples
+- 新增 OpenAI Agents 离线契约、真实模型和远程 HTTP server/client examples
+- 扩写 Registry 的 PyPI 安装、systemd/Nginx、管理、备份恢复和排障手册
+- 部署脚本默认支持固定版本 PyPI 安装，并保留显式 source 模式
+- 将 Signer、协议模型、结果、Profile、存储和 Vault 扩展点从顶层非破坏性 re-export
+- 将 docs、examples、Quick Start 和 deploy 资产纳入 SDK sdist
+
 ## 0.1.0b1 - 2026-07-10
 
 首个准备公开发布的安全重构 beta：

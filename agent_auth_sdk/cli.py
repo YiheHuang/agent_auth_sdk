@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, cast
 
 import typer
 
 app = typer.Typer(help="Agent Auth SDK developer tools")
+openai_app = typer.Typer(help="Inspect and migrate existing OpenAI Agents projects.")
+app.add_typer(openai_app, name="openai")
 
 
 @app.callback()
@@ -78,6 +81,65 @@ def doctor(
     typer.echo(json.dumps({"ok": True, "checks": checks}, ensure_ascii=False, indent=2))
 
 
+@app.command("provision")
+def provision_identity(
+    identity: Annotated[str, typer.Option(help="Configured role or full Agent ID.")],
+    config_path: Annotated[Path, typer.Option("--config", help="Path to agent-auth.toml.")] = Path(
+        ".agent-auth/agent-auth.toml"
+    ),
+) -> None:
+    """显式创建/检查配置的 Vault key，并将单个身份发布到 Registry。"""
+
+    from .integrations.openai_agents import OpenAIAgentsAuthConfig
+    from .integrations.openai_facade import OpenAIAgentAuth
+
+    async def run() -> dict:
+        config = OpenAIAgentsAuthConfig.from_file(config_path)
+        auth = await OpenAIAgentAuth.from_config(config, identity=identity, provision=True)
+        try:
+            return {"ok": True, "agent_id": auth.agent.agent_id, "kid": auth.agent.kid}
+        finally:
+            await auth.__aexit__()
+
+    typer.echo(json.dumps(asyncio.run(run()), ensure_ascii=False, indent=2))
+
+
+@openai_app.command("inspect")
+def inspect_openai(
+    project_root: Annotated[Path, typer.Argument(help="Existing OpenAI Agents project root.")] = Path("."),
+    json_output: Annotated[bool, typer.Option("--json", help="Emit machine-readable JSON.")] = False,
+) -> None:
+    """只读识别 Agent、Tool、Handoff、Runner 和 HTTP 边界。"""
+
+    from .openai_migration import migration_report
+
+    report = migration_report(project_root)
+    if json_output:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+    findings = cast(list[dict[str, Any]], report["findings"])
+    typer.echo(f"Found {len(findings)} OpenAI Agents integration points.")
+    for finding in findings:
+        typer.echo(f"{finding['path']}:{finding['line']} [{finding['kind']}] {finding['recommendation']}")
+
+
+@openai_app.command("migrate")
+def migrate_openai(
+    project_root: Annotated[Path, typer.Argument(help="Existing OpenAI Agents project root.")] = Path("."),
+    write: Annotated[bool, typer.Option("--write", help="Write an idempotent migration report.")] = False,
+) -> None:
+    """预览或写入迁移清单；不猜测身份、不改写业务源码。"""
+
+    from .openai_migration import migration_report, write_migration_report
+
+    if not write:
+        typer.echo(json.dumps(migration_report(project_root), ensure_ascii=False, indent=2))
+        typer.echo("Dry run only. Re-run with --write to create .agent-auth migration reports.")
+        return
+    output = write_migration_report(project_root)
+    typer.echo(f"Wrote idempotent migration report: {output}")
+
+
 @app.command("integrate-openai-agents")
 def integrate_openai_agents(
     project_root: Annotated[Path, typer.Option(help="Project root where .agent-auth will be created.")],
@@ -136,7 +198,17 @@ def integrate_openai_agents(
         ),
         encoding="utf-8",
     )
-    (auth_dir / "auth_adapter.py").write_text(_render_adapter(), encoding="utf-8")
+    adapter = _render_adapter()
+    (auth_dir / "auth_adapter.py").write_text(adapter, encoding="utf-8")
+    importable_adapter = root / "agent_auth_adapter.py"
+    if not importable_adapter.exists():
+        importable_adapter.write_text(
+            adapter.replace(
+                'Path(__file__).with_name("agent-auth.toml")',
+                'Path(__file__).parent / ".agent-auth" / "agent-auth.toml"',
+            ),
+            encoding="utf-8",
+        )
     (auth_dir / "env.local.example").write_text(_render_local_env(), encoding="utf-8")
     (auth_dir / "env.vault.example").write_text(_render_vault_env(parsed_roles), encoding="utf-8")
     (auth_dir / "INTEGRATION_REPORT.md").write_text(
@@ -144,7 +216,8 @@ def integrate_openai_agents(
         encoding="utf-8",
     )
     typer.echo(f"Generated explicit OpenAI Agents integration in {auth_dir}")
-    typer.echo("No business source files were modified.")
+    typer.echo("Generated agent_auth_adapter.py when no file with that name already existed.")
+    typer.echo("No existing business source files were modified.")
 
 
 def _parse_role_capability(value: str) -> tuple[str, str]:
@@ -193,7 +266,7 @@ def _render_config(
         'addr = "${AGENT_AUTH_VAULT_ADDR}"',
         'token_file = "${AGENT_AUTH_VAULT_TOKEN_FILE}"',
         'transit_mount = "${AGENT_AUTH_VAULT_TRANSIT_MOUNT}"',
-        "auto_create_keys = true",
+        "auto_create_keys = false",
         "",
         "[vault.key_names]",
         *[f'"{_escape(role)}" = "${{AGENT_AUTH_{_env_token(role)}_KEY_NAME}}"' for role in roles],
@@ -206,29 +279,24 @@ def _render_adapter() -> str:
     return """from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
-from agent_auth_sdk.integrations.openai_agents import AuthenticatedOpenAIAgents, OpenAIAgentsAuthConfig
-
-
-_AUTH: AuthenticatedOpenAIAgents | None = None
+from agent_auth_sdk import OpenAIAgentAuth
 
 
-async def get_auth_adapter() -> AuthenticatedOpenAIAgents:
-    global _AUTH
-    if _AUTH is None:
+_AUTH: dict[str, OpenAIAgentAuth] = {}
+
+
+async def get_auth(identity: str) -> OpenAIAgentAuth:
+    if identity not in _AUTH:
         config_path = Path(__file__).with_name("agent-auth.toml")
-        _AUTH = await AuthenticatedOpenAIAgents.from_config(OpenAIAgentsAuthConfig.from_file(config_path))
-    return _AUTH
+        _AUTH[identity] = await OpenAIAgentAuth.from_env(identity=identity, config_path=config_path)
+    return _AUTH[identity]
 
 
-async def call_agent(**kwargs: Any) -> Any:
-    auth = await get_auth_adapter()
-    return await auth.call_agent(**kwargs)
-
-
-def trusted_events() -> list[str]:
-    return [] if _AUTH is None else _AUTH.trusted_events()
+async def close_auth() -> None:
+    for auth in _AUTH.values():
+        await auth.__aexit__()
+    _AUTH.clear()
 """
 
 
@@ -263,37 +331,36 @@ Generated an explicit integration scaffold for roles: {", ".join(parsed_roles)}.
 
 Mode: `{mode}`
 
-No business source files were modified.
+No existing business source files were modified. A new importable `agent_auth_adapter.py`
+was generated when that path was available.
 
 ## Recommended Change
 
-Before:
+Before (typical Agent-as-tool):
 
 ```python
-@function_tool
-async def run_{first_target}(payload: dict) -> dict:
-    return await Runner.run({first_target}, payload)
+{first_target}_tool = {first_target}.as_tool(
+    tool_name="run_{first_target}",
+    tool_description="Call {first_target}.",
+)
 ```
 
 After:
 
 ```python
-from .agent_auth_loader import get_auth_adapter
+from agent_auth_adapter import get_auth
 
-@function_tool
-async def run_{first_target}(payload: dict) -> dict:
-    auth = await get_auth_adapter()
-    return await auth.call_agent(
-        source_role="{first_source}",
-        target_role="{first_target}",
-        target_agent={first_target},
-        payload=payload,
-        runner=Runner.run,
-    )
+auth = await get_auth("{first_source}")
+auth.bind({{"{first_target}": {first_target}}})
+{first_target}_tool = auth.agent_as_tool(
+    {first_target},
+    tool_name="run_{first_target}",
+    tool_description="Call the authenticated {first_target} Agent.",
+)
+{first_source}.tools.append({first_target}_tool)
 ```
 
-You can also load `.agent-auth/auth_adapter.py` directly with `importlib`
-if you do not want to place a small loader in your package.
+Place the binding and tool creation once during application startup.
 """
 
 

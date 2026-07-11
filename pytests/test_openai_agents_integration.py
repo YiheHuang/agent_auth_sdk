@@ -144,7 +144,8 @@ def test_cli_generates_explicit_integration_files(tmp_path: Path) -> None:
     auth_dir = tmp_path / ".agent-auth"
     assert (auth_dir / "agent-auth.toml").exists()
     assert (auth_dir / "auth_adapter.py").exists()
+    assert (tmp_path / "agent_auth_adapter.py").exists()
     report = (auth_dir / "INTEGRATION_REPORT.md").read_text(encoding="utf-8")
-    assert "No business source files were modified" in report
+    assert "No existing business source files were modified" in report
     config_text = (auth_dir / "agent-auth.toml").read_text(encoding="utf-8")
     assert '"security" = "review.security"' in config_text

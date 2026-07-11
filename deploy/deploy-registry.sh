@@ -4,7 +4,8 @@
 # 适用于 CentOS / OpenCloudOS，以 root 运行
 #
 # 用法:
-#   sudo bash deploy/deploy-registry.sh              # 全新部署或升级
+#   sudo bash deploy/deploy-registry.sh              # 默认从 PyPI 安装固定版本
+#   sudo AGENT_AUTH_INSTALL_MODE=source bash deploy/deploy-registry.sh
 #   sudo bash deploy/deploy-registry.sh --purge      # 完全清除后重新部署
 # ===========================================================================
 set -euo pipefail
@@ -24,6 +25,8 @@ STRICT_IDENTITIES="${AGENT_REGISTRY_STRICT_IDENTITIES:-1}"
 SERVER_NAME="${AGENT_REGISTRY_SERVER_NAME:-}"
 TLS_CERT="${AGENT_REGISTRY_TLS_CERT:-}"
 TLS_KEY="${AGENT_REGISTRY_TLS_KEY:-}"
+INSTALL_MODE="${AGENT_AUTH_INSTALL_MODE:-pypi}"
+AGENT_AUTH_VERSION="${AGENT_AUTH_VERSION:-0.2.0b1}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -59,8 +62,15 @@ fi
 
 log "安装 Registry 发行依赖 ..."
 "$VENV_DIR/bin/pip" install -q --upgrade pip
-"$VENV_DIR/bin/pip" install -q -e "$PROJECT_DIR"
-"$VENV_DIR/bin/pip" install -q -e "$PROJECT_DIR/packages/agent-auth-registry"
+if [[ "$INSTALL_MODE" == "pypi" ]]; then
+    "$VENV_DIR/bin/pip" install -q "verifiable-agent-auth-registry==$AGENT_AUTH_VERSION"
+elif [[ "$INSTALL_MODE" == "source" ]]; then
+    "$VENV_DIR/bin/pip" install -q -e "$PROJECT_DIR"
+    "$VENV_DIR/bin/pip" install -q -e "$PROJECT_DIR/packages/agent-auth-registry"
+else
+    warn "AGENT_AUTH_INSTALL_MODE 必须是 pypi 或 source"
+    exit 1
+fi
 
 # ── 运行时目录 ──────────────────────────────────────────────────────────────
 log "准备运行时目录 ..."

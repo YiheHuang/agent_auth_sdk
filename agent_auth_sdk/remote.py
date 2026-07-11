@@ -8,6 +8,8 @@ from typing import Any
 import httpx
 
 from .agent import AgentInstance
+from .auth_context import AuthenticatedAgentContext
+from .errors import AgentAuthenticationError, AgentTransportError
 from .http_utils import canonical_json_bytes
 from .models import SignedAgentMessage, VerificationFailure
 from .verifier import AgentVerifier
@@ -57,22 +59,37 @@ class RemoteAgentClient:
             body=body,
             headers={"content-type": "application/json"},
         )
-        response = await self._client().post(target_url, content=body, headers=signed.headers)
-        response.raise_for_status()
+        try:
+            response = await self._client().post(target_url, content=body, headers=signed.headers)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise AgentTransportError("Remote Agent request failed", agent_id=target_agent_id) from exc
         try:
             message = SignedAgentMessage.model_validate(response.json())
         except Exception as exc:
-            raise PermissionError("Remote Agent returned an unsigned or malformed response") from exc
+            raise AgentAuthenticationError(
+                "Remote Agent returned an unsigned or malformed response",
+                code="REMOTE_RESPONSE_INVALID",
+                agent_id=target_agent_id,
+            ) from exc
         if message.agent_id != target_agent_id or message.message_type != message_type:
-            raise PermissionError("Remote Agent response identity or message_type mismatch")
+            raise AgentAuthenticationError(
+                "Remote Agent response identity or message_type mismatch",
+                code="REMOTE_RESPONSE_MISMATCH",
+                agent_id=target_agent_id,
+            )
         verified = await self.verifier.verify_message(
             message=message,
             expected_recipient=self.sender.agent_id,
         )
         if isinstance(verified, VerificationFailure):
-            raise PermissionError(f"{verified.code}: {verified.reason}")
+            raise AgentAuthenticationError(verified.reason, code=verified.code, agent_id=target_agent_id)
         if verified.message is None:
-            raise PermissionError("Verification succeeded without a signed message")
+            raise AgentAuthenticationError(
+                "Verification succeeded without a signed message",
+                code="REMOTE_RESPONSE_INVALID",
+                agent_id=target_agent_id,
+            )
         return verified.message.payload
 
 
@@ -131,7 +148,13 @@ class AgentAuthASGIMiddleware:
             return
 
         state = scope.setdefault("state", {})
-        state["agent_auth"] = result
+        state["agent_auth"] = AuthenticatedAgentContext(
+            agent_id=result.agent_id,
+            kid=result.kid,
+            capabilities=tuple(result.metadata.capabilities) if result.metadata is not None else (),
+            request_id=result.request_id,
+        )
+        state["agent_auth_verification"] = result
         delivered = False
 
         async def replay_receive() -> dict[str, Any]:

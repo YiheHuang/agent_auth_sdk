@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "verifiable-agent-auth-sdk"
-version = "0.1.0b1"
+version = "0.2.0b1"
 description = "Python SDK for agent identity publishing, signed messaging, and registry-based verification"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -38,11 +38,13 @@ dependencies = [
 [project.optional-dependencies]
 vault = ["hvac>=2.4.0"]
 redis = ["redis>=5.0.0"]
-openai = ["openai-agents>=0.2.0,<1"]
+openai = ["openai-agents>=0.2.0,<=0.18.2"]
+openai-fastapi = ["openai-agents>=0.2.0,<=0.18.2", "fastapi>=0.115.0"]
 all = [
   "hvac>=2.4.0",
   "redis>=5.0.0",
-  "openai-agents>=0.2.0,<1",
+  "openai-agents>=0.2.0,<=0.18.2",
+  "fastapi>=0.115.0",
 ]
 dev = [
   "build>=1.2.0",
@@ -58,6 +60,9 @@ dev = [
 Homepage = "https://github.com/YiheHuang/agent_auth_sdk"
 Source = "https://github.com/YiheHuang/agent_auth_sdk"
 Issues = "https://github.com/YiheHuang/agent_auth_sdk/issues"
+Documentation = "https://github.com/YiheHuang/agent_auth_sdk/blob/main/QUICKSTART.md"
+Changelog = "https://github.com/YiheHuang/agent_auth_sdk/blob/main/CHANGELOG.md"
+Security = "https://github.com/YiheHuang/agent_auth_sdk/blob/main/SECURITY.md"
 
 [project.scripts]
 agent-auth = "agent_auth_sdk.cli:app"
@@ -71,9 +76,12 @@ packages = ["agent_auth_sdk"]
 [tool.hatch.build.targets.sdist]
 include = [
   "/agent_auth_sdk",
+  "/examples",
   "/docs",
+  "/deploy",
   "/CHANGELOG.md",
   "/LICENSE",
+  "/QUICKSTART.md",
   "/README.md",
   "/RELEASE.md",
   "/SECURITY.md",

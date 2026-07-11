@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "verifiable-agent-auth-registry"
-version = "0.1.0b1"
+version = "0.2.0b1"
 description = "Hardened single-node registry service for Agent Auth identities"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -23,7 +23,7 @@ classifiers = [
   "Topic :: Security :: Cryptography",
 ]
 dependencies = [
-  "verifiable-agent-auth-sdk==0.1.0b1",
+  "verifiable-agent-auth-sdk==0.2.0b1",
   "fastapi>=0.115.0",
   "uvicorn>=0.30.0",
   "typer>=0.12.0",
@@ -36,6 +36,9 @@ dev = ["pytest>=8.3.0"]
 Homepage = "https://github.com/YiheHuang/agent_auth_sdk"
 Source = "https://github.com/YiheHuang/agent_auth_sdk"
 Issues = "https://github.com/YiheHuang/agent_auth_sdk/issues"
+Documentation = "https://github.com/YiheHuang/agent_auth_sdk/blob/main/docs/REGISTRY_OPERATIONS.md"
+Changelog = "https://github.com/YiheHuang/agent_auth_sdk/blob/main/CHANGELOG.md"
+Security = "https://github.com/YiheHuang/agent_auth_sdk/blob/main/SECURITY.md"
 
 [project.scripts]
 agent-auth-registry = "agent_auth_registry.run:main"

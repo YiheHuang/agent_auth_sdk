@@ -22,6 +22,7 @@ def _run_module(module: str, *args: str) -> subprocess.CompletedProcess[str]:
         check=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
         timeout=30,
         env=env,
     )

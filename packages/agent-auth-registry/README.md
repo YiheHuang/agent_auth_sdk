@@ -1,11 +1,11 @@
 # Agent Auth Registry
 
-`agent-auth-registry` 是 `agent-auth-sdk` 的单节点中心身份注册服务。
+`verifiable-agent-auth-registry` 是 `verifiable-agent-auth-sdk` 的单节点中心身份注册服务。
 
 它提供 developer namespace 管理、Agent metadata 发布、密钥生命周期、原子 nonce 防重放和公开身份解析端点。
 
 ```bash
-pip install agent-auth-registry
+pip install verifiable-agent-auth-registry
 agent-auth-registry --help
 agent-auth-registry-admin --help
 ```

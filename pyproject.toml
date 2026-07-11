@@ -3,7 +3,7 @@ requires = ["hatchling>=1.26.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-auth-sdk"
+name = "verifiable-agent-auth-sdk"
 version = "0.1.0b1"
 description = "Python SDK for agent identity publishing, signed messaging, and registry-based verification"
 readme = "README.md"

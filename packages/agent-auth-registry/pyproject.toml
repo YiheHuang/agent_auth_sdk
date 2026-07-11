@@ -3,7 +3,7 @@ requires = ["hatchling>=1.26.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agent-auth-registry"
+name = "verifiable-agent-auth-registry"
 version = "0.1.0b1"
 description = "Hardened single-node registry service for Agent Auth identities"
 readme = "README.md"
@@ -23,7 +23,7 @@ classifiers = [
   "Topic :: Security :: Cryptography",
 ]
 dependencies = [
-  "agent-auth-sdk==0.1.0b1",
+  "verifiable-agent-auth-sdk==0.1.0b1",
   "fastapi>=0.115.0",
   "uvicorn>=0.30.0",
   "typer>=0.12.0",

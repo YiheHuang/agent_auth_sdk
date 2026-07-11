@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: testpypi
-      url: https://test.pypi.org/project/agent-auth-sdk/
+      url: https://test.pypi.org/project/verifiable-agent-auth-sdk/
     permissions:
       id-token: write
     steps:
@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: testpypi-registry
-      url: https://test.pypi.org/project/agent-auth-registry/
+      url: https://test.pypi.org/project/verifiable-agent-auth-registry/
     permissions:
       id-token: write
     steps:
@@ -79,8 +79,8 @@ jobs:
           python -m pip install
           --index-url https://test.pypi.org/simple/
           --extra-index-url https://pypi.org/simple/
-          "agent-auth-sdk==${{ inputs.version }}"
-          "agent-auth-registry==${{ inputs.version }}"
+          "verifiable-agent-auth-sdk==${{ inputs.version }}"
+          "verifiable-agent-auth-registry==${{ inputs.version }}"
       - run: agent-auth --help
       - run: agent-auth-registry --help
       - run: agent-auth-registry-admin --help

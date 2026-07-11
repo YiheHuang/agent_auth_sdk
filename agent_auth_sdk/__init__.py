@@ -41,6 +41,6 @@ __all__ = [
 ]
 
 try:
-    __version__ = version("agent-auth-sdk")
+    __version__ = version("verifiable-agent-auth-sdk")
 except PackageNotFoundError:  # 源码树运行
     __version__ = "0.1.0b1"

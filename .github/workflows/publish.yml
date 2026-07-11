@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/agent-auth-sdk/
+      url: https://pypi.org/project/verifiable-agent-auth-sdk/
     permissions:
       id-token: write
     steps:
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi-registry
-      url: https://pypi.org/project/agent-auth-registry/
+      url: https://pypi.org/project/verifiable-agent-auth-registry/
     permissions:
       id-token: write
     steps:

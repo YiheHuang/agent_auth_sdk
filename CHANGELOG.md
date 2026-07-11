@@ -13,7 +13,7 @@
 - HTTP/Registry 签名覆盖实际 body bytes，验签失败不泄漏底层解析异常
 - 新增 `AgentVerifier`、`RegistryClient`、`RemoteAgentClient` 与 ASGI middleware
 - Vault signer 固定 key version，token 隐藏且读取规则收紧
-- 拆分 `agent-auth-sdk` 与 `agent-auth-registry` 两个发行包
+- 拆分 `verifiable-agent-auth-sdk` 与 `verifiable-agent-auth-registry` 两个发行包
 - Registry HTTPS、非 root systemd、单 worker 和速率限制部署基线
 
 ## 1.0.0b1 - 2026-06-12（未公开发布的内部 beta）

@@ -1,24 +1,24 @@
 # Agent Auth SDK
 
-`agent-auth-sdk` 为 Agent 提供可验证身份、Registry 公钥发现、HTTP/消息签名验签、原子 nonce 防重放和 Vault Transit 私钥托管。
+`verifiable-agent-auth-sdk` 为 Agent 提供可验证身份、Registry 公钥发现、HTTP/消息签名验签、原子 nonce 防重放和 Vault Transit 私钥托管。
 
 当前版本：`0.1.0b1`。这是允许协议与 API 调整的 beta 版本。
 
 ## 安装
 
 ```bash
-pip install agent-auth-sdk
+pip install verifiable-agent-auth-sdk
 
 # 按需安装
-pip install "agent-auth-sdk[vault]"
-pip install "agent-auth-sdk[redis]"
-pip install "agent-auth-sdk[openai]"
+pip install "verifiable-agent-auth-sdk[vault]"
+pip install "verifiable-agent-auth-sdk[redis]"
+pip install "verifiable-agent-auth-sdk[openai]"
 ```
 
 Registry 是独立发行包：
 
 ```bash
-pip install agent-auth-registry
+pip install verifiable-agent-auth-registry
 ```
 
 ## 十分钟快速开始

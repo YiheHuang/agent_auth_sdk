@@ -1,147 +1,105 @@
 # Quick Start
 
-## 五分钟本地体验
-
-本地模式生成临时 ES256 key，只用于理解流程，不代表生产安全边界。
+## 本地模式
 
 ```bash
 python -m venv .venv
 # Linux/macOS: source .venv/bin/activate
 # Windows: .venv\Scripts\activate
-python -m pip install "verifiable-agent-auth-sdk[openai-fastapi]==1.0.0rc1"
+pip install "verifiable-agent-auth-sdk[openai]==1.0.0"
 agent-auth init
-agent-auth doctor
+agent-auth check
 ```
 
-上面三条命令只依赖 PyPI 安装包。若要运行仓库附带的两个无基础设施示例，请另外取得源码：
+生成的 `agent-auth.toml` 使用 dev 模式和临时内存 key。将现有代码中的 `Runner.run` 换成：
 
-```bash
-git clone https://github.com/YiheHuang/agent_auth_sdk.git
-cd agent_auth_sdk
-python examples/local_signed_message.py
-python examples/local_http_signing.py
+```python
+from agent_auth import AgentAuth
+
+auth = AgentAuth()
+auth.bind({"agent": coordinator})
+
+async with auth:
+    result = await auth.run(coordinator, user_input)
 ```
 
-预期看到正常验签成功，并且篡改或重复提交失败。
+## 生产模式
 
-## 生产配置：Vault + HTTPS Registry
-
-前置条件：HTTPS Registry、HTTPS Vault Transit、由 Registry 管理员确认归属的 DNS domain。strict profile 不接受 IP、localhost 或明文 HTTP。
-
-### 1. Registry 管理员创建 developer
+### 1. Registry 管理员
 
 ```bash
-agent-auth-registry-admin create-developer --client-id my-team
-agent-auth-registry-admin grant-namespace \
+agent-auth-registry-admin developer add \
   --client-id my-team \
   --domain agents.example.com \
-  --path-prefix /coordinator
+  --path-prefix /team
 ```
 
-API key 只显示一次，应放入 secret manager。
-
-### 2. Vault 管理员创建 key
+命令只显示一次 API key。将其放入应用 secret：
 
 ```bash
-vault secrets enable transit  # 已启用时跳过
+export AGENT_AUTH_REGISTRY_API_KEY="aar_..."
+```
+
+### 2. Vault key 与权限
+
+```bash
+vault secrets enable transit                     # 已启用则跳过
 vault write -f transit/keys/coordinator type=ecdsa-p256
 ```
 
-应用 token 只需要：
+应用 token 只需：
 
 ```hcl
 path "transit/keys/coordinator" { capabilities = ["read"] }
 path "transit/sign/coordinator" { capabilities = ["update"] }
 ```
 
-token 文件在 Linux/macOS 上必须为 `0600` 或更严格。
+执行 `agent-auth rotate` 的运维 token还需要 `transit/keys/coordinator/rotate` 的 `update` 权限。token 文件在 POSIX 系统必须为 `0600` 或更严格。
 
-### 3. 生成并编辑配置
-
-```bash
-agent-auth init \
-  --mode vault \
-  --roles coordinator \
-  --domain agents.example.com \
-  --organization "Example Team"
-```
-
-编辑 `.agent-auth/agent-auth.toml`：
+### 3. agent-auth.toml
 
 ```toml
-mode = "vault"
-identity = "agent://agents.example.com/coordinator"
-endpoint = "https://agents.example.com/invoke"
-public_base_url = "https://agents.example.com"
-profile = "strict"
-
-[registry]
-url = "https://registry.example.com"
-publish_url = "https://registry.example.com/v1/agents/publish"
-client_id = "${AGENT_AUTH_REGISTRY_CLIENT_ID}"
-api_key = "${AGENT_AUTH_REGISTRY_API_KEY}"
+version = 1
+mode = "production"
+registry = "https://registry.example.com"
+state = ".agent-auth/state.sqlite3"
+client_id = "my-team"
 
 [vault]
-addr = "https://vault.example.com"
-token_file = "../secrets/vault-token"
-verify = "../certs/vault-ca.pem" # 使用公共 CA 时写 true
+url = "https://vault.example.com"
+mount = "transit"
+verify = "/etc/ssl/vault-ca.pem"
+
+[agents.coordinator]
+id = "agent://agents.example.com/team/coordinator"
+endpoint = "https://agents.example.com/team/coordinator/invoke"
 key = "coordinator"
-auto_create_keys = false
-```
-
-设置凭证环境变量：
-
-```bash
-export AGENT_AUTH_REGISTRY_CLIENT_ID="my-team"
-export AGENT_AUTH_REGISTRY_API_KEY="replace-me"
-```
-
-Windows PowerShell 使用 `$env:NAME="value"`。
-
-### 4. 检查并发布
-
-```bash
-agent-auth doctor
-agent-auth provision
-```
-
-首次 provision 输出的 `kid` 末尾包含 Vault 版本，例如 `:v1`。将版本固定到配置：
-
-```toml
-[vault]
 key_version = 1
+token_file = "/run/secrets/coordinator-vault-token"
+capabilities = ["coordinate"]
+
+[remotes]
+researcher = "agent://agents.example.com/team/researcher"
 ```
 
-之后再次运行：
+生产要求 Agent ID host 与 endpoint host 完全相同。
+
+### 4. 检查、发布与运行
 
 ```bash
-agent-auth doctor
+agent-auth check
+agent-auth publish coordinator
 ```
 
-应用运行阶段只加载这一个固定身份，不会创建 key 或重复发布。
+应用启动不会创建 Vault key、发布身份或读取 Registry developer API key。
 
-### 5. 在代码中加载
+### 5. 轮换与撤销
 
-```python
-from agent_auth_sdk.openai import OpenAIAgentAuth
-
-auth = await OpenAIAgentAuth.from_env()
-async with auth:
-    print(auth.agent.agent_id, auth.agent.kid)
+```bash
+agent-auth rotate coordinator
+agent-auth revoke coordinator
 ```
 
-完整的两个 Agent 签名、发布和 recipient-bound 验签示例见 [`examples/vault_registry_quickstart.py`](https://github.com/YiheHuang/agent_auth_sdk/blob/main/examples/vault_registry_quickstart.py)。
+`rotate` 在 Registry 成功后原子更新 TOML 中的 `key_version`。若 Vault 已轮换但 Registry 请求失败，重试会复用未发布的新版本，不会连续创建版本。
 
-## 常见错误
-
-| code/错误 | 处理 |
-|---|---|
-| `VAULT_KEY_VERSION_REQUIRED` | provision 后把 `kid` 中的版本写入 `vault.key_version` |
-| `VAULT_CA_INVALID` | 检查 `vault.verify`；相对路径以 TOML 所在目录为基准 |
-| `VAULT_TOKEN_PERMISSION_DENIED` | 将 token 文件权限收紧为 `0600` |
-| `METADATA_FETCH_FAILED` | 检查 Registry URL、TLS 和身份是否已发布 |
-| `RECIPIENT_MISMATCH` | 请求中的 recipient 必须等于接收方完整 agent_id |
-| `NONCE_REPLAYED` | 同一签名只能消费一次，重新签名会生成新 nonce |
-| Registry 403 | 检查 developer 状态和 domain/path namespace |
-
-生产部署继续阅读 [Registry 部署与运维](https://github.com/YiheHuang/agent_auth_sdk/blob/main/docs/REGISTRY_OPERATIONS.md)。
+常见稳定错误：`CONFIG_INVALID`、`VAULT_REQUEST_FAILED`、`REGISTRY_UNAVAILABLE`、`SIGNATURE_INVALID`、`AUDIENCE_MISMATCH`、`NONCE_REPLAYED`。

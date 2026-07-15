@@ -1,252 +1,122 @@
-# Registry 部署与运维手册
+# Registry 部署与运维
 
-本文适用于 `verifiable-agent-auth-registry 1.0.0rc1`。
+适用于 `verifiable-agent-auth-registry==1.0.0`。Registry 只支持单节点、单 worker、本地 SQLite；不要使用 Gunicorn 多 worker、共享文件系统或直接暴露 Uvicorn。
 
-## 1. 支持边界
+## 配置
 
-- 单节点、单 Uvicorn worker、一个 SQLite 数据库。
-- 进程只监听 loopback，由 Nginx 提供公网 HTTPS。
-- 不支持多 worker、HA、共享网络文件系统或在线 schema downgrade。
-- Registry 管理员是 namespace 信任根；分配前必须通过组织流程确认 domain 归属。
-- 默认 strict identities，拒绝 IP、localhost、`.local` 和 `.internal`。
-
-## 2. 配置
-
-| 环境变量 | 默认值 | 说明 |
+| 环境变量 | 生产值 | 说明 |
 |---|---|---|
-| `AGENT_REGISTRY_HOST` | `127.0.0.1` | 生产保持 loopback |
-| `AGENT_REGISTRY_PORT` | `8008` | Uvicorn 监听端口 |
-| `AGENT_REGISTRY_DB_PATH` | `runtime/registry/registry.sqlite3` | SQLite 数据库 |
-| `AGENT_REGISTRY_PATH` | `runtime/registry/.well-known/agent.json` | 导出缓存；HTTP 读取仍以数据库为准 |
-| `AGENT_REGISTRY_ALLOWED_SKEW_SECONDS` | `300` | 写请求 timestamp 偏差 |
-| `AGENT_REGISTRY_WORKERS` | `1` | 其他值直接拒绝启动 |
-| `AGENT_REGISTRY_STRICT_IDENTITIES` | `1` | 生产保持开启 |
+| `AGENT_REGISTRY_URL` | `https://registry.example.com` | 必填；必须与 SDK 配置完全一致，也是 mutation audience |
+| `AGENT_REGISTRY_HOST` | `127.0.0.1` | 不要改为公网监听 |
+| `AGENT_REGISTRY_PORT` | `8008` | loopback 端口 |
+| `AGENT_REGISTRY_DB_PATH` | `/var/lib/agent-auth/registry.sqlite3` | 持久化本地磁盘 |
+| `AGENT_REGISTRY_ALLOWED_SKEW_SECONDS` | `120` | 签名时间容差 |
+| `AGENT_REGISTRY_STRICT_IDENTITIES` | `1` | 生产必须开启 |
 
-服务启用 SQLite WAL、foreign keys、busy timeout 和 schema version。写操作在 `BEGIN IMMEDIATE` 中原子提交 nonce、ownership、metadata/key 状态和成功审计。
-
-## 3. 本地开发
+## 本地开发
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install "verifiable-agent-auth-registry==1.0.0rc1"
-
-export AGENT_REGISTRY_DB_PATH="$PWD/runtime/registry.sqlite3"
-export AGENT_REGISTRY_PATH="$PWD/runtime/.well-known/agent.json"
+pip install "verifiable-agent-auth-registry==1.0.0"
 export AGENT_REGISTRY_STRICT_IDENTITIES=0
-agent-auth-registry --host 127.0.0.1 --port 8008 --workers 1
-```
-
-另一个终端：
-
-```bash
-export AGENT_REGISTRY_DB_PATH="$PWD/runtime/registry.sqlite3"
-export AGENT_REGISTRY_PATH="$PWD/runtime/.well-known/agent.json"
-agent-auth-registry-admin create-developer --client-id local-dev
-agent-auth-registry-admin grant-namespace \
-  --client-id local-dev --domain 127.0.0.1:9001 --path-prefix /
-curl --fail http://127.0.0.1:8008/healthz
+export AGENT_REGISTRY_URL=http://127.0.0.1:8008
+export AGENT_REGISTRY_DB_PATH=$PWD/registry.sqlite3
+agent-auth-registry
 ```
 
 不要把该模式暴露到公网。
 
-## 4. 生产安装
+## Linux 生产部署
 
-以下命令适用于 systemd Linux。Ubuntu/Debian 安装 `python3-venv nginx sqlite3`；RHEL/OpenCloudOS/CentOS 安装对应的 Python 3.11+、Nginx 和 SQLite 包。
-
-```bash
-sudo useradd --system --home-dir /opt/agent_auth_sdk/runtime --shell /usr/sbin/nologin agent-auth
-sudo install -d -o agent-auth -g agent-auth -m 0700 /opt/agent_auth_sdk/runtime/registry
-sudo install -d -o root -g root -m 0755 /opt/agent_auth_sdk
-sudo python3 -m venv /opt/agent_auth_sdk/.venv
-sudo /opt/agent_auth_sdk/.venv/bin/pip install --upgrade pip
-sudo /opt/agent_auth_sdk/.venv/bin/pip install "verifiable-agent-auth-registry==1.0.0rc1"
-sudo install -d -o root -g root -m 0755 /etc/agent-auth
-```
-
-创建 `/etc/agent-auth/registry.env`：
-
-```ini
-AGENT_REGISTRY_HOST=127.0.0.1
-AGENT_REGISTRY_PORT=8008
-AGENT_REGISTRY_DB_PATH=/opt/agent_auth_sdk/runtime/registry/registry.sqlite3
-AGENT_REGISTRY_PATH=/opt/agent_auth_sdk/runtime/registry/.well-known/agent.json
-AGENT_REGISTRY_ALLOWED_SKEW_SECONDS=300
-AGENT_REGISTRY_WORKERS=1
-AGENT_REGISTRY_STRICT_IDENTITIES=1
-```
+Ubuntu/Debian 安装 Python 3.11+、`python3-venv`、Nginx；RHEL 系安装等价软件包。然后：
 
 ```bash
-sudo chmod 0600 /etc/agent-auth/registry.env
+sudo useradd --system --home-dir /var/lib/agent-auth --shell /usr/sbin/nologin agent-auth
+sudo install -d -o agent-auth -g agent-auth -m 0700 /var/lib/agent-auth
+sudo install -d -o root -g root -m 0755 /opt/agent-auth /etc/agent-auth
+sudo python3 -m venv /opt/agent-auth/venv
+sudo /opt/agent-auth/venv/bin/pip install "verifiable-agent-auth-registry==1.0.0"
 ```
 
-systemd unit 使用仓库中的 [`deploy/registry.service`](../deploy/registry.service)，包含非 root 用户、`NoNewPrivileges`、只读系统、PrivateTmp 和 capability 清空：
+将 [`deploy/registry.env.example`](../deploy/registry.env.example) 安装为 `/etc/agent-auth/registry.env`，填入公开 HTTPS URL 后设为 `0600`。将 [`deploy/registry.service`](../deploy/registry.service) 安装到 `/etc/systemd/system/agent-auth-registry.service`：
 
 ```bash
-sudo cp deploy/registry.service /etc/systemd/system/agent-auth-registry.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now agent-auth-registry
-sudo systemctl status agent-auth-registry
-curl --fail http://127.0.0.1:8008/healthz
+curl --fail http://127.0.0.1:8008/health/ready
 ```
 
-如果安装路径不同，先修改 unit 中的 `WorkingDirectory`、`EnvironmentFile`、`ExecStart` 和 `ReadWritePaths`。
+将 [`deploy/nginx.agent-auth.conf`](../deploy/nginx.agent-auth.conf) 中的域名和证书路径替换为真实值，再执行 `nginx -t && systemctl reload nginx`。配置只代理五个公开路由，限制写速率和请求体，并启用 TLS 1.2/1.3。证书申请与续期由站点既有 ACME 流程负责。
 
-## 5. Nginx HTTPS
+仓库脚本 `sudo -E bash deploy/deploy-registry.sh` 可执行上述固定版本安装；`AGENT_AUTH_INSTALL_MODE=source` 才使用源码。`--purge` 会删除 Registry 数据库和 venv，执行前必须备份。
 
-使用仓库的 [`deploy/nginx.agent-auth.conf`](../deploy/nginx.agent-auth.conf)，替换域名和证书路径后：
+## 管理员 CLI
+
+所有命令必须读取与服务相同的 `AGENT_REGISTRY_DB_PATH`：
 
 ```bash
-sudo nginx -t
-sudo systemctl reload nginx
-curl --fail https://registry.example.com/healthz
+set -a; source /etc/agent-auth/registry.env; set +a
+source /opt/agent-auth/venv/bin/activate
+
+agent-auth-registry-admin developer add \
+  --client-id my-team --domain agents.example.com --path-prefix /team
+agent-auth-registry-admin developer list
+agent-auth-registry-admin developer rotate-key --client-id my-team
+agent-auth-registry-admin developer revoke --client-id my-team
+
+agent-auth-registry-admin namespace grant \
+  --client-id my-team --domain agents.example.com --path-prefix /other
+agent-auth-registry-admin namespace list --client-id my-team
+agent-auth-registry-admin namespace revoke --namespace-id UUID
+
+agent-auth-registry-admin agent revoke --agent-id agent://agents.example.com/team/a
+agent-auth-registry-admin db check
+agent-auth-registry-admin db backup --output /secure/registry.sqlite3
 ```
 
-配置包含：
+API key 只显示一次。有效 namespace 不能重叠；Agent revoke 不可逆。
 
-- HTTP 到 HTTPS 重定向、TLS 1.2/1.3 和 HSTS。
-- 512 KiB body limit、安全 headers。
-- 写端点 rate limit。
-- 上游固定 `127.0.0.1:8008`。
-- 转发原 Host、`X-Forwarded-For`、`X-Forwarded-Proto` 和 Authorization。
+## HTTP API
 
-`agent-auth-registry` 只信任来自 `127.0.0.1` 的 forwarded headers，因此 Nginx 与服务应在同一主机。不要直接监听 `0.0.0.0`。
+Registry 恰好公开五个路由：
 
-## 6. 一键脚本
-
-脚本适用于已把仓库放到 `/opt/agent_auth_sdk` 的 systemd 主机：
-
-```bash
-export AGENT_AUTH_VERSION=1.0.0rc1
-export AGENT_AUTH_INSTALL_MODE=pypi
-export AGENT_REGISTRY_SERVER_NAME=registry.example.com
-export AGENT_REGISTRY_TLS_CERT=/etc/letsencrypt/live/registry.example.com/fullchain.pem
-export AGENT_REGISTRY_TLS_KEY=/etc/letsencrypt/live/registry.example.com/privkey.pem
-sudo -E bash deploy/deploy-registry.sh
-```
-
-`AGENT_AUTH_INSTALL_MODE=source` 才会 editable-install 当前源码。`--purge` 会删除数据库、导出缓存和 venv，只能在明确需要重建时使用。
-
-## 7. Developer 与 namespace
-
-admin CLI 必须加载与服务相同的数据库路径：
-
-```bash
-set -a
-source /etc/agent-auth/registry.env
-set +a
-source /opt/agent_auth_sdk/.venv/bin/activate
-```
-
-| 命令 | 作用 |
+| 路由 | 说明 |
 |---|---|
-| `create-developer --client-id ID` | 创建 developer；API key 只显示一次 |
-| `list-developers` | 列出 developer 状态，不返回 API key |
-| `grant-namespace --client-id ID --domain DOMAIN --path-prefix PATH` | 分配不重叠 namespace |
-| `list-namespaces [--client-id ID]` | 查询 namespace id/status |
-| `revoke-namespace --namespace-id ID` | 撤销 namespace；不自动撤销已发布 Agent |
-| `rotate-api-key --client-id ID` | 使旧 API key 立即失效，新 key 只显示一次 |
-| `revoke-developer --client-id ID` | 禁止 developer 后续写操作 |
-| `inspect-agent --agent-id ID` | 查询 ownership 和 Registry entry |
-| `revoke-agent --agent-id ID` | 管理员不可逆撤销 Agent |
+| `GET /health/live` | 进程存活 |
+| `GET /health/ready` | schema、integrity 和数据库写就绪；失败为 503 |
+| `GET /v1/agents/resolve?agent_id=...` | 单 Agent 最小 metadata，支持 ETag |
+| `GET /.well-known/agent.json` | 所有活跃 Agent 目录，支持 ETag |
+| `POST /v1/agents` | SignedEnvelope mutation |
 
-每个 admin 命令都接受可选 `--db-path PATH`；生产更推荐统一加载 `AGENT_REGISTRY_DB_PATH`，避免误操作另一个数据库。
+写请求同时要求 `Authorization: Bearer <developer-api-key>` 和 `X-Registry-Client-ID`。envelope `type` 只能为 `registry.publish`、`registry.rotate` 或 `registry.revoke`。应用使用 `agent-auth publish/rotate/revoke`，无需手写协议。
 
-namespace 使用规范化后的精确 domain 和 path 前缀；有效 namespace 不能跨 developer 重叠。
+常见状态码：400 输入错误，401 developer/签名失败，403 namespace/owner 越权，404 未找到，409 重放、kid 或状态冲突。
 
-## 8. HTTP API
+## 备份、升级与恢复
 
-### 公开读取
-
-| 端点 | 成功响应 | 缓存 |
-|---|---|---|
-| `GET /health/live` | 进程存活 | 无 |
-| `GET /health/ready` | schema 与数据库 readiness；失败时 503 | 无 |
-| `GET /healthz` | `/health/ready` 兼容别名 | 无 |
-| `GET /.well-known/agent.json` | `AgentRegistryDocument` | ETag，60 秒 |
-| `GET /v1/agents/resolve?agent_id=...` | `{agent_id, metadata}` | ETag，60 秒 |
-
-resolve 对无效 identity 返回 400，对不存在或已撤销 Agent 返回 404。
-
-### 签名写入
-
-| 端点 | SDK 方法 | 语义 |
-|---|---|---|
-| `POST /v1/agents/publish` | `RegistryClient.publish` | 首次 insert ownership；同 owner 更新 metadata |
-| `POST /v1/agents/rotate-key` | `rotate_key` | 新 key 成为 current，旧 current inactive |
-| `POST /v1/agents/add-key` | `add_key` | 增加 active key，不改变 current |
-| `POST /v1/agents/revoke-key` | `revoke_key` | 永久撤销非 current kid |
-| `POST /v1/agents/revoke` | `revoke_agent` | 不可逆撤销整个 Agent |
-
-写请求要求 developer Bearer API key、`x-registry-client-id` 和 Agent 签名 headers。publish 的 header/body/metadata agent_id 必须一致；rotate/add 同时要求新 key possession proof。应用应使用 SDK，不要手写 canonical 请求。
-
-| 端点 | Request body | 成功响应关键字段 |
-|---|---|---|
-| publish | `agent_id`, `metadata`, `publish_intent="upsert_metadata"` | `ok`, `agent_id`, `developer_id`, `client_id` |
-| rotate-key | `agent_id`, `new_key`, `new_key_proof_headers` | `ok`, `agent_id`, `current_kid` |
-| add-key | `agent_id`, `new_key`, `new_key_proof_headers` | `ok`, `agent_id`, `added_kid` |
-| revoke-key | `agent_id`, `kid_to_revoke` | `ok`, `agent_id`, `revoked_kid` |
-| revoke | `agent_id` | `ok`, `agent_id` |
-
-共同签名 headers 为 `Authorization: Bearer ...`、`x-registry-client-id`、`x-agent-id`、`x-agent-kid`、`x-agent-timestamp`、`x-agent-nonce`、`x-agent-signature`、`x-agent-signature-input` 和 `host`。rotate/add 的 body 还包含由新 key 生成的 proof headers。
-
-常见状态：400 输入/证明错误，401 API key 或签名失败，403 namespace/owner 不允许，404 Agent/key 不存在，409 ownership 或并发状态冲突，422 schema 错误。
-
-旧 `/registry/agents/*` 路径仅保留 1.x 兼容，并返回 `Deprecation`、`Sunset` 和 successor
-`Link` header；新客户端只使用 `/v1/agents/*`。
-
-## 9. 备份与恢复
-
-推荐使用 Registry 自带的 schema 检查和 SQLite online backup：
+优先使用在线备份：
 
 ```bash
-sudo -u agent-auth agent-auth-registry-admin db check
-sudo -u agent-auth agent-auth-registry-admin db backup \
-  --output "/secure-backup/registry-$(date +%Y%m%d-%H%M%S).sqlite3"
+agent-auth-registry-admin db check
+agent-auth-registry-admin db backup --output /secure/registry-$(date +%F-%H%M).sqlite3
 ```
 
-或者停服后复制数据库：
+恢复时停服，保留当前数据库，复制已验证备份，修正 `agent-auth:agent-auth` owner 和 `0600` 权限，再启动并检查 ready/resolve。不要在运行时只复制主 SQLite 文件而忽略 WAL。
 
-```bash
-sudo systemctl stop agent-auth-registry
-sudo cp --preserve=mode,ownership,timestamps \
-  /opt/agent_auth_sdk/runtime/registry/registry.sqlite3 \
-  /secure-backup/registry.sqlite3
-sudo systemctl start agent-auth-registry
-```
+1.0 按全新 schema 处理，不迁移 beta 数据。升级前备份并阅读 CHANGELOG；Registry 精确依赖同版本 SDK。不要将新 schema 数据库直接用于旧二进制。
 
-不要在活跃写入时只复制主 `.sqlite3` 文件而忽略 WAL。恢复前停服、备份当前文件、复制已验证的备份、修正 owner/mode，再启动并检查 `/healthz` 和已知 agent resolve。
-
-## 10. 升级与回滚
-
-```bash
-sudo systemctl stop agent-auth-registry
-# 先执行第 9 节备份
-sudo /opt/agent_auth_sdk/.venv/bin/pip install --upgrade \
-  "verifiable-agent-auth-registry==1.0.0rc1"
-sudo systemctl start agent-auth-registry
-curl --fail https://registry.example.com/healthz
-```
-
-两个发行包必须使用 Registry 声明的精确配套版本。升级前阅读 CHANGELOG。若未来版本包含 schema migration，不得仅降级 Python 包后复用已迁移数据库；按发布说明恢复备份。
-
-## 11. 监控与排障
+## 排障
 
 ```bash
 sudo journalctl -u agent-auth-registry -f
-sudo systemctl show agent-auth-registry -p User -p MainPID
-curl -i https://registry.example.com/healthz
-curl -i https://registry.example.com/.well-known/agent.json
+curl -i https://registry.example.com/health/ready
+curl -i "https://registry.example.com/v1/agents/resolve?agent_id=agent%3A%2F%2Fagents.example.com%2Fteam%2Fa"
 ```
 
-| 现象 | 检查 |
-|---|---|
-| 启动提示 exactly one worker | `AGENT_REGISTRY_WORKERS=1`，不要使用 Gunicorn 多 worker |
-| `/healthz` 503 | DB 目录 owner/mode、磁盘空间、只读挂载、SQLite 锁 |
-| publish 403 | developer 状态、domain/path namespace、三个 agent_id 是否一致 |
-| publish 409 | identity 已由其他 developer 拥有，或客户端基于过期状态写入 |
-| timestamp expired | 主机 NTP 和 allowed skew |
-| Nginx 413/429 | body limit 或写 rate limit；不要盲目放宽 |
-| admin 看不到服务数据 | admin shell 未加载与服务相同的 `AGENT_REGISTRY_DB_PATH` |
+- 启动失败：确认 `AGENT_REGISTRY_URL`、DB 目录权限和 Python 版本。
+- ready 503：检查磁盘、只读挂载、SQLite integrity/lock。
+- publish 403：检查 developer 状态及 domain/path namespace。
+- publish 409：检查 owner、重复 request ID、kid 历史或已撤销状态。
+- `AUDIENCE_MISMATCH`：Registry URL 必须和应用 TOML 字节完全一致（末尾斜杠除外）。
+- `TIMESTAMP_EXPIRED`：检查两端 NTP。
 
-日志和审计不得输出 raw API key。认证失败也会进入 Registry 审计记录。
+审计记录认证失败和 mutation 结果，但不得记录原始 API key、signature 或 payload。

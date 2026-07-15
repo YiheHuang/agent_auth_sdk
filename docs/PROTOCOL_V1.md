@@ -1,105 +1,58 @@
-# Agent Auth Wire Protocol v1
+# SignedEnvelope v1
 
-本文是 v1 的规范性说明。关键词 MUST、MUST NOT、SHOULD 和 MAY 按 RFC 2119 含义理解。v1 在
-Agent Auth 1.x 中保持字节级兼容。
+本文是 Agent Auth 1.x 的规范性 wire protocol。所有本地 Agent 调用、远程请求/响应和 Registry 写操作都使用同一种 envelope。
 
-## 通用编码
-
-- 文本 MUST 为 UTF-8。
-- Base64 MUST 使用无 padding 的 base64url。
-- 时间 MUST 为 UTC RFC 3339 秒级 `YYYY-MM-DDTHH:MM:SSZ`；不得包含小数秒或非 UTC offset。
-- nonce MUST 在一次签名中唯一，接收方 MUST 原子消费并在有效窗口内拒绝重复值。
-- v1 算法 MUST 为 ES256：P-256、SHA-256、ASN.1 DER ECDSA signature。
-- 公钥与 fingerprint MUST 基于 P-256 SubjectPublicKeyInfo DER；fingerprint 为 SHA-256 hex。
-
-JSON canonicalization：对象 key 按 Unicode code point 排序，UTF-8 输出，分隔符为 `,` 和 `:`，
-不得输出多余空白。key MUST 是字符串；NaN、Infinity 和不可序列化值 MUST 被拒绝。
-
-## Agent identity
-
-```text
-agent://<normalized-host>/<one-or-more-path-segments>
+```json
+{
+  "v": 1,
+  "id": "018f...",
+  "sender": "agent://agents.example.com/coordinator",
+  "audience": "agent://agents.example.com/researcher",
+  "kid": "agent://agents.example.com/coordinator#key:v2",
+  "issued_at": "2026-07-15T12:00:00Z",
+  "type": "agent.call",
+  "reply_to": null,
+  "payload": "eyJxdWVyeSI6ImhlbGxvIn0",
+  "signature": "MEUCIQ..."
+}
 ```
 
-不得包含 userinfo、query、fragment、空 path segment、百分号编码或反斜杠。DNS host 使用小写
-IDNA ASCII；端口必须有效。strict profile 只接受公共 DNS host，不接受 IP、localhost、`.local`
-或 `.internal`。
+## 编码与签名
 
-## HTTP 请求签名
+- envelope 必须恰好包含上述十个字段；`v` 必须为整数 `1`。
+- `issued_at` 必须是 UTC、RFC 3339、秒级 `YYYY-MM-DDTHH:MM:SSZ`。
+- `payload` 是严格 JSON UTF-8 bytes 的无 padding base64url；拒绝 NaN、Infinity、非字符串 object key 和不可序列化值。
+- 签名输入是移除 `signature` 后的对象，以 UTF-8 JSON 编码：key 排序、无多余空白、`,`/`:` 分隔、Unicode 不转义。
+- 签名算法固定为 P-256 + SHA-256；签名编码为 ASN.1 DER，再做无 padding base64url。
+- 公钥固定为 P-256 SubjectPublicKeyInfo DER，再做无 padding base64url。
 
-签名输入按 LF (`0x0A`) 连接，末尾不增加 LF：
+接收端依次验证 sender/kid、audience、type、reply correlation、时间窗口、签名和 nonce。`id` 是 request ID，也是 `(sender, id)` 防重放键；只有验签成功后才能原子消费。
 
-```text
-METHOD
-/raw-path?raw-query
-BODY_SHA256_BASE64URL
-x-agent-id:<value>
-x-agent-kid:<value>
-x-agent-timestamp:<value>
-x-agent-nonce:<value>
-host:<value>
-```
+## 调用类型
 
-- METHOD MUST 转为大写。
-- path/query MUST 使用实际发送的编码形式；无 query 时不得附加 `?`。
-- body digest MUST 对实际发送的原始 body bytes 计算。
-- host MUST 与目标 URL authority 一致，包括非默认端口。
-- header 名大小写不敏感，但每个签名相关 header MUST 恰好出现一次。
+| type | sender → audience | reply_to |
+|---|---|---|
+| `tool.call` | Agent → 自身身份 | `null` |
+| `agent.call` | 调用 Agent → 目标 Agent | `null` |
+| `agent.result` | 目标 Agent → 调用 Agent | 原请求 `id` |
+| `agent.handoff` | 原 Agent → 接管 Agent | `null` |
+| `registry.publish` | Agent → Registry URL | `null` |
+| `registry.rotate` | 当前 key → Registry URL | `null` |
+| `registry.rotate.proof` | 新 key → Registry URL | 外层 rotate `id` |
+| `registry.revoke` | Agent → Registry URL | `null` |
 
-必需 header：
+handoff 没有返回 envelope。模型 streaming token 不逐块签名；stream 中真实发生的 tool、Agent-as-tool 和 handoff 边界照常签名。
 
-```text
-x-agent-id
-x-agent-kid
-x-agent-timestamp
-x-agent-nonce
-x-agent-signature
-x-agent-signature-input
-host
-```
+## Registry mutation payload
 
-`x-agent-signature-input` MUST 精确为：
+- publish：`agent_id`、`endpoint`、`capabilities`、`kid`、`public_key`。
+- rotate：`agent_id`、`new_kid`、`new_public_key`、`proof`。外层必须由 Registry 当前 key 签名；proof 必须由新 key 签名且 `reply_to` 指向外层。
+- revoke：仅 `agent_id`，由当前 key 签名。
 
-```text
-method path body-digest x-agent-id x-agent-kid x-agent-timestamp x-agent-nonce host
-```
+Registry 在一个 `BEGIN IMMEDIATE` 事务内消费 nonce、检查 namespace/owner、更新 Agent/key history 并写成功审计。kid 全局不可复用，已撤销 Agent 不可重新发布。
 
-接收端 MUST 在签名验证成功后原子消费 nonce。失败请求不得被当作已认证上下文交给业务代码。
+## Agent ID
 
-反向代理部署 MUST 使用外部可见 origin 重建 canonical URL，且只能信任来自明确代理地址的转发信息。
+格式为 `agent://<host>/<one-or-more-segments>`。拒绝 userinfo、query、fragment、空段、百分号编码、反斜杠和非法端口。production 仅接受公共 DNS host，并要求 endpoint 为 HTTPS 且 host/port 与 Agent ID 完全相同。
 
-## SignedAgentMessage
-
-消息签名使用域分离前缀 `agent-message-v1`，随后按实现固定顺序包含：agent_id、kid、timestamp、
-nonce、payload_type、canonical payload digest、recipient 和 message_type。
-
-点对点调用：
-
-- sender MUST 写入 recipient。
-- receiver MUST 显式传入 expected recipient。
-- 两者 MUST 完全相等，否则返回 `RECIPIENT_MISMATCH`。
-- 转发、payload 修改、message_type 修改或第二次消费 nonce MUST 失败。
-
-## Registry 写操作
-
-publish、rotate、add-key、revoke-key 和 revoke-agent 使用不同域分离前缀，防止签名跨操作复用。
-签名覆盖实际 canonical JSON body bytes。rotate/add-key 同时要求 current key 对请求签名，以及 new key
-对 possession proof 签名。
-
-Registry MUST 在同一个写事务中完成 nonce 消费、namespace/ownership 校验、metadata/key 更新和审计。
-首次 ownership MUST 使用仅插入语义，冲突返回 409，不得改写 owner。
-
-## 稳定失败分类
-
-常用 code：`INVALID_AGENT_ID`、`MESSAGE_INVALID`、`SIGNATURE_INVALID`、`TIMESTAMP_EXPIRED`、
-`NONCE_REPLAYED`、`RECIPIENT_MISMATCH`、`KEY_NOT_FOUND`、`KEY_REVOKED`、
-`METADATA_FETCH_FAILED`、`POLICY_REJECTED`。
-
-面对不可信输入的验签入口 MUST 返回稳定失败，不得泄漏 Pydantic、密钥解析或时间解析异常。
-
-## 测试向量与版本演进
-
-Golden vectors 见 [`protocol-v1-vectors.json`](protocol-v1-vectors.json)。第三方实现必须验证 canonical
-bytes、body digest、DER signature、fingerprint、timestamp 和 recipient 篡改用例。
-
-未来 RFC 9421/JWS 支持必须使用新的协议版本协商，不得静默改变 v1。
+Golden vector 见 [`protocol-v1-vectors.json`](protocol-v1-vectors.json)。任何不兼容变更必须使用新的 `v`，不能静默改变 v1。

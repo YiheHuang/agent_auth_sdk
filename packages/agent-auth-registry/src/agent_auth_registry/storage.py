@@ -1,4 +1,4 @@
-"""Registry 的 SQLite 权威存储。"""
+"""最小单节点 SQLite Registry storage。"""
 
 from __future__ import annotations
 
@@ -6,187 +6,139 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 
-from agent_auth_sdk.identity import normalize_agent_host, normalize_agent_path_prefix
-from agent_auth_sdk.models import AgentMetadata, AgentRegistryDocument, AgentRegistryEntry
-
-
-@dataclass(slots=True)
-class DeveloperRecord:
-    developer_id: str
-    client_id: str
-    api_key_hash: str
-    status: str
-    created_at: str
-    revoked_at: str | None
-
-
-@dataclass(slots=True)
-class OwnershipRecord:
-    agent_id: str
-    owner_developer_id: str
-    current_kid: str
-    public_key_fingerprint: str
-    status: str
-    created_at: str
-    updated_at: str
-
-
-@dataclass(slots=True)
-class RegistryEntryRecord:
-    agent_id: str
-    metadata_json: str
-    owner_developer_id: str
-    current_kid: str
-    public_key_fingerprint: str
-    published_at: str
-    updated_at: str
-    last_verified_publish_at: str
-
-
-@dataclass(slots=True)
-class DeveloperNamespaceRecord:
-    namespace_id: str
-    developer_id: str
-    domain: str
-    path_prefix: str
-    status: str
-    created_at: str
-    revoked_at: str | None
-
-
-class AgentStateConflictError(RuntimeError):
-    """操作基于过期的 Agent 状态，调用方必须重新解析后重试。"""
-
-
-class UnsupportedSchemaVersionError(RuntimeError):
-    """数据库 schema 版本不属于当前 Registry。"""
-
+from agent_auth._identity import namespace_matches
+from agent_auth._types import AgentRecord
 
 SCHEMA_VERSION = 1
 
 
+class StateConflictError(RuntimeError):
+    pass
+
+
+class UnsupportedSchemaVersionError(RuntimeError):
+    pass
+
+
+@dataclass(slots=True, frozen=True)
+class Developer:
+    id: str
+    client_id: str
+    api_key_hash: str
+    status: str
+
+
+@dataclass(slots=True, frozen=True)
+class Namespace:
+    id: str
+    developer_id: str
+    domain: str
+    path_prefix: str
+    status: str
+
+
 class RegistryStore:
-    def __init__(self, db_path: str | Path) -> None:
-        self._db_path = Path(db_path)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self._db_path, timeout=5.0)
+        connection = sqlite3.connect(self.path, timeout=5)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=5000")
         try:
             with connection:
                 yield connection
         finally:
             connection.close()
 
-    def _init_db(self) -> None:
-        with self._connect() as conn:
-            version_table = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
+    def _initialize(self) -> None:
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
             ).fetchone()
-            if version_table is not None:
-                row = conn.execute("SELECT MAX(version) AS version FROM schema_version").fetchone()
-                existing_version = int(row["version"]) if row and row["version"] is not None else 0
-                if existing_version not in {0, SCHEMA_VERSION}:
+            if existing:
+                version = connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+                if version not in {None, SCHEMA_VERSION}:
                     raise UnsupportedSchemaVersionError(
-                        f"Unsupported Registry schema version {existing_version}; expected {SCHEMA_VERSION}"
+                        f"Unsupported Registry schema version {version}; expected {SCHEMA_VERSION}"
                     )
-            conn.execute("PRAGMA journal_mode = WAL")
-            conn.executescript(
+            connection.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS developers (
-                    developer_id TEXT PRIMARY KEY,
-                    client_id TEXT NOT NULL UNIQUE,
-                    api_key_hash TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    revoked_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS agent_ownership (
-                    agent_id TEXT PRIMARY KEY,
-                    owner_developer_id TEXT NOT NULL,
-                    current_kid TEXT NOT NULL,
-                    public_key_fingerprint TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    FOREIGN KEY(owner_developer_id) REFERENCES developers(developer_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS agent_registry_entries (
-                    agent_id TEXT PRIMARY KEY,
-                    metadata_json TEXT NOT NULL,
-                    owner_developer_id TEXT NOT NULL,
-                    current_kid TEXT NOT NULL,
-                    public_key_fingerprint TEXT NOT NULL,
-                    published_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    last_verified_publish_at TEXT NOT NULL,
-                    FOREIGN KEY(agent_id) REFERENCES agent_ownership(agent_id),
-                    FOREIGN KEY(owner_developer_id) REFERENCES developers(developer_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS publish_nonces (
-                    nonce_key TEXT PRIMARY KEY,
-                    expires_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    developer_id TEXT,
-                    agent_id TEXT,
-                    action TEXT NOT NULL,
-                    result TEXT NOT NULL,
-                    reason_code TEXT,
-                    source_ip TEXT,
-                    created_at TEXT NOT NULL
-                );
-
                 CREATE TABLE IF NOT EXISTS schema_version (
                     version INTEGER PRIMARY KEY,
                     applied_at TEXT NOT NULL
                 );
-
-                INSERT OR IGNORE INTO schema_version(version, applied_at)
-                VALUES (1, CURRENT_TIMESTAMP);
-
-                CREATE TABLE IF NOT EXISTS developer_namespaces (
-                    namespace_id TEXT PRIMARY KEY,
-                    developer_id TEXT NOT NULL,
+                CREATE TABLE IF NOT EXISTS developers (
+                    id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL UNIQUE,
+                    api_key_hash TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('active','revoked')),
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS namespaces (
+                    id TEXT PRIMARY KEY,
+                    developer_id TEXT NOT NULL REFERENCES developers(id),
                     domain TEXT NOT NULL,
                     path_prefix TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    revoked_at TEXT,
-                    FOREIGN KEY(developer_id) REFERENCES developers(developer_id)
+                    status TEXT NOT NULL CHECK(status IN ('active','revoked')),
+                    created_at TEXT NOT NULL
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_developer_namespaces_domain
-                ON developer_namespaces(domain, status);
-                """,
+                CREATE UNIQUE INDEX IF NOT EXISTS namespaces_active_unique
+                    ON namespaces(domain, path_prefix) WHERE status='active';
+                CREATE TABLE IF NOT EXISTS agents (
+                    agent_id TEXT PRIMARY KEY,
+                    developer_id TEXT NOT NULL REFERENCES developers(id),
+                    endpoint TEXT NOT NULL,
+                    capabilities_json TEXT NOT NULL,
+                    kid TEXT NOT NULL,
+                    public_key TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('active','revoked'))
+                );
+                CREATE TABLE IF NOT EXISTS key_history (
+                    kid TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL REFERENCES agents(agent_id),
+                    public_key TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('current','inactive')),
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS nonces (
+                    sender TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    PRIMARY KEY(sender, request_id)
+                );
+                CREATE TABLE IF NOT EXISTS audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    developer_id TEXT,
+                    agent_id TEXT,
+                    action TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    code TEXT,
+                    source_ip TEXT
+                );
+                """
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)",
+                (SCHEMA_VERSION, _now()),
             )
 
-    @property
-    def db_path(self) -> Path:
-        return self._db_path
-
-    def schema_status(self) -> dict[str, int | bool | str]:
-        """返回可安全输出的数据库版本和完整性状态。"""
-
-        with self._connect() as conn:
-            row = conn.execute("SELECT MAX(version) AS version FROM schema_version").fetchone()
-            version = int(row["version"]) if row and row["version"] is not None else 0
-            integrity = str(conn.execute("PRAGMA quick_check").fetchone()[0])
+    def schema_status(self) -> dict[str, object]:
+        with self._connect() as connection:
+            version = connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
         return {
             "ok": version == SCHEMA_VERSION and integrity == "ok",
             "schema_version": version,
@@ -195,377 +147,251 @@ class RegistryStore:
         }
 
     def backup(self, destination: str | Path) -> Path:
-        """使用 SQLite online backup API 创建一致性备份。"""
-
         target = Path(destination)
-        if target.resolve() == self._db_path.resolve():
-            raise ValueError("backup destination must differ from the Registry database")
         target.parent.mkdir(parents=True, exist_ok=True)
-        source = sqlite3.connect(self._db_path, timeout=5.0)
-        destination_conn = sqlite3.connect(target, timeout=5.0)
-        try:
-            source.execute("PRAGMA busy_timeout = 5000")
-            source.backup(destination_conn)
-        finally:
-            destination_conn.close()
-            source.close()
+        with self._connect() as source, closing(sqlite3.connect(target)) as output:
+            with output:
+                source.backup(output)
         return target
 
-    def create_developer(self, *, developer_id: str, client_id: str, api_key_hash: str) -> None:
-        now = _now_iso()
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO developers(developer_id, client_id, api_key_hash, status, created_at, revoked_at)
-                VALUES (?, ?, ?, 'active', ?, NULL)
-                """,
-                (developer_id, client_id, api_key_hash, now),
-            )
+    def create_developer(self, client_id: str, api_key_hash: str) -> Developer:
+        developer = Developer(str(uuid.uuid4()), client_id, api_key_hash, "active")
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO developers(id, client_id, api_key_hash, status, created_at) VALUES (?,?,?,?,?)",
+                    (developer.id, developer.client_id, developer.api_key_hash, developer.status, _now()),
+                )
+        except sqlite3.IntegrityError as exc:
+            raise StateConflictError("CLIENT_ID_EXISTS") from exc
+        return developer
 
-    def list_developers(self) -> list[DeveloperRecord]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT developer_id, client_id, api_key_hash, status, created_at, revoked_at
-                FROM developers ORDER BY created_at ASC
-                """,
-            ).fetchall()
-        return [DeveloperRecord(**dict(row)) for row in rows]
+    def get_developer(self, client_id: str) -> Developer | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM developers WHERE client_id=?", (client_id,)).fetchone()
+        return _developer(row)
 
-    def revoke_developer(self, *, client_id: str) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE developers SET status = 'revoked', revoked_at = ? WHERE client_id = ?",
-                (_now_iso(), client_id),
-            )
+    def list_developers(self) -> list[Developer]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM developers ORDER BY client_id").fetchall()
+        return [_developer(row) for row in rows if row is not None]  # type: ignore[misc]
 
-    def admin_revoke_agent(self, *, agent_id: str) -> bool:
-        """管理员在单个事务中撤销 Agent 并记录审计。"""
-        now = _now_iso()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            cursor = conn.execute(
-                """
-                UPDATE agent_ownership SET status = 'revoked', updated_at = ?
-                WHERE agent_id = ? AND status = 'active'
-                """,
-                (now, agent_id),
-            )
-            result = "success" if cursor.rowcount == 1 else "rejected"
-            reason = None if cursor.rowcount == 1 else "AGENT_NOT_FOUND_OR_INACTIVE"
-            conn.execute(
-                """
-                INSERT INTO audit_log(developer_id, agent_id, action, result, reason_code, source_ip, created_at)
-                VALUES (NULL, ?, 'admin_revoke_agent', ?, ?, NULL, ?)
-                """,
-                (agent_id, result, reason, now),
-            )
-        return cursor.rowcount == 1
-
-    def update_developer_api_key_hash(self, *, client_id: str, api_key_hash: str) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE developers SET api_key_hash = ? WHERE client_id = ?",
+    def rotate_developer_key(self, client_id: str, api_key_hash: str) -> None:
+        with self._connect() as connection:
+            changed = connection.execute(
+                "UPDATE developers SET api_key_hash=? WHERE client_id=? AND status='active'",
                 (api_key_hash, client_id),
+            ).rowcount
+        if not changed:
+            raise StateConflictError("DEVELOPER_NOT_FOUND")
+
+    def revoke_developer(self, client_id: str) -> None:
+        with self._connect() as connection:
+            changed = connection.execute(
+                "UPDATE developers SET status='revoked' WHERE client_id=? AND status='active'", (client_id,)
+            ).rowcount
+        if not changed:
+            raise StateConflictError("DEVELOPER_NOT_FOUND")
+
+    def grant_namespace(self, developer_id: str, domain: str, path_prefix: str) -> Namespace:
+        domain = domain.lower().strip()
+        path_prefix = "/" + path_prefix.strip("/")
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM namespaces WHERE domain=? AND status='active'", (domain,)
+            ).fetchall()
+            for row in existing:
+                current = str(row["path_prefix"])
+                if (
+                    current == path_prefix
+                    or current.startswith(path_prefix + "/")
+                    or path_prefix.startswith(current + "/")
+                ):
+                    raise StateConflictError("NAMESPACE_OVERLAP")
+            namespace = Namespace(str(uuid.uuid4()), developer_id, domain, path_prefix, "active")
+            connection.execute(
+                "INSERT INTO namespaces(id, developer_id, domain, path_prefix, status, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (namespace.id, namespace.developer_id, domain, path_prefix, namespace.status, _now()),
             )
+        return namespace
 
-    def get_developer_by_client_id(self, client_id: str) -> DeveloperRecord | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT developer_id, client_id, api_key_hash, status, created_at, revoked_at
-                FROM developers
-                WHERE client_id = ?
-                """,
-                (client_id,),
-            ).fetchone()
-        return DeveloperRecord(**dict(row)) if row else None
+    def list_namespaces(self, client_id: str | None = None) -> list[Namespace]:
+        query = "SELECT n.* FROM namespaces n JOIN developers d ON d.id=n.developer_id"
+        parameters: tuple[str, ...] = ()
+        if client_id:
+            query += " WHERE d.client_id=?"
+            parameters = (client_id,)
+        query += " ORDER BY n.domain,n.path_prefix"
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_namespace(row) for row in rows]
 
-    def create_namespace(self, *, developer_id: str, domain: str, path_prefix: str) -> DeveloperNamespaceRecord:
-        """创建不与其他 active developer 重叠的精确 domain/path namespace。"""
+    def revoke_namespace(self, namespace_id: str) -> None:
+        with self._connect() as connection:
+            changed = connection.execute(
+                "UPDATE namespaces SET status='revoked' WHERE id=? AND status='active'", (namespace_id,)
+            ).rowcount
+        if not changed:
+            raise StateConflictError("NAMESPACE_NOT_FOUND")
 
-        domain = normalize_agent_host(domain)
-        path_prefix = normalize_agent_path_prefix(path_prefix)
-        namespace_id = str(uuid.uuid4())
-        now = _now_iso()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            developer = conn.execute(
-                "SELECT developer_id FROM developers WHERE developer_id = ? AND status = 'active'",
+    def has_namespace(self, developer_id: str, agent_id: str) -> bool:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT domain,path_prefix FROM namespaces WHERE developer_id=? AND status='active'",
                 (developer_id,),
-            ).fetchone()
-            if developer is None:
-                raise ValueError("active developer not found")
-            rows = conn.execute(
-                """
-                SELECT namespace_id, developer_id, domain, path_prefix, status, created_at, revoked_at
-                FROM developer_namespaces
-                WHERE domain = ? AND status = 'active'
-                """,
-                (domain,),
             ).fetchall()
-            for row in rows:
-                record = DeveloperNamespaceRecord(**dict(row))
-                overlaps = (
-                    path_prefix == "/"
-                    or record.path_prefix == "/"
-                    or path_prefix == record.path_prefix
-                    or path_prefix.startswith(record.path_prefix + "/")
-                    or record.path_prefix.startswith(path_prefix + "/")
-                )
-                if overlaps:
-                    raise ValueError(f"namespace overlaps active assignment owned by developer {record.developer_id}")
-            conn.execute(
-                """
-                INSERT INTO developer_namespaces(
-                    namespace_id, developer_id, domain, path_prefix, status, created_at, revoked_at
-                ) VALUES (?, ?, ?, ?, 'active', ?, NULL)
-                """,
-                (namespace_id, developer_id, domain, path_prefix, now),
-            )
-        return DeveloperNamespaceRecord(namespace_id, developer_id, domain, path_prefix, "active", now, None)
+        return any(namespace_matches(agent_id, row["domain"], row["path_prefix"]) for row in rows)
 
-    def list_namespaces(
-        self,
-        *,
-        developer_id: str | None = None,
-        domain: str | None = None,
-        active_only: bool = False,
-    ) -> list[DeveloperNamespaceRecord]:
-        clauses: list[str] = []
-        values: list[str] = []
-        if developer_id is not None:
-            clauses.append("developer_id = ?")
-            values.append(developer_id)
-        if domain is not None:
-            clauses.append("domain = ?")
-            values.append(domain)
-        if active_only:
-            clauses.append("status = 'active'")
-        where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT namespace_id, developer_id, domain, path_prefix, status, created_at, revoked_at
-                FROM developer_namespaces
-                """
-                + where
-                + " ORDER BY domain, path_prefix",
-                values,
-            ).fetchall()
-        return [DeveloperNamespaceRecord(**dict(row)) for row in rows]
-
-    def revoke_namespace(self, *, namespace_id: str) -> bool:
-        with self._connect() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE developer_namespaces
-                SET status = 'revoked', revoked_at = ?
-                WHERE namespace_id = ? AND status = 'active'
-                """,
-                (_now_iso(), namespace_id),
-            )
-        return cursor.rowcount == 1
-
-    def developer_has_namespace(self, *, developer_id: str, domain: str, agent_path: str) -> bool:
-        for record in self.list_namespaces(developer_id=developer_id, domain=domain, active_only=True):
-            if (
-                record.path_prefix == "/"
-                or agent_path == record.path_prefix
-                or agent_path.startswith(record.path_prefix + "/")
-            ):
-                return True
-        return False
-
-    def get_ownership(self, agent_id: str) -> OwnershipRecord | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT agent_id, owner_developer_id, current_kid, public_key_fingerprint, status, created_at, updated_at
-                FROM agent_ownership
-                WHERE agent_id = ?
-                """,
-                (agent_id,),
+    def resolve(self, agent_id: str) -> AgentRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM agents WHERE agent_id=? AND status='active'", (agent_id,)
             ).fetchone()
-        return OwnershipRecord(**dict(row)) if row else None
+        return _record(row)
 
-    def get_registry_entry(self, agent_id: str) -> RegistryEntryRecord | None:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT agent_id, metadata_json, owner_developer_id, current_kid,
-                    public_key_fingerprint, published_at, updated_at, last_verified_publish_at
-                FROM agent_registry_entries
-                WHERE agent_id = ?
-                """,
-                (agent_id,),
+    def list_active_agents(self) -> list[AgentRecord]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM agents WHERE status='active' ORDER BY agent_id").fetchall()
+        return [_record(row) for row in rows if row is not None]  # type: ignore[misc]
+
+    def owner(self, agent_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT developer_id FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
+        return str(row[0]) if row else None
+
+    def has_nonce(self, sender: str, request_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM nonces WHERE sender=? AND request_id=? AND expires_at>?",
+                (sender, request_id, _now()),
             ).fetchone()
-        return RegistryEntryRecord(**dict(row)) if row else None
+        return row is not None
 
-    def commit_agent_operation(
-        self,
-        *,
-        metadata: AgentMetadata,
-        developer_id: str,
-        current_kid: str,
-        public_key_fingerprint: str,
-        nonce_keys: list[str],
-        nonce_expires_at: datetime,
-        action: str,
-        source_ip: str | None,
-        create: bool,
-        created_at: str | None = None,
-        expected_updated_at: str | None = None,
-    ) -> bool:
-        """原子提交 nonce、Agent 状态和成功审计。"""
-
-        now = _next_updated_at(expected_updated_at)
-        created = created_at or now
-        metadata_json = metadata.model_dump_json()
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute("DELETE FROM publish_nonces WHERE expires_at <= ?", (now,))
-            try:
-                for nonce_key in nonce_keys:
-                    conn.execute(
-                        "INSERT INTO publish_nonces(nonce_key, expires_at) VALUES (?, ?)",
-                        (nonce_key, nonce_expires_at.isoformat()),
-                    )
-            except sqlite3.IntegrityError:
-                conn.rollback()
-                return False
-
-            if create:
-                conn.execute(
-                    """
-                    INSERT INTO agent_ownership(
-                        agent_id, owner_developer_id, current_kid, public_key_fingerprint,
-                        status, created_at, updated_at
-                    )
-                    VALUES (?, ?, ?, ?, 'active', ?, ?)
-                    """,
-                    (metadata.agent_id, developer_id, current_kid, public_key_fingerprint, created, now),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO agent_registry_entries(
-                        agent_id, metadata_json, owner_developer_id, current_kid,
-                        public_key_fingerprint, published_at, updated_at,
-                        last_verified_publish_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
+    def publish(self, record: AgentRecord, developer_id: str, request_id: str, expires_at: str) -> AgentRecord:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            _consume(connection, record.agent_id, request_id, expires_at)
+            current = connection.execute("SELECT * FROM agents WHERE agent_id=?", (record.agent_id,)).fetchone()
+            if current is None:
+                if connection.execute("SELECT 1 FROM key_history WHERE kid=?", (record.kid,)).fetchone():
+                    raise StateConflictError("KID_ALREADY_USED")
+                connection.execute(
+                    "INSERT INTO agents(agent_id,developer_id,endpoint,capabilities_json,kid,public_key,"
+                    "updated_at,status) "
+                    "VALUES (?,?,?,?,?,?,?,'active')",
                     (
-                        metadata.agent_id,
-                        metadata_json,
+                        record.agent_id,
                         developer_id,
-                        current_kid,
-                        public_key_fingerprint,
-                        created,
-                        now,
+                        record.endpoint,
+                        json.dumps(list(record.capabilities), separators=(",", ":")),
+                        record.kid,
+                        record.public_key,
                         now,
                     ),
+                )
+                connection.execute(
+                    "INSERT INTO key_history(kid,agent_id,public_key,status,created_at) VALUES (?,?,?,'current',?)",
+                    (record.kid, record.agent_id, record.public_key, now),
                 )
             else:
-                if expected_updated_at is None:
-                    raise ValueError("expected_updated_at is required for an Agent update")
-                ownership_cursor = conn.execute(
-                    """
-                    UPDATE agent_ownership
-                    SET current_kid = ?, public_key_fingerprint = ?, updated_at = ?
-                    WHERE agent_id = ? AND owner_developer_id = ?
-                        AND status = 'active' AND updated_at = ?
-                    """,
+                if current["developer_id"] != developer_id:
+                    raise StateConflictError("OWNER_MISMATCH")
+                if current["status"] != "active":
+                    raise StateConflictError("AGENT_REVOKED")
+                if current["kid"] != record.kid or current["public_key"] != record.public_key:
+                    raise StateConflictError("PUBLISH_CANNOT_CHANGE_KEY")
+                connection.execute(
+                    "UPDATE agents SET endpoint=?,capabilities_json=?,updated_at=? WHERE agent_id=?",
                     (
-                        current_kid,
-                        public_key_fingerprint,
+                        record.endpoint,
+                        json.dumps(list(record.capabilities), separators=(",", ":")),
                         now,
-                        metadata.agent_id,
-                        developer_id,
-                        expected_updated_at,
+                        record.agent_id,
                     ),
                 )
-                entry_cursor = conn.execute(
-                    """
-                    UPDATE agent_registry_entries
-                    SET metadata_json = ?, current_kid = ?, public_key_fingerprint = ?,
-                        updated_at = ?, last_verified_publish_at = ?
-                    WHERE agent_id = ? AND owner_developer_id = ? AND updated_at = ?
-                    """,
-                    (
-                        metadata_json,
-                        current_kid,
-                        public_key_fingerprint,
-                        now,
-                        now,
-                        metadata.agent_id,
-                        developer_id,
-                        expected_updated_at,
-                    ),
-                )
-                if ownership_cursor.rowcount != 1 or entry_cursor.rowcount != 1:
-                    raise AgentStateConflictError("Agent state changed while the operation was in progress")
+            _audit(connection, developer_id, record.agent_id, "publish", "accepted", None, None)
+        result = self.resolve(record.agent_id)
+        if result is None:  # pragma: no cover - transaction invariant
+            raise RuntimeError("published Agent missing")
+        return result
 
-            conn.execute(
-                """
-                INSERT INTO audit_log(developer_id, agent_id, action, result, reason_code, source_ip, created_at)
-                VALUES (?, ?, ?, 'success', NULL, ?, ?)
-                """,
-                (developer_id, metadata.agent_id, action, source_ip, now),
-            )
-        return True
-
-    def commit_revoke_agent(
+    def rotate(
         self,
         *,
         agent_id: str,
         developer_id: str,
-        nonce_key: str,
-        nonce_expires_at: datetime,
-        source_ip: str | None,
-        expected_current_kid: str,
-        expected_updated_at: str,
-    ) -> bool:
-        """原子消费 nonce、撤销 Agent 并写入成功审计。"""
-
-        now = _next_updated_at(expected_updated_at)
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute("DELETE FROM publish_nonces WHERE expires_at <= ?", (now,))
-            try:
-                conn.execute(
-                    "INSERT INTO publish_nonces(nonce_key, expires_at) VALUES (?, ?)",
-                    (nonce_key, nonce_expires_at.isoformat()),
-                )
-            except sqlite3.IntegrityError:
-                conn.rollback()
-                return False
-            cursor = conn.execute(
-                """
-                UPDATE agent_ownership SET status = 'revoked', updated_at = ?
-                WHERE agent_id = ? AND owner_developer_id = ? AND status = 'active'
-                    AND current_kid = ? AND updated_at = ?
-                """,
-                (now, agent_id, developer_id, expected_current_kid, expected_updated_at),
+        current_kid: str,
+        new_kid: str,
+        new_public_key: str,
+        request_ids: tuple[str, str],
+        expires_at: str,
+    ) -> AgentRecord:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for request_id in request_ids:
+                _consume(connection, agent_id, request_id, expires_at)
+            row = connection.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
+            if row is None:
+                raise StateConflictError("AGENT_NOT_FOUND")
+            if row["developer_id"] != developer_id:
+                raise StateConflictError("OWNER_MISMATCH")
+            if row["status"] != "active" or row["kid"] != current_kid:
+                raise StateConflictError("CURRENT_KEY_MISMATCH")
+            if connection.execute("SELECT 1 FROM key_history WHERE kid=?", (new_kid,)).fetchone():
+                raise StateConflictError("KID_ALREADY_USED")
+            connection.execute("UPDATE key_history SET status='inactive' WHERE kid=?", (current_kid,))
+            connection.execute(
+                "INSERT INTO key_history(kid,agent_id,public_key,status,created_at) VALUES (?,?,?,'current',?)",
+                (new_kid, agent_id, new_public_key, now),
             )
-            if cursor.rowcount != 1:
-                raise AgentStateConflictError("Agent state changed while the operation was in progress")
-            conn.execute(
-                """
-                INSERT INTO audit_log(developer_id, agent_id, action, result, reason_code, source_ip, created_at)
-                VALUES (?, ?, 'revoke_agent', 'success', NULL, ?, ?)
-                """,
-                (developer_id, agent_id, source_ip, now),
+            connection.execute(
+                "UPDATE agents SET kid=?,public_key=?,updated_at=? WHERE agent_id=?",
+                (new_kid, new_public_key, now, agent_id),
             )
-        return True
+            _audit(connection, developer_id, agent_id, "rotate", "accepted", None, None)
+        result = self.resolve(agent_id)
+        if result is None:  # pragma: no cover
+            raise RuntimeError("rotated Agent missing")
+        return result
 
-    def has_nonce(self, nonce_key: str) -> bool:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT nonce_key FROM publish_nonces WHERE nonce_key = ? AND expires_at > ?",
-                (nonce_key, _now_iso()),
-            ).fetchone()
-        return row is not None
+    def revoke(
+        self,
+        *,
+        agent_id: str,
+        developer_id: str,
+        current_kid: str,
+        request_id: str,
+        expires_at: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            _consume(connection, agent_id, request_id, expires_at)
+            row = connection.execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
+            if row is None:
+                raise StateConflictError("AGENT_NOT_FOUND")
+            if row["developer_id"] != developer_id:
+                raise StateConflictError("OWNER_MISMATCH")
+            if row["status"] != "active" or row["kid"] != current_kid:
+                raise StateConflictError("CURRENT_KEY_MISMATCH")
+            connection.execute("UPDATE agents SET status='revoked',updated_at=? WHERE agent_id=?", (_now(), agent_id))
+            connection.execute("UPDATE key_history SET status='inactive' WHERE kid=?", (current_kid,))
+            _audit(connection, developer_id, agent_id, "revoke", "accepted", None, None)
+
+    def admin_revoke_agent(self, agent_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                "UPDATE agents SET status='revoked',updated_at=? WHERE agent_id=? AND status='active'",
+                (_now(), agent_id),
+            ).rowcount
+            if changed:
+                connection.execute("UPDATE key_history SET status='inactive' WHERE agent_id=?", (agent_id,))
+                _audit(connection, None, agent_id, "admin.revoke", "accepted", None, None)
+        if not changed:
+            raise StateConflictError("AGENT_NOT_FOUND")
 
     def write_audit(
         self,
@@ -574,71 +400,70 @@ class RegistryStore:
         agent_id: str | None,
         action: str,
         result: str,
-        reason_code: str | None,
+        code: str | None,
         source_ip: str | None,
     ) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO audit_log(developer_id, agent_id, action, result, reason_code, source_ip, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (developer_id, agent_id, action, result, reason_code, source_ip, _now_iso()),
-            )
+        with self._connect() as connection:
+            _audit(connection, developer_id, agent_id, action, result, code, source_ip)
 
-    def render_public_document(self) -> AgentRegistryDocument:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT e.agent_id, e.metadata_json, e.published_at
-                FROM agent_registry_entries e
-                JOIN agent_ownership o ON e.agent_id = o.agent_id
-                WHERE o.status = 'active'
-                ORDER BY e.agent_id ASC
-                """,
-            ).fetchall()
-        agents = [
-            AgentRegistryEntry(
-                agent_id=row["agent_id"],
-                metadata=AgentMetadata.model_validate(json.loads(row["metadata_json"])),
-                published_at=datetime.fromisoformat(row["published_at"]),
-                publisher=None,
-            )
-            for row in rows
-        ]
-        updated_at = max(
-            (entry.metadata.updated_at for entry in agents),
-            default=datetime(1970, 1, 1, tzinfo=UTC),
-        )
-        return AgentRegistryDocument(updated_at=updated_at, agents=agents)
-
-    def readiness_check(self) -> bool:
+    def readiness(self) -> bool:
         try:
-            with self._connect() as conn:
-                conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").fetchone()
-                conn.execute("BEGIN IMMEDIATE")
-                conn.execute("ROLLBACK")
-            return True
+            status = self.schema_status()
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute("CREATE TEMP TABLE IF NOT EXISTS readiness(value INTEGER)")
+            return bool(status["ok"])
         except sqlite3.Error:
             return False
 
-    def write_public_document(self, output_path: str | Path) -> Path:
-        document = self.render_public_document()
-        target = Path(output_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(document.model_dump_json(indent=2), encoding="utf-8")
-        return target
+
+def _consume(connection: sqlite3.Connection, sender: str, request_id: str, expires_at: str) -> None:
+    connection.execute("DELETE FROM nonces WHERE expires_at <= ?", (_now(),))
+    try:
+        connection.execute(
+            "INSERT INTO nonces(sender,request_id,expires_at) VALUES (?,?,?)",
+            (sender, request_id, expires_at),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise StateConflictError("NONCE_REPLAYED") from exc
 
 
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+def _audit(
+    connection: sqlite3.Connection,
+    developer_id: str | None,
+    agent_id: str | None,
+    action: str,
+    result: str,
+    code: str | None,
+    source_ip: str | None,
+) -> None:
+    connection.execute(
+        "INSERT INTO audit(created_at,developer_id,agent_id,action,result,code,source_ip) VALUES (?,?,?,?,?,?,?)",
+        (_now(), developer_id, agent_id, action, result, code, source_ip),
+    )
 
 
-def _next_updated_at(expected_updated_at: str | None) -> str:
-    now = datetime.now(UTC)
-    if expected_updated_at is None:
-        return now.isoformat()
-    expected = datetime.fromisoformat(expected_updated_at)
-    if now <= expected:
-        now = expected + timedelta(microseconds=1)
-    return now.isoformat()
+def _developer(row: sqlite3.Row | None) -> Developer | None:
+    return Developer(row["id"], row["client_id"], row["api_key_hash"], row["status"]) if row else None
+
+
+def _namespace(row: sqlite3.Row) -> Namespace:
+    return Namespace(row["id"], row["developer_id"], row["domain"], row["path_prefix"], row["status"])
+
+
+def _record(row: sqlite3.Row | None) -> AgentRecord | None:
+    if row is None:
+        return None
+    capabilities = json.loads(row["capabilities_json"])
+    return AgentRecord(
+        agent_id=row["agent_id"],
+        endpoint=row["endpoint"],
+        capabilities=tuple(capabilities),
+        kid=row["kid"],
+        public_key=row["public_key"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _now() -> str:
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")

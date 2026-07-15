@@ -1,770 +1,312 @@
-"""中心注册服务器：安全接收开发者发布的 Agent metadata。"""
+"""五路由中心 Registry。"""
 
 from __future__ import annotations
 
 import hashlib
 import os
-import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
 
-from agent_auth_sdk.http_utils import parse_rfc3339_utc_seconds
-from agent_auth_sdk.identity import assert_strict_agent_id, build_agent_id, parse_agent_id
-from agent_auth_sdk.models import AgentKey, AgentMetadata
-from agent_auth_sdk.registry_security import (
-    agent_key_fingerprint,
-    hash_api_key,
-    is_legacy_api_key_hash,
-    verify_api_key,
-    verify_registry_add_key_proof,
-    verify_registry_new_key_proof,
-    verify_registry_publish_signature,
-)
+from agent_auth._errors import AgentAuthError
+from agent_auth._identity import parse_agent_id, validate_endpoint, validate_service_url
+from agent_auth._protocol import SignedEnvelope, parse_timestamp, verify_envelope
+from agent_auth._types import AgentRecord
 
-from .storage import AgentStateConflictError, OwnershipRecord, RegistryStore
+from .security import verify_api_key
+from .storage import Developer, RegistryStore, StateConflictError
 
 
-class PublishRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    agent_id: str
-    metadata: AgentMetadata
-    publish_intent: str
+def load_db_path() -> Path:
+    return Path(os.getenv("AGENT_REGISTRY_DB_PATH", "runtime/registry.sqlite3"))
 
 
-class RotateKeyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    agent_id: str
-    new_key: AgentKey
-    new_key_proof_headers: dict[str, str]
+def load_registry_url() -> str:
+    value = os.getenv("AGENT_REGISTRY_URL")
+    if not value and strict_identities():
+        raise RuntimeError("AGENT_REGISTRY_URL is required when strict identities are enabled")
+    try:
+        return validate_service_url(value or "http://testserver", strict=strict_identities())
+    except AgentAuthError as exc:
+        raise RuntimeError("AGENT_REGISTRY_URL must be a valid HTTPS public URL") from exc
 
 
-class AddKeyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    agent_id: str
-    new_key: AgentKey
-    new_key_proof_headers: dict[str, str]
+def strict_identities() -> bool:
+    return os.getenv("AGENT_REGISTRY_STRICT_IDENTITIES", "1").lower() not in {"0", "false", "no"}
 
 
-class RevokeKeyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    agent_id: str
-    kid_to_revoke: str
+def allowed_skew() -> int:
+    return int(os.getenv("AGENT_REGISTRY_ALLOWED_SKEW_SECONDS", "120"))
 
 
-class RevokeAgentRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    agent_id: str
-
-
-def load_registry_public_path() -> Path:
-    return Path(os.getenv("AGENT_REGISTRY_PATH", "runtime/registry/.well-known/agent.json"))
-
-
-def load_registry_db_path() -> Path:
-    return Path(os.getenv("AGENT_REGISTRY_DB_PATH", "runtime/registry/registry.sqlite3"))
-
-
-def load_registry_allowed_skew_seconds() -> int:
-    return int(os.getenv("AGENT_REGISTRY_ALLOWED_SKEW_SECONDS", "300"))
-
-
-def load_registry_strict_identities() -> bool:
-    return os.getenv("AGENT_REGISTRY_STRICT_IDENTITIES", "1").strip().lower() not in {"0", "false", "no", "off"}
-
-
-def create_app() -> FastAPI:
-    app = FastAPI(title="Agent Registry")
-    store = RegistryStore(load_registry_db_path())
-
-    @app.middleware("http")
-    async def legacy_route_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
-        response = await call_next(request)
-        if request.url.path.startswith("/registry/agents/"):
-            successor = request.url.path.replace("/registry/agents/", "/v1/agents/", 1)
-            response.headers["Deprecation"] = "true"
-            response.headers["Sunset"] = "Thu, 01 Jul 2027 00:00:00 GMT"
-            response.headers["Link"] = f'<{successor}>; rel="successor-version"'
-        return response
+def create_app(*, store: RegistryStore | None = None) -> FastAPI:
+    load_registry_url()
+    database = store or RegistryStore(load_db_path())
+    app = FastAPI(
+        title="Agent Auth Registry",
+        version="1.0",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
 
     @app.get("/health/live")
-    def health_live() -> dict[str, str]:
+    def live() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.get("/health/ready")
-    def health_ready() -> JSONResponse:
-        ready = store.readiness_check()
-        return JSONResponse(
-            {"status": "ok" if ready else "not_ready"},
-            status_code=200 if ready else 503,
-        )
-
-    @app.get("/healthz")
-    def healthz() -> JSONResponse:
-        return health_ready()
-
-    @app.get("/.well-known/agent.json")
-    def well_known_registry() -> JSONResponse:
-        document = store.render_public_document()
-        payload = document.model_dump(mode="json")
-        etag = hashlib.sha256(document.model_dump_json().encode("utf-8")).hexdigest()
-        return JSONResponse(payload, headers={"ETag": f'"{etag}"', "Cache-Control": "public, max-age=60"})
+    def ready() -> JSONResponse:
+        ok = database.readiness()
+        return JSONResponse({"status": "ok" if ok else "not_ready"}, status_code=200 if ok else 503)
 
     @app.get("/v1/agents/resolve")
-    def resolve_registry_agent(agent_id: str) -> JSONResponse:
+    def resolve(agent_id: str, if_none_match: str | None = Header(default=None)) -> JSONResponse:
         try:
-            parse_agent_id(agent_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="INVALID_AGENT_ID") from exc
-        ownership = store.get_ownership(agent_id)
-        entry = store.get_registry_entry(agent_id)
-        if ownership is None or ownership.status != "active" or entry is None:
+            parse_agent_id(agent_id, strict=strict_identities())
+        except AgentAuthError as exc:
+            raise HTTPException(status_code=400, detail=exc.code) from exc
+        record = database.resolve(agent_id)
+        if record is None:
             raise HTTPException(status_code=404, detail="AGENT_NOT_FOUND")
-        metadata = AgentMetadata.model_validate_json(entry.metadata_json)
-        etag = hashlib.sha256(entry.metadata_json.encode("utf-8")).hexdigest()
-        return JSONResponse(
-            {"agent_id": agent_id, "metadata": metadata.model_dump(mode="json")},
-            headers={"ETag": f'"{etag}"', "Cache-Control": "public, max-age=60"},
-        )
+        payload = record.as_dict()
+        etag = _etag(payload)
+        if if_none_match == etag:
+            return JSONResponse(content=None, status_code=304, headers={"ETag": etag})
+        return JSONResponse(payload, headers={"ETag": etag, "Cache-Control": "public, max-age=60"})
 
-    @app.post("/v1/agents/publish")
-    @app.post("/registry/agents/publish")
-    async def publish_agent(
-        request: PublishRequest,
-        http_request: Request,
+    @app.get("/.well-known/agent.json")
+    def well_known(if_none_match: str | None = Header(default=None)) -> JSONResponse:
+        payload = {"version": 1, "agents": [record.as_dict() for record in database.list_active_agents()]}
+        etag = _etag(payload)
+        if if_none_match == etag:
+            return JSONResponse(content=None, status_code=304, headers={"ETag": etag})
+        return JSONResponse(payload, headers={"ETag": etag, "Cache-Control": "public, max-age=60"})
+
+    @app.post("/v1/agents")
+    async def mutate(
+        request: Request,
         authorization: str | None = Header(default=None),
-        x_agent_id: str | None = Header(default=None),
-        x_agent_kid: str | None = Header(default=None),
-        x_agent_timestamp: str | None = Header(default=None),
-        x_agent_nonce: str | None = Header(default=None),
-        x_agent_signature: str | None = Header(default=None),
         x_registry_client_id: str | None = Header(default=None),
     ) -> JSONResponse:
-        source_ip = http_request.client.host if http_request.client else None
-        developer = None
+        source_ip = request.client.host if request.client else None
+        developer: Developer | None = None
+        envelope: SignedEnvelope | None = None
         try:
-            developer = _authenticate_developer(store, authorization, x_registry_client_id)
-            _validate_publish_headers(
-                request=request,
-                x_agent_id=x_agent_id,
-                x_agent_kid=x_agent_kid,
-                x_agent_timestamp=x_agent_timestamp,
-                x_agent_nonce=x_agent_nonce,
-                x_agent_signature=x_agent_signature,
-            )
-            _assert_fresh_timestamp(x_agent_timestamp)
-            nonce_key = f"{developer.developer_id}:{x_agent_nonce}"
-
-            ownership = store.get_ownership(request.agent_id)
-            if ownership is None:
-                _assert_developer_namespace(store, developer.developer_id, request.agent_id)
-                _validate_new_agent_identity(request)
-                signing_key = _select_key(request.metadata.keys, x_agent_kid)
-                verified = verify_registry_publish_signature(
-                    path=http_request.url.path,
-                    host=http_request.headers.get("host", ""),
-                    body=await http_request.body(),
-                    headers=dict(http_request.headers),
-                    public_key=signing_key,
-                )
-                if not verified:
-                    raise HTTPException(status_code=401, detail="SIGNATURE_INVALID")
-                try:
-                    committed = store.commit_agent_operation(
-                        metadata=request.metadata,
-                        developer_id=developer.developer_id,
-                        current_kid=x_agent_kid,
-                        public_key_fingerprint=agent_key_fingerprint(signing_key),
-                        nonce_keys=[nonce_key],
-                        nonce_expires_at=_registry_nonce_expiry(),
-                        action="publish",
-                        source_ip=source_ip,
-                        create=True,
-                    )
-                except sqlite3.IntegrityError as exc:
-                    raise HTTPException(status_code=409, detail="AGENT_ALREADY_EXISTS") from exc
-                if not committed:
-                    raise HTTPException(status_code=409, detail="NONCE_REPLAYED")
-            else:
-                if ownership.owner_developer_id != developer.developer_id:
-                    raise HTTPException(status_code=403, detail="OWNER_MISMATCH")
-                _assert_developer_namespace(store, developer.developer_id, request.agent_id)
-                _assert_agent_active(ownership)
-                entry = store.get_registry_entry(request.agent_id)
-                if entry is None:
-                    raise HTTPException(status_code=500, detail="REGISTRY_ENTRY_MISSING")
-                current_metadata = AgentMetadata.model_validate_json(entry.metadata_json)
-                _validate_immutable_fields(current_metadata, request.metadata)
-                if _keys_changed(current_metadata.keys, request.metadata.keys):
-                    raise HTTPException(status_code=409, detail="KEY_CHANGE_REQUIRES_ROTATION")
-                signing_key = _select_key(current_metadata.keys, x_agent_kid)
-                verified = verify_registry_publish_signature(
-                    path=http_request.url.path,
-                    host=http_request.headers.get("host", ""),
-                    body=await http_request.body(),
-                    headers=dict(http_request.headers),
-                    public_key=signing_key,
-                )
-                if not verified:
-                    raise HTTPException(status_code=401, detail="SIGNATURE_INVALID")
-                try:
-                    committed = store.commit_agent_operation(
-                        metadata=request.metadata,
-                        developer_id=developer.developer_id,
-                        current_kid=ownership.current_kid,
-                        public_key_fingerprint=ownership.public_key_fingerprint,
-                        created_at=ownership.created_at,
-                        expected_updated_at=ownership.updated_at,
-                        nonce_keys=[nonce_key],
-                        nonce_expires_at=_registry_nonce_expiry(),
-                        action="publish",
-                        source_ip=source_ip,
-                        create=False,
-                    )
-                except AgentStateConflictError as exc:
-                    raise HTTPException(status_code=409, detail="AGENT_STATE_CONFLICT") from exc
-                if not committed:
-                    raise HTTPException(status_code=409, detail="NONCE_REPLAYED")
-
-            return JSONResponse(
-                {
-                    "ok": True,
-                    "agent_id": request.agent_id,
-                    "developer_id": developer.developer_id,
-                    "client_id": developer.client_id,
-                },
-            )
-        except HTTPException as exc:
-            store.write_audit(
-                developer_id=getattr(developer, "developer_id", None),
-                agent_id=request.agent_id,
-                action="publish",
+            developer = _authenticate(database, authorization, x_registry_client_id)
+            raw = await request.json()
+            if not isinstance(raw, dict):
+                raise AgentAuthError("ENVELOPE_INVALID", "Mutation body must be a signed envelope")
+            envelope = SignedEnvelope.from_dict(raw)
+            if database.has_nonce(envelope.sender, envelope.id):
+                raise StateConflictError("NONCE_REPLAYED")
+            if envelope.type == "registry.publish":
+                record = _publish(database, developer, envelope)
+                return JSONResponse({"ok": True, **record.as_dict()})
+            if envelope.type == "registry.rotate":
+                record = _rotate(database, developer, envelope)
+                return JSONResponse({"ok": True, **record.as_dict()})
+            if envelope.type == "registry.revoke":
+                _revoke(database, developer, envelope)
+                return JSONResponse({"ok": True, "agent_id": envelope.sender})
+            raise AgentAuthError("MUTATION_TYPE_INVALID", "Unsupported Registry mutation type")
+        except StateConflictError as exc:
+            code = str(exc)
+            database.write_audit(
+                developer_id=developer.id if developer else None,
+                agent_id=envelope.sender if envelope else None,
+                action=envelope.type if envelope else "mutation",
                 result="rejected",
-                reason_code=str(exc.detail),
+                code=code,
                 source_ip=source_ip,
             )
-            raise
-
-    @app.post("/v1/agents/rotate-key")
-    @app.post("/registry/agents/rotate-key")
-    async def rotate_key(
-        request: RotateKeyRequest,
-        http_request: Request,
-        authorization: str | None = Header(default=None),
-        x_agent_id: str | None = Header(default=None),
-        x_agent_kid: str | None = Header(default=None),
-        x_agent_timestamp: str | None = Header(default=None),
-        x_agent_nonce: str | None = Header(default=None),
-        x_agent_signature: str | None = Header(default=None),
-        x_registry_client_id: str | None = Header(default=None),
-    ) -> JSONResponse:
-        source_ip = http_request.client.host if http_request.client else None
-        developer = None
-        try:
-            developer = _authenticate_developer(store, authorization, x_registry_client_id)
-            if x_agent_id != request.agent_id:
-                raise HTTPException(status_code=400, detail="AGENT_ID_MISMATCH")
-            _assert_fresh_timestamp(x_agent_timestamp)
-            nonce_key = f"{developer.developer_id}:{x_agent_nonce}"
-            proof_headers = request.new_key_proof_headers
-            if not proof_headers:
-                raise HTTPException(status_code=400, detail="NEW_KEY_PROOF_REQUIRED")
-            normalized_proof_headers = {key.lower(): value for key, value in proof_headers.items()}
-            _assert_fresh_timestamp(normalized_proof_headers.get("x-agent-timestamp"))
-            proof_nonce = normalized_proof_headers.get("x-agent-nonce")
-            if not proof_nonce:
-                raise HTTPException(status_code=400, detail="NEW_KEY_PROOF_MISSING_NONCE")
-            proof_nonce_key = f"{developer.developer_id}:new-key:{proof_nonce}"
-            if normalized_proof_headers.get("x-registry-client-id") != developer.client_id:
-                raise HTTPException(status_code=400, detail="NEW_KEY_PROOF_CLIENT_MISMATCH")
-
-            ownership = store.get_ownership(request.agent_id)
-            if ownership is None:
-                raise HTTPException(status_code=404, detail="AGENT_NOT_FOUND")
-            if ownership.owner_developer_id != developer.developer_id:
-                raise HTTPException(status_code=403, detail="OWNER_MISMATCH")
-            _assert_developer_namespace(store, developer.developer_id, request.agent_id)
-            _assert_agent_active(ownership)
-            if x_agent_kid != ownership.current_kid:
-                raise HTTPException(status_code=409, detail="ROTATION_REQUIRES_CURRENT_KEY")
-            entry = store.get_registry_entry(request.agent_id)
-            if entry is None:
-                raise HTTPException(status_code=500, detail="REGISTRY_ENTRY_MISSING")
-            metadata = AgentMetadata.model_validate_json(entry.metadata_json)
-            if (
-                request.new_key.kid in {key.kid for key in metadata.keys}
-                or request.new_key.kid in metadata.revoked_kids
-            ):
-                raise HTTPException(status_code=409, detail="KID_ALREADY_USED")
-            old_key = _select_key(metadata.keys, x_agent_kid)
-            verified = verify_registry_publish_signature(
-                path=http_request.url.path,
-                host=http_request.headers.get("host", ""),
-                body=await http_request.body(),
-                headers=dict(http_request.headers),
-                public_key=old_key,
-            )
-            if not verified:
-                raise HTTPException(status_code=401, detail="SIGNATURE_INVALID")
-            proof_valid = verify_registry_new_key_proof(
-                agent_id=request.agent_id,
-                new_key=request.new_key,
-                headers=proof_headers,
-                host=http_request.headers.get("host", ""),
-            )
-            if not proof_valid:
-                raise HTTPException(status_code=401, detail="NEW_KEY_PROOF_INVALID")
-
-            updated_keys = []
-            for key in metadata.keys:
-                if key.kid == x_agent_kid:
-                    updated_keys.append(key.model_copy(update={"status": "inactive"}))
-                else:
-                    updated_keys.append(key)
-            updated_keys.append(request.new_key.model_copy(update={"status": "active"}))
-            updated_metadata = metadata.model_copy(
-                update={
-                    "keys": updated_keys,
-                    "updated_at": datetime.now(UTC),
-                },
-            )
-            try:
-                committed = store.commit_agent_operation(
-                    metadata=updated_metadata,
-                    developer_id=developer.developer_id,
-                    current_kid=request.new_key.kid,
-                    public_key_fingerprint=agent_key_fingerprint(request.new_key),
-                    created_at=ownership.created_at,
-                    expected_updated_at=ownership.updated_at,
-                    nonce_keys=[nonce_key, proof_nonce_key],
-                    nonce_expires_at=_registry_nonce_expiry(),
-                    action="rotate_key",
-                    source_ip=source_ip,
-                    create=False,
-                )
-            except AgentStateConflictError as exc:
-                raise HTTPException(status_code=409, detail="AGENT_STATE_CONFLICT") from exc
-            if not committed:
-                raise HTTPException(status_code=409, detail="NONCE_REPLAYED")
-            return JSONResponse({"ok": True, "agent_id": request.agent_id, "current_kid": request.new_key.kid})
-        except HTTPException as exc:
-            store.write_audit(
-                developer_id=getattr(developer, "developer_id", None),
-                agent_id=request.agent_id,
-                action="rotate_key",
+            status = 403 if code in {"OWNER_MISMATCH", "NAMESPACE_NOT_AUTHORIZED"} else 409
+            raise HTTPException(status_code=status, detail=code) from exc
+        except AgentAuthError as exc:
+            database.write_audit(
+                developer_id=developer.id if developer else None,
+                agent_id=envelope.sender if envelope else None,
+                action=envelope.type if envelope else "mutation",
                 result="rejected",
-                reason_code=str(exc.detail),
+                code=exc.code,
                 source_ip=source_ip,
             )
-            raise
-
-    @app.post("/v1/agents/add-key")
-    @app.post("/registry/agents/add-key")
-    async def add_key(
-        request: AddKeyRequest,
-        http_request: Request,
-        authorization: str | None = Header(default=None),
-        x_agent_id: str | None = Header(default=None),
-        x_agent_kid: str | None = Header(default=None),
-        x_agent_timestamp: str | None = Header(default=None),
-        x_agent_nonce: str | None = Header(default=None),
-        x_agent_signature: str | None = Header(default=None),
-        x_registry_client_id: str | None = Header(default=None),
-    ) -> JSONResponse:
-        source_ip = http_request.client.host if http_request.client else None
-        developer = None
-        try:
-            developer = _authenticate_developer(store, authorization, x_registry_client_id)
-            if x_agent_id != request.agent_id:
-                raise HTTPException(status_code=400, detail="AGENT_ID_MISMATCH")
-            _assert_fresh_timestamp(x_agent_timestamp)
-            nonce_key = f"{developer.developer_id}:{x_agent_nonce}"
-            proof_headers = request.new_key_proof_headers
-            if not proof_headers:
-                raise HTTPException(status_code=400, detail="NEW_KEY_PROOF_REQUIRED")
-            normalized_proof_headers = {key.lower(): value for key, value in proof_headers.items()}
-            _assert_fresh_timestamp(normalized_proof_headers.get("x-agent-timestamp"))
-            proof_nonce = normalized_proof_headers.get("x-agent-nonce")
-            if not proof_nonce:
-                raise HTTPException(status_code=400, detail="NEW_KEY_PROOF_MISSING_NONCE")
-            proof_nonce_key = f"{developer.developer_id}:add-key:{proof_nonce}"
-            if normalized_proof_headers.get("x-registry-client-id") != developer.client_id:
-                raise HTTPException(status_code=400, detail="NEW_KEY_PROOF_CLIENT_MISMATCH")
-
-            ownership = store.get_ownership(request.agent_id)
-            if ownership is None:
-                raise HTTPException(status_code=404, detail="AGENT_NOT_FOUND")
-            if ownership.owner_developer_id != developer.developer_id:
-                raise HTTPException(status_code=403, detail="OWNER_MISMATCH")
-            _assert_developer_namespace(store, developer.developer_id, request.agent_id)
-            _assert_agent_active(ownership)
-            entry = store.get_registry_entry(request.agent_id)
-            if entry is None:
-                raise HTTPException(status_code=500, detail="REGISTRY_ENTRY_MISSING")
-            metadata = AgentMetadata.model_validate_json(entry.metadata_json)
-            if (
-                request.new_key.kid in {key.kid for key in metadata.keys}
-                or request.new_key.kid in metadata.revoked_kids
-            ):
-                raise HTTPException(status_code=409, detail="KID_ALREADY_USED")
-            old_key = _select_key(metadata.keys, x_agent_kid)
-            verified = verify_registry_publish_signature(
-                path=http_request.url.path,
-                host=http_request.headers.get("host", ""),
-                body=await http_request.body(),
-                headers=dict(http_request.headers),
-                public_key=old_key,
-            )
-            if not verified:
-                raise HTTPException(status_code=401, detail="SIGNATURE_INVALID")
-            proof_valid = verify_registry_add_key_proof(
-                agent_id=request.agent_id,
-                new_key=request.new_key,
-                headers=proof_headers,
-                host=http_request.headers.get("host", ""),
-            )
-            if not proof_valid:
-                raise HTTPException(status_code=401, detail="NEW_KEY_PROOF_INVALID")
-
-            # 追加新 key，不修改已有 key 状态
-            updated_keys = [*metadata.keys, request.new_key.model_copy(update={"status": "active"})]
-            updated_metadata = metadata.model_copy(
-                update={
-                    "keys": updated_keys,
-                    "updated_at": datetime.now(UTC),
-                },
-            )
-            try:
-                committed = store.commit_agent_operation(
-                    metadata=updated_metadata,
-                    developer_id=developer.developer_id,
-                    current_kid=ownership.current_kid,
-                    public_key_fingerprint=ownership.public_key_fingerprint,
-                    created_at=ownership.created_at,
-                    expected_updated_at=ownership.updated_at,
-                    nonce_keys=[nonce_key, proof_nonce_key],
-                    nonce_expires_at=_registry_nonce_expiry(),
-                    action="add_key",
-                    source_ip=source_ip,
-                    create=False,
-                )
-            except AgentStateConflictError as exc:
-                raise HTTPException(status_code=409, detail="AGENT_STATE_CONFLICT") from exc
-            if not committed:
-                raise HTTPException(status_code=409, detail="NONCE_REPLAYED")
-            return JSONResponse({"ok": True, "agent_id": request.agent_id, "added_kid": request.new_key.kid})
-        except HTTPException as exc:
-            store.write_audit(
-                developer_id=getattr(developer, "developer_id", None),
-                agent_id=request.agent_id,
-                action="add_key",
-                result="rejected",
-                reason_code=str(exc.detail),
-                source_ip=source_ip,
-            )
-            raise
-
-    @app.post("/v1/agents/revoke-key")
-    @app.post("/registry/agents/revoke-key")
-    async def revoke_key(
-        request: RevokeKeyRequest,
-        http_request: Request,
-        authorization: str | None = Header(default=None),
-        x_agent_id: str | None = Header(default=None),
-        x_agent_kid: str | None = Header(default=None),
-        x_agent_timestamp: str | None = Header(default=None),
-        x_agent_nonce: str | None = Header(default=None),
-        x_agent_signature: str | None = Header(default=None),
-        x_registry_client_id: str | None = Header(default=None),
-    ) -> JSONResponse:
-        source_ip = http_request.client.host if http_request.client else None
-        developer = None
-        try:
-            developer = _authenticate_developer(store, authorization, x_registry_client_id)
-            if x_agent_id != request.agent_id:
-                raise HTTPException(status_code=400, detail="AGENT_ID_MISMATCH")
-            _assert_fresh_timestamp(x_agent_timestamp)
-            nonce_key = f"{developer.developer_id}:{x_agent_nonce}"
-
-            ownership = store.get_ownership(request.agent_id)
-            if ownership is None:
-                raise HTTPException(status_code=404, detail="AGENT_NOT_FOUND")
-            if ownership.owner_developer_id != developer.developer_id:
-                raise HTTPException(status_code=403, detail="OWNER_MISMATCH")
-            _assert_developer_namespace(store, developer.developer_id, request.agent_id)
-            _assert_agent_active(ownership)
-            if x_agent_kid != ownership.current_kid:
-                raise HTTPException(status_code=409, detail="OPERATION_REQUIRES_CURRENT_KEY")
-            entry = store.get_registry_entry(request.agent_id)
-            if entry is None:
-                raise HTTPException(status_code=500, detail="REGISTRY_ENTRY_MISSING")
-            metadata = AgentMetadata.model_validate_json(entry.metadata_json)
-            old_key = _select_key(metadata.keys, x_agent_kid)
-            verified = verify_registry_publish_signature(
-                path=http_request.url.path,
-                host=http_request.headers.get("host", ""),
-                body=await http_request.body(),
-                headers=dict(http_request.headers),
-                public_key=old_key,
-            )
-            if not verified:
-                raise HTTPException(status_code=401, detail="SIGNATURE_INVALID")
-
-            # 校验 kid_to_revoke 存在
-            target_key = None
-            active_count = 0
-            for key in metadata.keys:
-                if key.kid == request.kid_to_revoke:
-                    target_key = key
-                if key.status == "active":
-                    active_count += 1
-            if target_key is None:
-                raise HTTPException(status_code=400, detail="KEY_NOT_FOUND")
-            if request.kid_to_revoke == ownership.current_kid:
-                raise HTTPException(status_code=409, detail="CANNOT_REVOKE_CURRENT_KEY")
-            if target_key.status == "revoked" or request.kid_to_revoke in metadata.revoked_kids:
-                raise HTTPException(status_code=409, detail="KEY_ALREADY_REVOKED")
-            # 防锁死：不能撤销唯一的 active key
-            if target_key.status == "active" and active_count <= 1:
-                raise HTTPException(status_code=409, detail="CANNOT_REVOKE_LAST_ACTIVE_KEY")
-
-            # 加入 revoked_kids + 标记 status="revoked"
-            updated_revoked = [*metadata.revoked_kids, request.kid_to_revoke]
-            updated_keys = [
-                key.model_copy(update={"status": "revoked"}) if key.kid == request.kid_to_revoke else key
-                for key in metadata.keys
-            ]
-            updated_metadata = metadata.model_copy(
-                update={
-                    "keys": updated_keys,
-                    "revoked_kids": updated_revoked,
-                    "updated_at": datetime.now(UTC),
-                },
-            )
-            try:
-                committed = store.commit_agent_operation(
-                    metadata=updated_metadata,
-                    developer_id=developer.developer_id,
-                    current_kid=ownership.current_kid,
-                    public_key_fingerprint=ownership.public_key_fingerprint,
-                    created_at=ownership.created_at,
-                    expected_updated_at=ownership.updated_at,
-                    nonce_keys=[nonce_key],
-                    nonce_expires_at=_registry_nonce_expiry(),
-                    action="revoke_key",
-                    source_ip=source_ip,
-                    create=False,
-                )
-            except AgentStateConflictError as exc:
-                raise HTTPException(status_code=409, detail="AGENT_STATE_CONFLICT") from exc
-            if not committed:
-                raise HTTPException(status_code=409, detail="NONCE_REPLAYED")
-            return JSONResponse({"ok": True, "agent_id": request.agent_id, "revoked_kid": request.kid_to_revoke})
-        except HTTPException as exc:
-            store.write_audit(
-                developer_id=getattr(developer, "developer_id", None),
-                agent_id=request.agent_id,
-                action="revoke_key",
-                result="rejected",
-                reason_code=str(exc.detail),
-                source_ip=source_ip,
-            )
-            raise
-
-    @app.post("/v1/agents/revoke")
-    @app.post("/registry/agents/revoke")
-    async def revoke_agent(
-        request: RevokeAgentRequest,
-        http_request: Request,
-        authorization: str | None = Header(default=None),
-        x_agent_id: str | None = Header(default=None),
-        x_agent_kid: str | None = Header(default=None),
-        x_agent_timestamp: str | None = Header(default=None),
-        x_agent_nonce: str | None = Header(default=None),
-        x_agent_signature: str | None = Header(default=None),
-        x_registry_client_id: str | None = Header(default=None),
-    ) -> JSONResponse:
-        """撤销整个 Agent。撤销后 agent 从公开文档消失，所有操作被拒绝。"""
-        source_ip = http_request.client.host if http_request.client else None
-        developer = None
-        try:
-            developer = _authenticate_developer(store, authorization, x_registry_client_id)
-            if x_agent_id != request.agent_id:
-                raise HTTPException(status_code=400, detail="AGENT_ID_MISMATCH")
-            if not x_agent_kid:
-                raise HTTPException(status_code=400, detail="MISSING_AGENT_KID")
-            _assert_fresh_timestamp(x_agent_timestamp)
-            nonce_key = f"{developer.developer_id}:{x_agent_nonce}"
-
-            ownership = store.get_ownership(request.agent_id)
-            if ownership is None:
-                raise HTTPException(status_code=404, detail="AGENT_NOT_FOUND")
-            _assert_agent_active(ownership)
-            if ownership.owner_developer_id != developer.developer_id:
-                raise HTTPException(status_code=403, detail="OWNER_MISMATCH")
-            _assert_developer_namespace(store, developer.developer_id, request.agent_id)
-            if x_agent_kid != ownership.current_kid:
-                raise HTTPException(status_code=409, detail="OPERATION_REQUIRES_CURRENT_KEY")
-            entry = store.get_registry_entry(request.agent_id)
-            if entry is None:
-                raise HTTPException(status_code=500, detail="REGISTRY_ENTRY_MISSING")
-            metadata = AgentMetadata.model_validate_json(entry.metadata_json)
-            old_key = _select_key(metadata.keys, x_agent_kid)
-            verified = verify_registry_publish_signature(
-                path=http_request.url.path,
-                host=http_request.headers.get("host", ""),
-                body=await http_request.body(),
-                headers=dict(http_request.headers),
-                public_key=old_key,
-            )
-            if not verified:
-                raise HTTPException(status_code=401, detail="SIGNATURE_INVALID")
-
-            try:
-                committed = store.commit_revoke_agent(
-                    agent_id=request.agent_id,
-                    developer_id=developer.developer_id,
-                    nonce_key=nonce_key,
-                    nonce_expires_at=_registry_nonce_expiry(),
-                    source_ip=source_ip,
-                    expected_current_kid=ownership.current_kid,
-                    expected_updated_at=ownership.updated_at,
-                )
-            except AgentStateConflictError as exc:
-                raise HTTPException(status_code=409, detail="AGENT_STATE_CONFLICT") from exc
-            if not committed:
-                raise HTTPException(status_code=409, detail="NONCE_REPLAYED")
-            return JSONResponse({"ok": True, "agent_id": request.agent_id})
-        except HTTPException as exc:
-            store.write_audit(
-                developer_id=getattr(developer, "developer_id", None),
-                agent_id=request.agent_id,
-                action="revoke_agent",
-                result="rejected",
-                reason_code=str(exc.detail),
-                source_ip=source_ip,
-            )
-            raise
+            authentication_error = exc.code in {
+                "SIGNATURE_INVALID",
+                "TIMESTAMP_EXPIRED",
+                "SIGNER_MISMATCH",
+            }
+            status = 401 if authentication_error else 400
+            if exc.code in {"DEVELOPER_NOT_FOUND", "DEVELOPER_KEY_INVALID", "DEVELOPER_AUTH_MISSING"}:
+                status = 401
+            raise HTTPException(status_code=status, detail=exc.code) from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail="REQUEST_INVALID") from exc
 
     return app
 
 
-def _authenticate_developer(store: RegistryStore, authorization: str | None, client_id: str | None):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="MISSING_DEVELOPER_API_KEY")
-    if not client_id:
-        raise HTTPException(status_code=401, detail="MISSING_CLIENT_ID")
-    developer = store.get_developer_by_client_id(client_id)
+def _publish(store: RegistryStore, developer: Developer, envelope: SignedEnvelope) -> AgentRecord:
+    payload = _payload(envelope, {"agent_id", "endpoint", "capabilities", "kid", "public_key"})
+    agent_id = _text(payload, "agent_id")
+    endpoint = _text(payload, "endpoint")
+    kid = _text(payload, "kid")
+    public_key = _text(payload, "public_key")
+    capabilities = payload["capabilities"]
+    if not isinstance(capabilities, list) or not all(isinstance(value, str) for value in capabilities):
+        raise AgentAuthError("METADATA_INVALID", "capabilities must be a string list")
+    if envelope.sender != agent_id or envelope.kid != kid:
+        raise AgentAuthError("SIGNER_MISMATCH", "Publish signer does not match metadata")
+    parse_agent_id(agent_id, strict=strict_identities())
+    validate_endpoint(agent_id, endpoint, strict=strict_identities())
+    _validate_kid(agent_id, kid)
+    if not store.has_namespace(developer.id, agent_id):
+        raise StateConflictError("NAMESPACE_NOT_AUTHORIZED")
+    current = store.resolve(agent_id)
+    verification_record = current or AgentRecord(
+        agent_id,
+        endpoint,
+        tuple(capabilities),
+        kid,
+        public_key,
+        envelope.issued_at,
+    )
+    verify_envelope(
+        envelope,
+        record=verification_record,
+        audience=load_registry_url(),
+        nonce_state=None,
+        expected_type="registry.publish",
+        allowed_skew_seconds=allowed_skew(),
+    )
+    record = AgentRecord(agent_id, endpoint, tuple(capabilities), kid, public_key, envelope.issued_at)
+    return store.publish(record, developer.id, envelope.id, _expiry(envelope))
+
+
+def _rotate(store: RegistryStore, developer: Developer, envelope: SignedEnvelope) -> AgentRecord:
+    payload = _payload(envelope, {"agent_id", "new_kid", "new_public_key", "proof"})
+    agent_id = _text(payload, "agent_id")
+    new_kid = _text(payload, "new_kid")
+    new_public_key = _text(payload, "new_public_key")
+    if envelope.sender != agent_id:
+        raise AgentAuthError("SIGNER_MISMATCH", "Rotation sender does not match agent_id")
+    if not store.has_namespace(developer.id, agent_id):
+        raise StateConflictError("NAMESPACE_NOT_AUTHORIZED")
+    current = store.resolve(agent_id)
+    if current is None:
+        raise StateConflictError("AGENT_NOT_FOUND")
+    verify_envelope(
+        envelope,
+        record=current,
+        audience=load_registry_url(),
+        nonce_state=None,
+        expected_type="registry.rotate",
+        allowed_skew_seconds=allowed_skew(),
+    )
+    proof_raw = payload["proof"]
+    if not isinstance(proof_raw, dict):
+        raise AgentAuthError("ROTATION_PROOF_INVALID", "Rotation proof is missing")
+    proof = SignedEnvelope.from_dict(proof_raw)
+    proof_payload = _payload(proof, {"agent_id", "new_kid", "new_public_key"})
+    expected_payload = {"agent_id": agent_id, "new_kid": new_kid, "new_public_key": new_public_key}
+    if proof_payload != expected_payload or proof.reply_to != envelope.id:
+        raise AgentAuthError("ROTATION_PROOF_INVALID", "Rotation proof does not match mutation")
+    _validate_kid(agent_id, new_kid)
+    new_record = AgentRecord(agent_id, current.endpoint, current.capabilities, new_kid, new_public_key, proof.issued_at)
+    verify_envelope(
+        proof,
+        record=new_record,
+        audience=load_registry_url(),
+        nonce_state=None,
+        expected_type="registry.rotate.proof",
+        expected_reply_to=envelope.id,
+        allowed_skew_seconds=allowed_skew(),
+    )
+    return store.rotate(
+        agent_id=agent_id,
+        developer_id=developer.id,
+        current_kid=current.kid,
+        new_kid=new_kid,
+        new_public_key=new_public_key,
+        request_ids=(envelope.id, proof.id),
+        expires_at=_expiry(envelope),
+    )
+
+
+def _revoke(store: RegistryStore, developer: Developer, envelope: SignedEnvelope) -> None:
+    payload = _payload(envelope, {"agent_id"})
+    agent_id = _text(payload, "agent_id")
+    if envelope.sender != agent_id:
+        raise AgentAuthError("SIGNER_MISMATCH", "Revoke sender does not match agent_id")
+    if not store.has_namespace(developer.id, agent_id):
+        raise StateConflictError("NAMESPACE_NOT_AUTHORIZED")
+    current = store.resolve(agent_id)
+    if current is None:
+        raise StateConflictError("AGENT_NOT_FOUND")
+    verify_envelope(
+        envelope,
+        record=current,
+        audience=load_registry_url(),
+        nonce_state=None,
+        expected_type="registry.revoke",
+        allowed_skew_seconds=allowed_skew(),
+    )
+    store.revoke(
+        agent_id=agent_id,
+        developer_id=developer.id,
+        current_kid=current.kid,
+        request_id=envelope.id,
+        expires_at=_expiry(envelope),
+    )
+
+
+def _authenticate(store: RegistryStore, authorization: str | None, client_id: str | None) -> Developer:
+    if not authorization or not authorization.startswith("Bearer ") or not client_id:
+        raise AgentAuthError("DEVELOPER_AUTH_MISSING", "Developer credentials are required")
+    developer = store.get_developer(client_id)
     if developer is None or developer.status != "active":
-        raise HTTPException(status_code=401, detail="DEVELOPER_NOT_FOUND")
-    api_key = authorization.removeprefix("Bearer ").strip()
-    if not verify_api_key(api_key, developer.api_key_hash):
-        raise HTTPException(status_code=401, detail="INVALID_DEVELOPER_API_KEY")
-    if is_legacy_api_key_hash(developer.api_key_hash):
-        store.update_developer_api_key_hash(client_id=client_id, api_key_hash=hash_api_key(api_key))
+        raise AgentAuthError("DEVELOPER_NOT_FOUND", "Developer is not active")
+    if not verify_api_key(authorization.removeprefix("Bearer ").strip(), developer.api_key_hash):
+        raise AgentAuthError("DEVELOPER_KEY_INVALID", "Developer API key is invalid")
     return developer
 
 
-def _assert_agent_active(ownership: OwnershipRecord) -> None:
-    if ownership.status != "active":
-        raise HTTPException(status_code=410, detail="AGENT_REVOKED")
+def _payload(envelope: SignedEnvelope, fields: set[str]) -> dict[str, Any]:
+    import json
 
+    from agent_auth._protocol import b64url_decode
 
-def _validate_publish_headers(
-    *,
-    request: PublishRequest,
-    x_agent_id: str | None,
-    x_agent_kid: str | None,
-    x_agent_timestamp: str | None,
-    x_agent_nonce: str | None,
-    x_agent_signature: str | None,
-) -> None:
-    if request.publish_intent != "upsert_metadata":
-        raise HTTPException(status_code=400, detail="INVALID_PUBLISH_INTENT")
-    if x_agent_id != request.agent_id:
-        raise HTTPException(status_code=400, detail="AGENT_ID_MISMATCH")
-    if request.agent_id != request.metadata.agent_id:
-        raise HTTPException(status_code=400, detail="METADATA_AGENT_ID_MISMATCH")
-    if not x_agent_kid:
-        raise HTTPException(status_code=400, detail="MISSING_AGENT_KID")
-    if not x_agent_timestamp:
-        raise HTTPException(status_code=400, detail="MISSING_TIMESTAMP")
-    if not x_agent_nonce:
-        raise HTTPException(status_code=400, detail="MISSING_NONCE")
-    if not x_agent_signature:
-        raise HTTPException(status_code=400, detail="MISSING_SIGNATURE")
-
-
-def _assert_fresh_timestamp(value: str | None) -> None:
-    if not value:
-        raise HTTPException(status_code=400, detail="MISSING_TIMESTAMP")
     try:
-        parsed = parse_rfc3339_utc_seconds(value)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="INVALID_TIMESTAMP") from exc
-    skew = abs((datetime.now(UTC) - parsed).total_seconds())
-    if skew > load_registry_allowed_skew_seconds():
-        raise HTTPException(status_code=401, detail="TIMESTAMP_EXPIRED")
+        value = json.loads(b64url_decode(envelope.payload))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AgentAuthError("PAYLOAD_INVALID", "Mutation payload is invalid") from exc
+    if not isinstance(value, dict) or set(value) != fields:
+        raise AgentAuthError("PAYLOAD_INVALID", "Mutation payload fields are invalid")
+    return value
 
 
-def _validate_new_agent_identity(request: PublishRequest) -> None:
-    metadata = request.metadata
-    if load_registry_strict_identities():
-        try:
-            assert_strict_agent_id(request.agent_id)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="STRICT_AGENT_ID_REJECTED") from exc
-    expected_agent_id = build_agent_id(metadata.domain, metadata.name)
-    if request.agent_id != metadata.agent_id or metadata.agent_id != expected_agent_id:
-        raise HTTPException(status_code=400, detail="AGENT_ID_SUBJECT_MISMATCH")
-    active_keys = [key for key in metadata.keys if key.status == "active"]
-    if not active_keys:
-        raise HTTPException(status_code=400, detail="ACTIVE_KEY_REQUIRED")
-    if any(key.kid in metadata.revoked_kids for key in active_keys):
-        raise HTTPException(status_code=400, detail="ACTIVE_KEY_IS_REVOKED")
+def _text(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value:
+        raise AgentAuthError("PAYLOAD_INVALID", f"{key} must be a non-empty string")
+    return value
 
 
-def _assert_developer_namespace(store: RegistryStore, developer_id: str, agent_id: str) -> None:
-    try:
-        parsed = parse_agent_id(agent_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="INVALID_AGENT_ID") from exc
-    agent_path = "/" + "/".join(parsed.path_segments)
-    if not store.developer_has_namespace(
-        developer_id=developer_id,
-        domain=parsed.host,
-        agent_path=agent_path,
-    ):
-        raise HTTPException(status_code=403, detail="NAMESPACE_NOT_AUTHORIZED")
+def _validate_kid(agent_id: str, kid: str) -> None:
+    prefix = f"{agent_id}#key:v"
+    if not kid.startswith(prefix) or not kid.removeprefix(prefix).isdigit() or int(kid.removeprefix(prefix)) <= 0:
+        raise AgentAuthError("KID_INVALID", "kid must bind the Agent ID to a positive Vault key version")
 
 
-def _registry_nonce_expiry() -> datetime:
-    return datetime.now(UTC) + timedelta(seconds=load_registry_allowed_skew_seconds())
+def _expiry(envelope: SignedEnvelope) -> str:
+    value = parse_timestamp(envelope.issued_at) + timedelta(seconds=allowed_skew())
+    return value.isoformat().replace("+00:00", "Z")
 
 
-def _validate_immutable_fields(current: AgentMetadata, incoming: AgentMetadata) -> None:
-    if current.agent_id != incoming.agent_id:
-        raise HTTPException(status_code=409, detail="IMMUTABLE_AGENT_ID")
-    if current.domain != incoming.domain:
-        raise HTTPException(status_code=409, detail="IMMUTABLE_DOMAIN")
-    if current.name != incoming.name:
-        raise HTTPException(status_code=409, detail="IMMUTABLE_NAME")
+def _etag(value: object) -> str:
+    import json
 
-
-def _select_key(keys: list[AgentKey], kid: str | None) -> AgentKey:
-    for key in keys:
-        if key.kid == kid and key.status == "active":
-            return key
-    raise HTTPException(status_code=401, detail="ACTIVE_KEY_NOT_FOUND")
-
-
-def _keys_changed(current: list[AgentKey], incoming: list[AgentKey]) -> bool:
-    current_payload = [key.model_dump(mode="json") for key in current]
-    incoming_payload = [key.model_dump(mode="json") for key in incoming]
-    return current_payload != incoming_payload
-
-
-app = create_app()
+    digest = hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return f'"{digest}"'

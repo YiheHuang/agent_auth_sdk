@@ -1,58 +1,26 @@
 # Agent Auth Registry
 
-`verifiable-agent-auth-registry` 是 Agent Auth 的轻量中心 Registry：管理员给 developer 分配
-domain/path namespace，developer 发布 Agent 公钥，接收方按 agent_id 解析公钥。
-
-`1.0.0rc1` 正式支持单节点、单 worker SQLite。它不支持 HA，也不应直接暴露 Uvicorn 到公网。
-
-## 安装和运行
+`verifiable-agent-auth-registry` 是 Agent Auth 的单节点身份目录：管理员分配 namespace，Agent 用 Vault key 签名发布，调用方按 Agent ID 解析当前公钥。
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install "verifiable-agent-auth-registry==1.0.0rc1"
-
-export AGENT_REGISTRY_DB_PATH="$PWD/runtime/registry.sqlite3"
-agent-auth-registry --host 127.0.0.1 --port 8008 --workers 1
+pip install "verifiable-agent-auth-registry==1.0.0"
+export AGENT_REGISTRY_STRICT_IDENTITIES=0
+export AGENT_REGISTRY_URL=http://127.0.0.1:8008
+export AGENT_REGISTRY_DB_PATH=$PWD/registry.sqlite3
+agent-auth-registry
 ```
 
-生产环境必须放在 HTTPS Nginx 后，并使用专用非 root 用户。
-
-## 初始化
+另一个终端：
 
 ```bash
-agent-auth-registry-admin create-developer --client-id developer-a
-agent-auth-registry-admin grant-namespace \
-  --client-id developer-a \
-  --domain agents.example.com \
-  --path-prefix /team-a
-```
-
-API key 只显示一次。Admin CLI 必须读取与服务相同的 `AGENT_REGISTRY_DB_PATH`。
-
-## 检查和备份
-
-```bash
-agent-auth-registry-admin db check
-agent-auth-registry-admin db backup --output /secure-backup/registry.sqlite3
+export AGENT_REGISTRY_DB_PATH=$PWD/registry.sqlite3
+agent-auth-registry-admin developer add \
+  --client-id local --domain 127.0.0.1 --path-prefix /agents
 curl --fail http://127.0.0.1:8008/health/ready
 ```
 
-## HTTP API
+生产环境必须使用专用非 root 用户、单 worker、本地 SQLite、loopback Uvicorn 和 HTTPS 反向代理。Registry 只公开 live、ready、resolve、well-known 和统一 mutation 五个路由。
 
-- `GET /health/live`
-- `GET /health/ready`
-- `GET /.well-known/agent.json`
-- `GET /v1/agents/resolve?agent_id=...`
-- `POST /v1/agents/publish`
-- `POST /v1/agents/rotate-key`
-- `POST /v1/agents/add-key`
-- `POST /v1/agents/revoke-key`
-- `POST /v1/agents/revoke`
-
-签名写操作应通过 SDK `RegistryClient`，不要在应用中手工拼 canonical 请求。
-
-完整部署、Nginx、systemd、备份恢复和排障见
-[Registry 部署与运维](https://github.com/YiheHuang/agent_auth_sdk/blob/main/docs/REGISTRY_OPERATIONS.md)。
+完整配置、systemd/Nginx、developer/namespace 管理、备份和排障见 [Registry 部署与运维](https://github.com/YiheHuang/agent_auth_sdk/blob/main/docs/REGISTRY_OPERATIONS.md)。
 
 License: MIT

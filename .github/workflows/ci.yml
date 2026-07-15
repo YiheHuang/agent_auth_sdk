@@ -34,23 +34,23 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[all,dev]"
       - run: python -m pip install -e "packages/agent-auth-registry[dev]"
-      - run: python -m ruff check agent_auth_sdk packages/agent-auth-registry/src pytests examples
-      - run: python -m ruff format --check agent_auth_sdk packages/agent-auth-registry/src pytests examples
-      - run: python -m mypy agent_auth_sdk
+      - run: python -m ruff check agent_auth packages/agent-auth-registry/src pytests examples
+      - run: python -m ruff format --check agent_auth packages/agent-auth-registry/src pytests examples
+      - run: python -m mypy agent_auth packages/agent-auth-registry/src
       - run: bash -n deploy/deploy-registry.sh
       - name: Full project branch coverage
         run: >-
           python -m pytest
-          --cov=agent_auth_sdk
+          --cov=agent_auth
           --cov=packages/agent-auth-registry/src/agent_auth_registry
-          --cov-branch --cov-report=term-missing --cov-fail-under=80
+          --cov-branch --cov-report=term-missing --cov-fail-under=85
       - name: Security core branch coverage
         run: >-
           python -m pytest
-          --cov=agent_auth_sdk.messaging
-          --cov=agent_auth_sdk.verification
-          --cov=agent_auth_sdk.stores
-          --cov=agent_auth_sdk.registry_security
+          --cov=agent_auth._protocol
+          --cov=agent_auth._state
+          --cov=agent_auth_registry.app
+          --cov=agent_auth_registry.storage
           --cov-branch --cov-report=term-missing --cov-fail-under=95
       - run: python -m build --sdist --wheel
       - run: python -m build --sdist --wheel packages/agent-auth-registry
@@ -60,7 +60,7 @@ jobs:
           python -m pip install --ignore-installed --target /tmp/agent-auth-audit \
             dist/verifiable_agent_auth_sdk-*.whl \
             packages/agent-auth-registry/dist/verifiable_agent_auth_registry-*.whl \
-            "hvac>=2.4.0" "redis>=5.0.0" "openai-agents>=0.18.2,<0.19"
+            "openai-agents>=0.18.2,<0.19"
           python -m pip_audit --path /tmp/agent-auth-audit
       - name: Clean wheel install and CLI smoke test
         run: |
@@ -75,8 +75,8 @@ jobs:
           mkdir /tmp/agent-auth-smoke-project
           cd /tmp/agent-auth-smoke-project
           /tmp/agent-auth-wheel-smoke/bin/agent-auth init
-          /tmp/agent-auth-wheel-smoke/bin/agent-auth doctor
-          /tmp/agent-auth-wheel-smoke/bin/agent-auth-registry-admin db check --db-path registry.db
+          /tmp/agent-auth-wheel-smoke/bin/agent-auth check
+          /tmp/agent-auth-wheel-smoke/bin/agent-auth-registry-admin --db-path registry.db db check
 
   openai-agents-contract:
     runs-on: ubuntu-latest
@@ -92,10 +92,6 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install -e ".[dev,openai-fastapi]" "${{ matrix.openai_agents }}"
-      - run: >-
-          python -m pytest -q
-          pytests/test_openai_facade.py
-          pytests/test_openai_agents_contract.py
-          pytests/test_openai_agents_integration.py
-          pytests/test_examples_and_docs.py::test_openai_offline_example_executes
+      - run: python -m pip install -e ".[dev,server]" "${{ matrix.openai_agents }}"
+      - run: python -m pytest -q pytests/test_openai_contract.py pytests/test_auth.py
+      - run: python examples/openai_local.py

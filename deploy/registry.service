@@ -1,15 +1,16 @@
 [Unit]
-Description=Agent Auth SDK Registry Service
-After=network.target
+Description=Agent Auth Registry
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=agent-auth
 Group=agent-auth
-WorkingDirectory=/opt/agent_auth_sdk
+WorkingDirectory=/var/lib/agent-auth
 EnvironmentFile=/etc/agent-auth/registry.env
-ExecStart=/opt/agent_auth_sdk/.venv/bin/python -m agent_auth_registry.run
-Restart=always
+ExecStart=/opt/agent-auth/venv/bin/agent-auth-registry
+Restart=on-failure
 RestartSec=3
 UMask=0077
 NoNewPrivileges=true
@@ -26,7 +27,7 @@ RestrictNamespaces=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 LockPersonality=true
-ReadWritePaths=/opt/agent_auth_sdk/runtime
+ReadWritePaths=/var/lib/agent-auth
 
 [Install]
 WantedBy=multi-user.target

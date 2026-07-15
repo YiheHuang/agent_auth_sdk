@@ -5,7 +5,6 @@
 | Version | Security fixes |
 |---|---|
 | `1.0.x` | Yes |
-| `1.0.0rc1` | Until `1.0.0` is released |
 | `0.2.x` beta | Until 2026-10-31 |
 | Earlier snapshots | No |
 
@@ -21,8 +20,8 @@ public issue before coordinated disclosure.
 - Registry runs as a non-root, single-worker service behind HTTPS.
 - Every developer has an administrator-assigned, non-overlapping namespace.
 - Production signers use Vault Transit or an equivalent non-exportable signer and a fixed key version.
-- Verifiers use `registry_only` discovery and fail closed.
-- Multi-process receivers use an atomic shared nonce store such as Redis.
-- Reverse-proxied Agent endpoints configure their public base URL.
+- Verifiers only use the configured Registry and fail closed.
+- Production receivers use a persistent local SQLite nonce database on a local filesystem.
+- Each production process loads only the Vault tokens required by its own trust boundary.
 
 See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for trust boundaries and residual risks.

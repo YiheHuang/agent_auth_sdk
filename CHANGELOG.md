@@ -1,20 +1,21 @@
 # Changelog
 
-## 1.0.0rc1 - 2026-07-15
+## 1.0.0 - 2026-07-15
 
-首个正式版候选，保持 wire protocol v1 和 Registry schema 1：
+首个最小核心正式版；不兼容 beta API、wire contract 或数据库：
 
-- 单身份配置支持零参数 `OpenAIAgentAuth.from_env()`，同时保留 beta 多 role 配置兼容
-- 支持注入 HTTP client、nonce store 和 metadata cache；相对 Vault CA 路径按 TOML 目录解析
-- strict profile 要求固定 Vault key version；本地明文 Vault 只允许显式 loopback/test
-- 新增 `[remotes.<alias>]` 与 `auth.remote_tool()`，减少重复 agent_id/URL
-- 新增 `auth.router()`/`@router.endpoint()`，并支持直接 `app.include_router(router)`
-- 远程请求传播 request ID，稳定错误 envelope 映射为 `AgentAuthError`
-- Router/ASGI middleware 使用原始 path/query 和可配置 public base URL，拒绝重复签名 header
-- Registry 启动拒绝未知 schema，新增 `db check` 与 SQLite online `db backup`
-- 新增 live/ready health endpoint，旧写路由返回弃用 header
-- OpenAI Agents 正式兼容范围收口为 `>=0.18.2,<0.19`，Python 增加 3.14
-- 重写正式版 README、Quick Start、协议、安全、Registry 和 0.2→1.0 迁移文档
+- Python import 统一为 `agent_auth`；顶层只公开 `AgentAuth`、`AuthContext`、`AgentAuthError` 和版本号
+- OpenAI Agents 成为核心能力：`bind` + `run/run_sync/run_streamed` 自动覆盖 FunctionTool、Agent-as-tool 与 handoff
+- 本地与远程调用统一使用双向 SignedEnvelope v1；删除 HTTP header/message 双协议
+- 新增最小 `remote_tool`、FastAPI `endpoint`/`router`，保留原生 OpenAI tool schema 和 Runner 返回类型
+- 配置统一为一个 `agent-auth.toml`；production 固定 Vault Transit key version 并只使用 Registry 发现
+- Vault 改为 `httpx` 直连，基础 SDK 直接依赖缩减为 `cryptography` 与 `httpx`
+- SDK CLI 收敛为 `init/check/publish/rotate/revoke` 五个命令
+- metadata 缩减为身份、endpoint、capability、当前 kid/public key 和更新时间
+- Registry 收敛为五个公开路由，保留 namespace、ownership、nonce、key history、audit 和 SQLite 事务
+- Registry 管理 CLI 按 developer、namespace、agent、db 四组组织
+- OpenAI Agents 支持范围固定为 `>=0.18.2,<0.19`；Python 支持 3.11–3.14
+- 重写 README、Quick Start、API、OpenAI、协议、安全、Registry 运维和三组示例
 
 ## 0.2.0b1 - 2026-07-11
 

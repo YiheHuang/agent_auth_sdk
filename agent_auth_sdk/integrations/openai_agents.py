@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import ipaddress
 import json
 import os
 from collections.abc import Awaitable, Callable
@@ -16,6 +17,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -23,6 +25,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from ..agent import AgentInstance
 from ..config import MetadataResolverConfig, VerificationConfig, get_runtime_profile
+from ..identity import build_agent_id, parse_agent_id
 from ..messaging import verify_agent_message
 from ..models import (
     AgentRegistryDocument,
@@ -66,10 +69,21 @@ class LocalEs256Signer:
 
 
 @dataclass(slots=True, frozen=True)
+class RemoteAgentEndpoint:
+    """一个可通过别名调用的远程 Agent。"""
+
+    agent_id: str
+    url: str
+
+
+@dataclass(slots=True, frozen=True)
 class OpenAIAgentsAuthConfig:
-    roles: tuple[str, ...]
+    roles: tuple[str, ...] = ()
+    identity: str | None = None
     mode: str = "local"
     domain: str = "127.0.0.1:8700"
+    endpoint: str | None = None
+    public_base_url: str | None = None
     organization: str = "Agent Auth Application"
     environment: str = "local"
     runtime_dir: Path = Path(".agent-auth/runtime")
@@ -85,7 +99,41 @@ class OpenAIAgentsAuthConfig:
     vault_namespace: str | None = None
     vault_verify: bool | str = True
     vault_key_names: dict[str, str] = field(default_factory=dict)
-    auto_create_vault_keys: bool = True
+    vault_key_versions: dict[str, int] = field(default_factory=dict)
+    allow_insecure_local_vault: bool = False
+    auto_create_vault_keys: bool = False
+    remotes: dict[str, RemoteAgentEndpoint] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        roles = self.roles
+        if self.identity:
+            parsed = parse_agent_id(self.identity)
+            identity_role = "/".join(parsed.path_segments)
+            if self.domain == "127.0.0.1:8700":
+                object.__setattr__(self, "domain", parsed.host)
+            if not roles:
+                roles = (identity_role,)
+                object.__setattr__(self, "roles", roles)
+            if identity_role not in roles:
+                raise ValueError("identity must reference one of the configured roles")
+            if build_agent_id(self.domain, identity_role) != self.identity:
+                raise ValueError("identity must match the configured domain and role")
+        if not roles:
+            raise ValueError("agent-auth config must define identity or roles")
+        if self.endpoint and len(roles) != 1:
+            raise ValueError("endpoint can only be used with a single identity")
+        for name, value in (("endpoint", self.endpoint), ("public_base_url", self.public_base_url)):
+            if value:
+                _validate_service_url(name, value, strict=self.profile == "strict")
+        for alias, remote in self.remotes.items():
+            parse_agent_id(remote.agent_id)
+            _validate_service_url(f"remotes.{alias}.url", remote.url, strict=self.profile == "strict")
+        if self.allow_insecure_local_vault:
+            if self.profile != "test" or not self.vault_addr or not _is_loopback_url(self.vault_addr):
+                raise ValueError("allow_insecure_local_http requires test profile and a loopback Vault address")
+        for role, version in self.vault_key_versions.items():
+            if role not in roles or version <= 0:
+                raise ValueError("vault key versions must be positive and reference a configured role")
 
     @classmethod
     def from_file(cls, path: str | Path) -> OpenAIAgentsAuthConfig:
@@ -97,9 +145,19 @@ class OpenAIAgentsAuthConfig:
 
         raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
         base_dir = config_path.parent
+        identity = _optional_str(_expand(raw.get("identity")))
         roles = tuple(str(role).strip() for role in raw.get("roles", []) if str(role).strip())
+        configured_domain = _optional_str(_expand(raw.get("domain")))
+        if identity:
+            parsed_identity = parse_agent_id(identity)
+            identity_role = "/".join(parsed_identity.path_segments)
+            if not roles:
+                roles = (identity_role,)
+            domain = configured_domain or parsed_identity.host
+        else:
+            domain = configured_domain or "127.0.0.1:8700"
         if not roles:
-            raise ValueError("agent-auth config must define at least one role")
+            raise ValueError("agent-auth config must define identity or roles")
 
         runtime_dir = Path(_expand(raw.get("runtime_dir", "runtime")))
         if not runtime_dir.is_absolute():
@@ -109,16 +167,39 @@ class OpenAIAgentsAuthConfig:
         vault = raw.get("vault", {})
         capabilities = {str(k): str(v) for k, v in raw.get("capabilities", {}).items()}
         vault_key_names = {str(k): str(_expand(v)) for k, v in vault.get("key_names", {}).items()}
+        if vault.get("key") and len(roles) == 1:
+            vault_key_names.setdefault(roles[0], str(_expand(vault["key"])))
+        vault_key_versions = {str(k): int(_expand(v)) for k, v in vault.get("key_versions", {}).items()}
+        if vault.get("key_version") is not None and len(roles) == 1:
+            vault_key_versions.setdefault(roles[0], int(_expand(vault["key_version"])))
         vault_token_file = _optional_str(_expand(vault.get("token_file")))
         if vault_token_file is not None:
             token_path = Path(vault_token_file)
             if not token_path.is_absolute():
                 token_path = base_dir / token_path
             vault_token_file = str(token_path)
+        vault_verify = _parse_vault_verify(_expand(vault.get("verify", True)))
+        if isinstance(vault_verify, str):
+            verify_path = Path(vault_verify)
+            if not verify_path.is_absolute():
+                vault_verify = str(base_dir / verify_path)
+        remotes: dict[str, RemoteAgentEndpoint] = {}
+        for alias, remote in raw.get("remotes", {}).items():
+            if not isinstance(remote, dict):
+                raise ValueError(f"remotes.{alias} must be a table")
+            agent_id = _optional_str(_expand(remote.get("agent_id")))
+            url = _optional_str(_expand(remote.get("url")))
+            if not agent_id or not url:
+                raise ValueError(f"remotes.{alias} requires agent_id and url")
+            parse_agent_id(agent_id)
+            remotes[str(alias)] = RemoteAgentEndpoint(agent_id=agent_id, url=url)
         return cls(
             roles=roles,
+            identity=identity,
             mode=os.getenv("AGENT_AUTH_MODE", str(_expand(raw.get("mode", "local")))).lower(),
-            domain=str(_expand(raw.get("domain", "127.0.0.1:8700"))),
+            domain=domain,
+            endpoint=_optional_str(_expand(raw.get("endpoint"))),
+            public_base_url=_optional_str(_expand(raw.get("public_base_url"))),
             organization=str(_expand(raw.get("organization", "Agent Auth Application"))),
             environment=str(_expand(raw.get("environment", "local"))),
             runtime_dir=runtime_dir,
@@ -132,9 +213,12 @@ class OpenAIAgentsAuthConfig:
             vault_token_file=vault_token_file,
             vault_transit_mount=str(_expand(vault.get("transit_mount", "transit"))),
             vault_namespace=_optional_str(_expand(vault.get("namespace"))),
-            vault_verify=_parse_vault_verify(_expand(vault.get("verify", True))),
+            vault_verify=vault_verify,
             vault_key_names=vault_key_names,
+            vault_key_versions=vault_key_versions,
+            allow_insecure_local_vault=bool(vault.get("allow_insecure_local_http", False)),
             auto_create_vault_keys=bool(vault.get("auto_create_keys", True)),
+            remotes=remotes,
         )
 
     def capability_for(self, role: str) -> str:
@@ -142,6 +226,20 @@ class OpenAIAgentsAuthConfig:
 
     def registry_document_url(self) -> str:
         return self.registry_url or f"http://{self.domain}/.well-known/agent.json"
+
+    def default_role(self) -> str:
+        if len(self.roles) != 1:
+            raise ValueError("identity is required when config declares multiple roles")
+        return self.roles[0]
+
+    def agent_id_for(self, role: str) -> str:
+        return build_agent_id(self.domain, role)
+
+    def endpoint_for(self, role: str) -> str:
+        if self.endpoint and role == self.default_role():
+            return self.endpoint
+        scheme = "http" if self.profile == "test" else "https"
+        return f"{scheme}://{self.domain}/agents/{role}"
 
 
 @dataclass(slots=True)
@@ -153,11 +251,11 @@ class OpenAIAgentsAuthRuntime:
     @classmethod
     async def create(cls, config: OpenAIAgentsAuthConfig) -> OpenAIAgentsAuthRuntime:
         runtime = cls(config=config)
-        config.runtime_dir.mkdir(parents=True, exist_ok=True)
         if config.mode == "local":
             runtime._create_local_agents()
             return runtime
         if config.mode == "vault":
+            config.runtime_dir.mkdir(parents=True, exist_ok=True)
             await runtime._create_vault_agents_and_publish()
             return runtime
         raise ValueError("mode must be 'local' or 'vault'")
@@ -235,14 +333,13 @@ class OpenAIAgentsAuthRuntime:
                 domain=self.config.domain,
                 name=role,
                 organization=self.config.organization,
-                endpoint=f"http://{self.config.domain}/agents/{role}",
+                endpoint=self.config.endpoint_for(role),
                 signer=signer,
                 public_key_pem=signer.public_key_pem(),
                 kid=f"local:{role}",
                 capabilities=["sign", "verify", self.config.capability_for(role)],
                 environment=self.config.environment,
             )
-            agent.export_metadata(self.config.runtime_dir / "metadata" / role)
             self.agents[role] = agent
             self.nonce_stores[role] = InMemoryNonceStore()
 
@@ -269,13 +366,15 @@ class OpenAIAgentsAuthRuntime:
                     domain=self.config.domain,
                     name=role,
                     organization=self.config.organization,
-                    endpoint=f"https://{self.config.domain}/agents/{role}",
+                    endpoint=self.config.endpoint_for(role),
                     vault_addr=self.config.vault_addr or "",
                     vault_token_file=self.config.vault_token_file,
                     transit_mount=self.config.vault_transit_mount,
                     key_name=key_name,
                     namespace=self.config.vault_namespace,
                     verify=self.config.vault_verify,
+                    allow_insecure_raw_token=self.config.allow_insecure_local_vault,
+                    key_version=self.config.vault_key_versions.get(role),
                     capabilities=["sign", "verify", self.config.capability_for(role)],
                     environment=self.config.environment,
                     auto_create_key=self.config.auto_create_vault_keys,
@@ -572,3 +671,25 @@ def _parse_vault_verify(value: Any) -> bool | str:
     if text.lower() in {"1", "true", "yes", "on"}:
         return True
     return text
+
+
+def _validate_service_url(name: str, value: str, *, strict: bool) -> None:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{name} must be an absolute HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None or parsed.fragment:
+        raise ValueError(f"{name} must not contain userinfo or fragment")
+    if strict and parsed.scheme != "https":
+        raise ValueError(f"{name} must use HTTPS in strict profile")
+
+
+def _is_loopback_url(value: str) -> bool:
+    hostname = urlsplit(value).hostname
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False

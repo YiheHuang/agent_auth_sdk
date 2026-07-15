@@ -178,7 +178,7 @@ agent-auth doctor --config .agent-auth/agent-auth.toml
 `agent_auth_adapter.py`；不会覆盖现有 adapter 或修改现有业务源码。`doctor` 是只读检查，不创建
 key、不发布 Agent。
 
-`0.2.0b1` 还提供职责分离命令：
+`1.0.0rc1` 提供职责分离命令：
 
 ```bash
 # 只读扫描已有 OpenAI Agents 项目

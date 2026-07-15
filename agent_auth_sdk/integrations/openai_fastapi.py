@@ -16,9 +16,11 @@ from agent_auth_sdk.errors import (
     AgentAuthorizationError,
     AgentConfigurationError,
     AgentDiscoveryError,
+    AgentReplayError,
     AgentTransportError,
 )
 from agent_auth_sdk.models import VerificationFailure
+from agent_auth_sdk.remote import _validate_public_base_url, duplicate_signed_header, request_url_from_scope
 
 from .openai_agents import _to_payload
 from .openai_facade import OpenAIAgentAuth, _raise_verification
@@ -33,11 +35,24 @@ except ImportError:  # pragma: no cover - optional dependency gate
 class AgentAuthRouter:
     """验签请求、注入 context、执行 handler 并签名响应的 FastAPI router。"""
 
-    def __init__(self, auth: OpenAIAgentAuth, *, prefix: str = "", tags: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        auth: OpenAIAgentAuth,
+        *,
+        prefix: str = "",
+        tags: list[str] | None = None,
+        public_base_url: str | None = None,
+    ) -> None:
         if APIRouter is None:
             raise AgentConfigurationError("Install verifiable-agent-auth-sdk[openai-fastapi]")
         self.auth = auth
         self.router = APIRouter(prefix=prefix, tags=cast(Any, tags))
+        self.public_base_url = _validate_public_base_url(public_base_url)
+
+    def __getattr__(self, name: str) -> Any:
+        """让 FastAPI ``include_router(auth.router())`` 可直接工作。"""
+
+        return getattr(self.router, name)
 
     def agent_endpoint(
         self,
@@ -55,10 +70,23 @@ class AgentAuthRouter:
                 request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
                 try:
                     body = await request.body()
+                    duplicate = duplicate_signed_header(request.scope.get("headers", []))
+                    if duplicate:
+                        return _error_response(
+                            400,
+                            "DUPLICATE_SIGNED_HEADER",
+                            f"Duplicate signed header: {duplicate}",
+                            request_id,
+                        )
+                    headers = {key.lower(): value for key, value in request.headers.items()}
                     verification = await self.auth.verifier.verify_http(
                         method=request.method,
-                        url=str(request.url),
-                        headers={key.lower(): value for key, value in request.headers.items()},
+                        url=request_url_from_scope(
+                            request.scope,
+                            headers=headers,
+                            public_base_url=self.public_base_url,
+                        ),
+                        headers=headers,
                         body=body,
                         request_id=request_id,
                     )
@@ -105,12 +133,14 @@ class AgentAuthRouter:
                     )
                 except AgentAuthorizationError as exc:
                     return _agent_error_response(403, exc, request_id)
+                except AgentReplayError as exc:
+                    return _agent_error_response(409, exc, request_id)
                 except (AgentDiscoveryError, AgentTransportError) as exc:
-                    return _agent_error_response(502, exc, request_id)
+                    return _agent_error_response(503, exc, request_id)
                 except AgentAuthenticationError as exc:
                     return _agent_error_response(401, exc, request_id)
                 except AgentAuthError as exc:
-                    return _agent_error_response(502, exc, request_id)
+                    return _agent_error_response(500, exc, request_id)
 
             endpoint.__name__ = handler.__name__
             endpoint.__doc__ = handler.__doc__
@@ -118,6 +148,8 @@ class AgentAuthRouter:
             return handler
 
         return decorator
+
+    endpoint = agent_endpoint
 
 
 async def authenticated_agent(request: Request) -> AuthenticatedAgentContext:  # type: ignore[valid-type]
@@ -137,7 +169,7 @@ def _agent_error_response(status: int, error: AgentAuthError, request_id: str) -
 
 def _error_response(status: int, code: str, message: str, request_id: str) -> JSONResponse:
     return JSONResponse(  # type: ignore[operator]
-        {"code": code, "message": message, "request_id": request_id},
+        {"error": {"code": code, "message": message, "request_id": request_id}},
         status_code=status,
         headers={"x-request-id": request_id},
     )

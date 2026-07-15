@@ -9,7 +9,10 @@ import httpx
 from agent_auth_sdk import TEST_PROFILE, AgentVerifier, MetadataResolverConfig, VerificationConfig
 from agent_auth_sdk.http_utils import canonical_json_bytes
 
-from ._shared import local_agent, registry_transport
+try:
+    from ._shared import local_agent, registry_transport
+except ImportError:  # 允许 python examples/local_http_signing.py
+    from _shared import local_agent, registry_transport
 
 
 async def main() -> None:

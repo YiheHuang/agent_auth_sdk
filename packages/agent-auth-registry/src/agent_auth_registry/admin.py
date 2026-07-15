@@ -18,6 +18,33 @@ from .app import load_registry_db_path, load_registry_public_path
 from .storage import RegistryStore
 
 app = typer.Typer(help="Agent Auth Registry admin CLI")
+db_app = typer.Typer(help="检查和备份 Registry SQLite 数据库")
+app.add_typer(db_app, name="db")
+
+
+@db_app.command("check")
+def check_database(
+    db_path: Annotated[Path | None, typer.Option(help="registry sqlite 路径")] = None,
+) -> None:
+    """检查 schema 版本和 SQLite 完整性。"""
+
+    store = RegistryStore(db_path or load_registry_db_path())
+    status = store.schema_status()
+    typer.echo(json.dumps(status, ensure_ascii=False, indent=2))
+    if not status["ok"]:
+        raise typer.Exit(code=1)
+
+
+@db_app.command("backup")
+def backup_database(
+    output: Annotated[Path, typer.Option("--output", "-o", help="备份文件路径")],
+    db_path: Annotated[Path | None, typer.Option(help="registry sqlite 路径")] = None,
+) -> None:
+    """在线创建一致的 SQLite 备份。"""
+
+    store = RegistryStore(db_path or load_registry_db_path())
+    target = store.backup(output)
+    typer.echo(json.dumps({"ok": True, "backup": str(target)}, ensure_ascii=False, indent=2))
 
 
 @app.command("create-developer")

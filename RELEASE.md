@@ -16,7 +16,7 @@
 - [ ] 检查 `README.md`、`QUICKSTART.md`、`docs/SDK_GUIDE.md` 和 examples 是否仍与实际行为一致。
 - [ ] 检查异常类型、稳定 `VerificationFailure.code` 和错误文本是否发生变化。
 - [ ] 检查 async client、Vault client、cache、nonce store 的生命周期是否正确关闭。
-- [ ] 检查 Windows/Linux 和 Python 3.11–3.13 差异。
+- [ ] 检查 Windows/Linux 和 Python 3.11–3.14 差异。
 - [ ] 执行 Ruff、格式、Mypy 和完整 pytest。
 
 ## 3. 公开 API 修改
@@ -162,12 +162,12 @@ python -m twine check --strict dist/* packages/agent-auth-registry/dist/*
 
 ## 12. 发布前质量门槛
 
-- [ ] Python 3.11、3.12、3.13，Linux/Windows CI 全绿。
+- [ ] Python 3.11、3.12、3.13、3.14，Linux/Windows CI 全绿。
 - [ ] `python -m ruff check agent_auth_sdk packages/agent-auth-registry/src pytests examples`。
 - [ ] `python -m ruff format --check agent_auth_sdk packages/agent-auth-registry/src pytests examples`。
 - [ ] `python -m mypy agent_auth_sdk`。
-- [ ] 完整测试通过，总分支覆盖率不低于 70%。
-- [ ] messaging、verification、stores、registry_security 安全核心分支覆盖率不低于 90%。
+- [ ] 完整测试通过，总分支覆盖率不低于 80%。
+- [ ] messaging、verification、stores、registry_security 安全核心分支覆盖率不低于 95%。
 - [ ] OpenAI Agents 最低和最新受支持版本 contract test 通过。
 - [ ] 本地消息、HTTP 和 OpenAI 离线 examples 在干净 wheel 环境执行成功。
 - [ ] 三个 CLI 的 `--help` 和关键 admin 命令 smoke test 通过。

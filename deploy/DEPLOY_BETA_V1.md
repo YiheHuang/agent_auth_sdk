@@ -5,7 +5,7 @@ Registry v1 仅支持单节点、单 worker SQLite，并且只应监听 loopback
 ## 安装
 
 ```bash
-export AGENT_AUTH_VERSION=0.2.0b1
+export AGENT_AUTH_VERSION=1.0.0rc1
 export AGENT_AUTH_INSTALL_MODE=pypi
 export AGENT_REGISTRY_SERVER_NAME=registry.example.com
 export AGENT_REGISTRY_TLS_CERT=/etc/letsencrypt/live/registry.example.com/fullchain.pem

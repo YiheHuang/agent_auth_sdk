@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.0rc1 - 2026-07-15
+
+首个正式版候选，保持 wire protocol v1 和 Registry schema 1：
+
+- 单身份配置支持零参数 `OpenAIAgentAuth.from_env()`，同时保留 beta 多 role 配置兼容
+- 支持注入 HTTP client、nonce store 和 metadata cache；相对 Vault CA 路径按 TOML 目录解析
+- strict profile 要求固定 Vault key version；本地明文 Vault 只允许显式 loopback/test
+- 新增 `[remotes.<alias>]` 与 `auth.remote_tool()`，减少重复 agent_id/URL
+- 新增 `auth.router()`/`@router.endpoint()`，并支持直接 `app.include_router(router)`
+- 远程请求传播 request ID，稳定错误 envelope 映射为 `AgentAuthError`
+- Router/ASGI middleware 使用原始 path/query 和可配置 public base URL，拒绝重复签名 header
+- Registry 启动拒绝未知 schema，新增 `db check` 与 SQLite online `db backup`
+- 新增 live/ready health endpoint，旧写路由返回弃用 header
+- OpenAI Agents 正式兼容范围收口为 `>=0.18.2,<0.19`，Python 增加 3.14
+- 重写正式版 README、Quick Start、协议、安全、Registry 和 0.2→1.0 迁移文档
+
 ## 0.2.0b1 - 2026-07-11
 
 OpenAI Agents 开发体验版本：
@@ -42,7 +58,7 @@ OpenAI Agents 开发体验版本：
 - 拆分 `verifiable-agent-auth-sdk` 与 `verifiable-agent-auth-registry` 两个发行包
 - Registry HTTPS、非 root systemd、单 worker 和速率限制部署基线
 
-## 1.0.0b1 - 2026-06-12（未公开发布的内部 beta）
+## 1.0.0b1 - 2026-06-12（未公开发布的内部历史编号，不属于当前 SemVer 发布线）
 
 首次 beta 版本，包含以下主要功能：
 

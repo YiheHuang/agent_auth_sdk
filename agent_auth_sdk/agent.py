@@ -70,6 +70,7 @@ class AgentInstance:
         capabilities: list[str] | None = None,
         environment: str | None = None,
         kid: str | None = None,
+        key_version: int | None = None,
         auto_create_key: bool = False,
     ) -> AgentInstance:
         config = VaultKmsConfig(
@@ -82,13 +83,15 @@ class AgentInstance:
             namespace=namespace,
             verify=verify,
             kid=kid,
+            key_version=key_version,
         )
         client = _build_vault_client(config)
         if auto_create_key:
             _ensure_transit_key(config, client=client)
         description = VaultTransitPublicKeyResolver(config, client=client).describe()
-        resolved_kid = kid or f"vault:{transit_mount}/{key_name}:v{description.latest_version}"
-        pinned_config = replace(config, kid=resolved_kid, key_version=description.latest_version)
+        resolved_version = description.latest_version
+        resolved_kid = kid or f"vault:{transit_mount}/{key_name}:v{resolved_version}"
+        pinned_config = replace(config, kid=resolved_kid, key_version=resolved_version)
         signer = VaultTransitSigner(pinned_config, client=client)
         signer.validate_access()
         return cls.from_signer(

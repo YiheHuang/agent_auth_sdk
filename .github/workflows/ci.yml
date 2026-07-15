@@ -10,7 +10,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python: ["3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[all,dev]"
@@ -43,7 +43,7 @@ jobs:
           python -m pytest
           --cov=agent_auth_sdk
           --cov=packages/agent-auth-registry/src/agent_auth_registry
-          --cov-branch --cov-report=term-missing --cov-fail-under=70
+          --cov-branch --cov-report=term-missing --cov-fail-under=80
       - name: Security core branch coverage
         run: >-
           python -m pytest
@@ -51,23 +51,45 @@ jobs:
           --cov=agent_auth_sdk.verification
           --cov=agent_auth_sdk.stores
           --cov=agent_auth_sdk.registry_security
-          --cov-branch --cov-report=term-missing --cov-fail-under=90
-      - run: python -m pip_audit --skip-editable
+          --cov-branch --cov-report=term-missing --cov-fail-under=95
       - run: python -m build --sdist --wheel
       - run: python -m build --sdist --wheel packages/agent-auth-registry
       - run: python -m twine check --strict dist/* packages/agent-auth-registry/dist/*
+      - name: Audit isolated runtime dependency tree
+        run: |
+          python -m pip install --ignore-installed --target /tmp/agent-auth-audit \
+            dist/verifiable_agent_auth_sdk-*.whl \
+            packages/agent-auth-registry/dist/verifiable_agent_auth_registry-*.whl \
+            "hvac>=2.4.0" "redis>=5.0.0" "openai-agents>=0.18.2,<0.19"
+          python -m pip_audit --path /tmp/agent-auth-audit
+      - name: Clean wheel install and CLI smoke test
+        run: |
+          python -m venv /tmp/agent-auth-wheel-smoke
+          /tmp/agent-auth-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/agent-auth-wheel-smoke/bin/python -m pip install dist/*.whl
+          /tmp/agent-auth-wheel-smoke/bin/python -m pip install packages/agent-auth-registry/dist/*.whl
+          /tmp/agent-auth-wheel-smoke/bin/python -m pip check
+          /tmp/agent-auth-wheel-smoke/bin/agent-auth --help
+          /tmp/agent-auth-wheel-smoke/bin/agent-auth-registry --help
+          /tmp/agent-auth-wheel-smoke/bin/agent-auth-registry-admin --help
+          mkdir /tmp/agent-auth-smoke-project
+          cd /tmp/agent-auth-smoke-project
+          /tmp/agent-auth-wheel-smoke/bin/agent-auth init
+          /tmp/agent-auth-wheel-smoke/bin/agent-auth doctor
+          /tmp/agent-auth-wheel-smoke/bin/agent-auth-registry-admin db check --db-path registry.db
 
   openai-agents-contract:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        openai_agents: ["openai-agents==0.2.0", "openai-agents==0.18.2"]
+        python: ["3.11", "3.14"]
+        openai_agents: ["openai-agents==0.18.2", "openai-agents>=0.18.2,<0.19"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python }}
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev,openai-fastapi]" "${{ matrix.openai_agents }}"

@@ -9,6 +9,8 @@ from pathlib import Path
 
 import agent_auth_sdk
 import agent_auth_sdk.integrations as integrations
+import agent_auth_sdk.openai
+import agent_auth_sdk.vault
 
 ROOT = Path(__file__).parents[1]
 

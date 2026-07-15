@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
+from agent_auth_registry.admin import app as registry_admin_app
 from agent_auth_registry.app import create_app as create_registry_app
-from agent_auth_registry.storage import AgentStateConflictError, RegistryStore
+from agent_auth_registry.storage import (
+    AgentStateConflictError,
+    RegistryStore,
+    UnsupportedSchemaVersionError,
+)
+from typer.testing import CliRunner
 
 from agent_auth_sdk import (
     AgentAuthASGIMiddleware,
@@ -489,3 +496,145 @@ async def test_remote_http_boundary_verifies_request_and_signed_response() -> No
         await receiver_metadata_client.aclose()
 
     assert result == {"echo": {"task": "ping"}}
+
+
+def test_registry_schema_check_backup_and_future_version_rejection(tmp_path) -> None:
+    db_path = tmp_path / "registry.sqlite3"
+    store = RegistryStore(db_path)
+    assert store.schema_status() == {
+        "ok": True,
+        "schema_version": 1,
+        "expected_schema_version": 1,
+        "integrity": "ok",
+    }
+    backup_path = tmp_path / "backup" / "registry.sqlite3"
+    assert store.backup(backup_path) == backup_path
+    assert RegistryStore(backup_path).schema_status()["ok"] is True
+
+    runner = CliRunner()
+    checked = runner.invoke(registry_admin_app, ["db", "check", "--db-path", str(db_path)])
+    assert checked.exit_code == 0
+    assert '"schema_version": 1' in checked.stdout
+
+    future_path = tmp_path / "future.sqlite3"
+    conn = sqlite3.connect(future_path)
+    try:
+        conn.execute("CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+        conn.execute("INSERT INTO schema_version(version, applied_at) VALUES (99, CURRENT_TIMESTAMP)")
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(UnsupportedSchemaVersionError, match="version 99"):
+        RegistryStore(future_path)
+
+
+def test_registry_admin_core_commands(tmp_path) -> None:
+    db_path = tmp_path / "admin.sqlite3"
+    runner = CliRunner()
+    created = runner.invoke(
+        registry_admin_app,
+        ["create-developer", "--client-id", "team-a", "--db-path", str(db_path)],
+    )
+    assert created.exit_code == 0, created.output
+    developer = json.loads(created.stdout)
+    assert developer["client_id"] == "team-a"
+    assert developer["api_key"]
+
+    granted = runner.invoke(
+        registry_admin_app,
+        [
+            "grant-namespace",
+            "--client-id",
+            "team-a",
+            "--domain",
+            "agents.example.com",
+            "--path-prefix",
+            "/team-a",
+            "--db-path",
+            str(db_path),
+        ],
+    )
+    assert granted.exit_code == 0, granted.output
+    namespace = json.loads(granted.stdout)
+
+    listed = runner.invoke(
+        registry_admin_app,
+        ["list-namespaces", "--client-id", "team-a", "--db-path", str(db_path)],
+    )
+    assert listed.exit_code == 0
+    assert json.loads(listed.stdout)[0]["path_prefix"] == "/team-a"
+
+    rotated = runner.invoke(
+        registry_admin_app,
+        ["rotate-api-key", "--client-id", "team-a", "--db-path", str(db_path)],
+    )
+    assert rotated.exit_code == 0
+    assert json.loads(rotated.stdout)["api_key"] != developer["api_key"]
+
+    inspected = runner.invoke(
+        registry_admin_app,
+        ["inspect-agent", "--agent-id", "agent://agents.example.com/team-a/missing", "--db-path", str(db_path)],
+    )
+    assert inspected.exit_code == 0
+    assert json.loads(inspected.stdout) == {"ownership": None, "entry": None}
+
+    revoked_namespace = runner.invoke(
+        registry_admin_app,
+        ["revoke-namespace", "--namespace-id", namespace["namespace_id"], "--db-path", str(db_path)],
+    )
+    assert revoked_namespace.exit_code == 0
+    revoked_developer = runner.invoke(
+        registry_admin_app,
+        ["revoke-developer", "--client-id", "team-a", "--db-path", str(db_path)],
+    )
+    assert revoked_developer.exit_code == 0
+
+    backup_path = tmp_path / "admin-backup.sqlite3"
+    backed_up = runner.invoke(
+        registry_admin_app,
+        ["db", "backup", "--output", str(backup_path), "--db-path", str(db_path)],
+    )
+    assert backed_up.exit_code == 0, backed_up.output
+    assert backup_path.is_file()
+
+
+def test_registry_run_enforces_single_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    from agent_auth_registry import run
+
+    called: dict[str, object] = {}
+
+    def fake_run(*args: object, **kwargs: object) -> None:
+        called.update(kwargs)
+
+    monkeypatch.setattr(run.uvicorn, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["agent-auth-registry", "--port", "8123"])
+    run.main()
+    assert called["port"] == 8123
+    assert called["workers"] == 1
+
+    monkeypatch.setattr(sys, "argv", ["agent-auth-registry", "--workers", "2"])
+    with pytest.raises(RuntimeError, match="exactly one worker"):
+        run.main()
+
+
+@pytest.mark.anyio
+async def test_registry_health_and_legacy_deprecation_headers(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENT_REGISTRY_DB_PATH", str(tmp_path / "registry.sqlite3"))
+    monkeypatch.setenv("AGENT_REGISTRY_PATH", str(tmp_path / "agent.json"))
+    monkeypatch.setenv("AGENT_REGISTRY_STRICT_IDENTITIES", "0")
+    app = create_registry_app()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://registry.local") as client:
+        assert (await client.get("/health/live")).json() == {"status": "ok"}
+        assert (await client.get("/health/ready")).status_code == 200
+        assert (await client.get("/healthz")).status_code == 200
+        assert (await client.get("/.well-known/agent.json")).status_code == 200
+        legacy = await client.post("/registry/agents/publish", json={})
+    assert legacy.status_code == 422
+    assert legacy.headers["deprecation"] == "true"
+    assert legacy.headers["sunset"]
+    assert "/v1/agents/publish" in legacy.headers["link"]

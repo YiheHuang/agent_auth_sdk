@@ -8,7 +8,10 @@ import httpx
 
 from agent_auth_sdk import TEST_PROFILE, AgentVerifier, MetadataResolverConfig, VerificationConfig
 
-from ._shared import local_agent, registry_transport
+try:
+    from ._shared import local_agent, registry_transport
+except ImportError:  # 允许 python examples/local_signed_message.py
+    from _shared import local_agent, registry_transport
 
 
 async def main() -> None:

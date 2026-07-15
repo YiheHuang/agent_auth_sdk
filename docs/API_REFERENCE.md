@@ -1,6 +1,7 @@
 # 公开 API Reference
 
-本文记录 `0.2.0b1` 承诺支持的公开接口。优先从 `agent_auth_sdk` 顶层导入；OpenAI 适配从 `agent_auth_sdk.integrations` 导入。
+本文记录 `1.0.0rc1` 的公开接口。核心类型从 `agent_auth_sdk` 导入；新项目从
+`agent_auth_sdk.openai` 导入 OpenAI Agents 高层入口。beta 顶层 re-export 暂时保留兼容。
 
 未列出的 `registry_security`、`http_utils` canonical helper、`publish` 底层请求函数和以下划线开头的符号属于内部实现。协议实现者应依据 [协议 v1](PROTOCOL_V1.md)，而不是复制内部函数。
 
@@ -87,13 +88,19 @@ class AuthorizationPolicy(Protocol):
 RemoteAgentClient(*, sender: AgentInstance, verifier: AgentVerifier, http_client=None)
 ```
 
-`await call(target_url, target_agent_id, payload, message_type="agent.call.result")` 对 canonical JSON bytes 签名、POST，并要求响应是由 `target_agent_id` 签发且 recipient 为 sender 的 `SignedAgentMessage`。认证失败抛 `PermissionError`。
+`await call(target_url, target_agent_id, payload, message_type="agent.call.result", request_id=None)`
+对 canonical JSON bytes 签名、POST，并要求响应是由 `target_agent_id` 签发且 recipient 为 sender
+的 `SignedAgentMessage`。安全错误 envelope 映射为带稳定 code/request ID 的 `AgentAuthError`。
 
 ```python
-AgentAuthASGIMiddleware(app, *, verifier: AgentVerifier, max_body_bytes=1_048_576)
+AgentAuthASGIMiddleware(
+    app, *, verifier: AgentVerifier,
+    max_body_bytes=1_048_576, public_base_url=None,
+)
 ```
 
-HTTP 验签失败返回 401 JSON；body 过大返回 413；成功时写入 ASGI `scope["state"]["agent_auth"]`。WebSocket 等非 HTTP scope 原样传递。
+`public_base_url` 用于反向代理后的 canonical URL。重复签名 header 返回 400，验签失败返回 401，
+body 过大返回 413；成功时写入 ASGI `scope["state"]["agent_auth"]`。
 
 ## 配置与 Profile
 
@@ -186,13 +193,14 @@ sync wrapper 内部使用 `asyncio.run()`，不能在已经运行的 event loop 
 
 ## OpenAI Agents API
 
-新接口可从 `agent_auth_sdk` 顶层或 `agent_auth_sdk.integrations` 导入。
+推荐从 `agent_auth_sdk.openai` 导入。兼容接口仍可从 `agent_auth_sdk.integrations` 导入。
 
 ### OpenAIAgentAuth
 
-- `await OpenAIAgentAuth.from_env(identity, config_path=...)`：加载单个运行身份，不创建 key、不发布。
+- `await OpenAIAgentAuth.from_env(identity=None, config_path=None, http_client=None, nonce_store=None, cache=None)`：
+  单身份配置可零参数加载，不创建 key、不发布；调用方提供的 HTTP client 不会被 SDK 关闭。
 - `from_env_sync(...)`：无活动 event loop 时的同步构造入口。
-- `await from_config(config, identity=..., provision=False)`：从已解析配置构造。
+- `await from_config(config, identity=None, provision=False, ...)`：从已解析配置构造。
 - `from_components(...)`：依赖注入入口，适合测试或自定义 KMS。
 - `local(identity, domain=...)`：单身份本地构造器；不支持本地跨 role Tool。
 - `await provision()` / `provision_sync()`：显式发布当前 metadata。
@@ -200,18 +208,23 @@ sync wrapper 内部使用 `asyncio.run()`，不能在已经运行的 event loop 
 - `protect_tool(tool, target=...)`：保护已有 `FunctionTool` 并保留 dataclass 字段。
 - `agent_as_tool(agent, identity=..., ...)`：创建受保护的原生 Agent-as-tool。
 - `remote_agent_tool(...)`：由 Pydantic 输入输出类型创建签名远程 `FunctionTool`。
+- `remote_tool(name, input_type=..., output_type=...)`：按 `[remotes.<name>]` 别名创建远程 tool；
+  也可显式传 `target` 和 `url`。
 - `remote_agent_tools(specs)`：按顺序批量创建 `RemoteAgentToolSpec` 声明的远程 tools。
 - `authenticated_handoff(...)`：同进程签名审计/授权 handoff。
 - `authenticated_context(result)`：将验签成功结果转换为 `AuthenticatedAgentContext`。
 - `events()`：返回当前进程的 `AgentAuthEvent` 副本。
+- `drain_events()`：返回并清空最多 1000 条的内存事件缓冲。
+- `router()`：返回绑定当前身份的 `AgentAuthRouter`。
 - 支持 `async with`；退出时关闭 facade 拥有的 HTTP client。
 
 `AuthenticatedTool` 是框架无关的最小 Tool Protocol；`RemoteAgentToolSpec` 是不可变的批量远程
-Tool 配置。
+Tool 配置；`RemoteAgentEndpoint` 表示 TOML 中的远程 agent_id/url 别名。
 
 ### AgentAuthRouter 与 authenticated_agent
 
-安装 `openai-fastapi` extra。`AgentAuthRouter(auth).agent_endpoint(...)` 注册 FastAPI 路由，
+安装 `openai-fastapi` extra。推荐 `router = auth.router()`、`@router.endpoint(...)` 和
+`app.include_router(router)`；`AgentAuthRouter(auth).agent_endpoint(...)` 继续兼容。Router
 自动完成请求验签、可选 `AuthorizationPolicy`、`AuthenticatedAgentContext` 注入和响应签名。
 `authenticated_agent(request)` 可用于 `Depends()` 读取现有认证上下文。
 
@@ -260,10 +273,10 @@ Tool 配置。
 
 ## CLI 与 Registry HTTP API
 
-- `agent-auth init`：必需 `--project-root`、`--roles`；可选 `--framework openai-agents`、`--mode local|vault`、`--domain`、`--organization`。
+- `agent-auth init`：零参数生成单身份本地配置；可选 `--project-root`、`--roles`、`--mode`、`--domain`、`--organization`。
 - `agent-auth integrate-openai-agents`：同上，并支持 `--registry-url`、`--registry-publish-url` 和可重复的 `--role-capability role:capability`。
 - `agent-auth doctor --config PATH`：只读检查 TOML、identity、profile、TLS 和 Vault token 文件；默认 `.agent-auth/agent-auth.toml`。
-- `agent-auth provision --identity ROLE --config PATH`：显式创建/检查单个 Vault key 并发布身份。
+- `agent-auth provision [--identity ROLE] [--config PATH]`：单身份配置不需传 identity，显式检查并发布。
 - `agent-auth openai inspect PATH [--json]`：只读 AST 扫描已有 OpenAI Agents 项目。
 - `agent-auth openai migrate PATH [--write]`：预览或幂等生成迁移报告；不猜测身份、不改业务源码。
 - `agent-auth-registry`、`agent-auth-registry-admin` 和所有 Registry HTTP endpoint：见 [Registry 部署与运维](REGISTRY_OPERATIONS.md)。

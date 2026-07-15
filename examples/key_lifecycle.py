@@ -8,7 +8,10 @@ import os
 
 from agent_auth_sdk import AgentInstance, RegistryClient
 
-from ._shared import required_env, vault_verify_from_env
+try:
+    from ._shared import required_env, vault_verify_from_env
+except ImportError:  # 允许 python examples/key_lifecycle.py
+    from _shared import required_env, vault_verify_from_env
 
 
 def parser() -> argparse.ArgumentParser:

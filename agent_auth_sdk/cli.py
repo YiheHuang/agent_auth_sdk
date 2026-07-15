@@ -21,8 +21,8 @@ def _main() -> None:
 
 @app.command("init")
 def init_project(
-    project_root: Annotated[Path, typer.Option(help="Project root.")],
-    roles: Annotated[str, typer.Option(help="Comma-separated Agent roles.")],
+    project_root: Annotated[Path, typer.Option(help="Project root.")] = Path("."),
+    roles: Annotated[str, typer.Option(help="Comma-separated Agent roles.")] = "agent",
     framework: Annotated[str, typer.Option(help="Framework name.")] = "openai-agents",
     mode: Annotated[str, typer.Option(help="Integration mode: local or vault.")] = "local",
     domain: Annotated[str, typer.Option(help="Agent identity domain.")] = "127.0.0.1:8700",
@@ -83,7 +83,7 @@ def doctor(
 
 @app.command("provision")
 def provision_identity(
-    identity: Annotated[str, typer.Option(help="Configured role or full Agent ID.")],
+    identity: Annotated[str | None, typer.Option(help="Configured role or full Agent ID.")] = None,
     config_path: Annotated[Path, typer.Option("--config", help="Path to agent-auth.toml.")] = Path(
         ".agent-auth/agent-auth.toml"
     ),
@@ -241,17 +241,29 @@ def _render_config(
     registry_publish_url: str | None,
     capabilities: dict[str, str],
 ) -> str:
+    from .identity import build_agent_id
+
     scheme = "http" if mode == "local" else "https"
     registry_document = registry_url or f"{scheme}://{domain}/.well-known/agent.json"
     registry_publish = registry_publish_url or f"{scheme}://{domain}/v1/agents/publish"
+    single_identity = len(roles) == 1
     lines = [
         f'mode = "{_escape(mode)}"',
         f'domain = "{_escape(domain)}"',
+        *(
+            [
+                f'identity = "{_escape(build_agent_id(domain, roles[0]))}"',
+                f'endpoint = "{_escape(scheme)}://{_escape(domain)}/agents/{_escape(roles[0])}"',
+                f'public_base_url = "{_escape(scheme)}://{_escape(domain)}"',
+            ]
+            if single_identity
+            else []
+        ),
         f'organization = "{_escape(organization)}"',
         f'environment = "{"local" if mode == "local" else "production"}"',
         f'profile = "{"test" if mode == "local" else "strict"}"',
         'runtime_dir = "runtime"',
-        "roles = [" + ", ".join(f'"{_escape(role)}"' for role in roles) + "]",
+        *([] if single_identity else ["roles = [" + ", ".join(f'"{_escape(role)}"' for role in roles) + "]"]),
         "",
         "[capabilities]",
         *[f'"{_escape(role)}" = "{_escape(capability)}"' for role, capability in capabilities.items()],
@@ -268,8 +280,17 @@ def _render_config(
         'transit_mount = "${AGENT_AUTH_VAULT_TRANSIT_MOUNT}"',
         "auto_create_keys = false",
         "",
-        "[vault.key_names]",
-        *[f'"{_escape(role)}" = "${{AGENT_AUTH_{_env_token(role)}_KEY_NAME}}"' for role in roles],
+        *(
+            [
+                f'key = "${{AGENT_AUTH_{_env_token(roles[0])}_KEY_NAME}}"',
+                "# key_version = 1  # strict deployments should pin this after provisioning",
+            ]
+            if single_identity
+            else [
+                "[vault.key_names]",
+                *[f'"{_escape(role)}" = "${{AGENT_AUTH_{_env_token(role)}_KEY_NAME}}"' for role in roles],
+            ]
+        ),
         "",
     ]
     return "\n".join(lines)
@@ -280,17 +301,18 @@ def _render_adapter() -> str:
 
 from pathlib import Path
 
-from agent_auth_sdk import OpenAIAgentAuth
+from agent_auth_sdk.openai import OpenAIAgentAuth
 
 
 _AUTH: dict[str, OpenAIAgentAuth] = {}
 
 
-async def get_auth(identity: str) -> OpenAIAgentAuth:
-    if identity not in _AUTH:
+async def get_auth(identity: str | None = None) -> OpenAIAgentAuth:
+    key = identity or "__default__"
+    if key not in _AUTH:
         config_path = Path(__file__).with_name("agent-auth.toml")
-        _AUTH[identity] = await OpenAIAgentAuth.from_env(identity=identity, config_path=config_path)
-    return _AUTH[identity]
+        _AUTH[key] = await OpenAIAgentAuth.from_env(identity=identity, config_path=config_path)
+    return _AUTH[key]
 
 
 async def close_auth() -> None:
@@ -325,6 +347,7 @@ def _render_vault_env(roles: tuple[str, ...]) -> str:
 def _render_report(*, parsed_roles: tuple[str, ...], mode: str) -> str:
     first_target = parsed_roles[1] if len(parsed_roles) > 1 else parsed_roles[0]
     first_source = parsed_roles[0]
+    get_auth_call = "get_auth()" if len(parsed_roles) == 1 else f'get_auth("{first_source}")'
     return f"""# Agent Auth OpenAI Agents Integration
 
 Generated an explicit integration scaffold for roles: {", ".join(parsed_roles)}.
@@ -350,7 +373,7 @@ After:
 ```python
 from agent_auth_adapter import get_auth
 
-auth = await get_auth("{first_source}")
+auth = await {get_auth_call}
 auth.bind({{"{first_target}": {first_target}}})
 {first_target}_tool = auth.agent_as_tool(
     {first_target},

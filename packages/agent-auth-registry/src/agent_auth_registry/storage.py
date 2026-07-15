@@ -63,6 +63,13 @@ class AgentStateConflictError(RuntimeError):
     """操作基于过期的 Agent 状态，调用方必须重新解析后重试。"""
 
 
+class UnsupportedSchemaVersionError(RuntimeError):
+    """数据库 schema 版本不属于当前 Registry。"""
+
+
+SCHEMA_VERSION = 1
+
+
 class RegistryStore:
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = Path(db_path)
@@ -83,6 +90,16 @@ class RegistryStore:
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            version_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'"
+            ).fetchone()
+            if version_table is not None:
+                row = conn.execute("SELECT MAX(version) AS version FROM schema_version").fetchone()
+                existing_version = int(row["version"]) if row and row["version"] is not None else 0
+                if existing_version not in {0, SCHEMA_VERSION}:
+                    raise UnsupportedSchemaVersionError(
+                        f"Unsupported Registry schema version {existing_version}; expected {SCHEMA_VERSION}"
+                    )
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(
                 """
@@ -158,6 +175,41 @@ class RegistryStore:
                 ON developer_namespaces(domain, status);
                 """,
             )
+
+    @property
+    def db_path(self) -> Path:
+        return self._db_path
+
+    def schema_status(self) -> dict[str, int | bool | str]:
+        """返回可安全输出的数据库版本和完整性状态。"""
+
+        with self._connect() as conn:
+            row = conn.execute("SELECT MAX(version) AS version FROM schema_version").fetchone()
+            version = int(row["version"]) if row and row["version"] is not None else 0
+            integrity = str(conn.execute("PRAGMA quick_check").fetchone()[0])
+        return {
+            "ok": version == SCHEMA_VERSION and integrity == "ok",
+            "schema_version": version,
+            "expected_schema_version": SCHEMA_VERSION,
+            "integrity": integrity,
+        }
+
+    def backup(self, destination: str | Path) -> Path:
+        """使用 SQLite online backup API 创建一致性备份。"""
+
+        target = Path(destination)
+        if target.resolve() == self._db_path.resolve():
+            raise ValueError("backup destination must differ from the Registry database")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = sqlite3.connect(self._db_path, timeout=5.0)
+        destination_conn = sqlite3.connect(target, timeout=5.0)
+        try:
+            source.execute("PRAGMA busy_timeout = 5000")
+            source.backup(destination_conn)
+        finally:
+            destination_conn.close()
+            source.close()
+        return target
 
     def create_developer(self, *, developer_id: str, client_id: str, api_key_hash: str) -> None:
         now = _now_iso()

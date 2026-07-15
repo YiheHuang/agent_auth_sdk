@@ -149,3 +149,61 @@ def test_cli_generates_explicit_integration_files(tmp_path: Path) -> None:
     assert "No existing business source files were modified" in report
     config_text = (auth_dir / "agent-auth.toml").read_text(encoding="utf-8")
     assert '"security" = "review.security"' in config_text
+
+
+def test_zero_config_cli_init_and_doctor(tmp_path: Path) -> None:
+    runner = CliRunner()
+    initialized = runner.invoke(app, ["init", "--project-root", str(tmp_path)])
+    assert initialized.exit_code == 0, initialized.output
+    config_path = tmp_path / ".agent-auth" / "agent-auth.toml"
+    config_text = config_path.read_text(encoding="utf-8")
+    assert 'identity = "agent://127.0.0.1:8700/agent"' in config_text
+    assert "roles =" not in config_text
+
+    checked = runner.invoke(app, ["doctor", "--config", str(config_path)])
+    assert checked.exit_code == 0, checked.output
+    assert '"identity:agent": "agent://127.0.0.1:8700/agent"' in checked.stdout
+
+
+def test_config_rejects_insecure_vault_outside_loopback_test() -> None:
+    direct = OpenAIAgentsAuthConfig(identity="agent://agents.example.com/agent")
+    assert direct.domain == "agents.example.com"
+    with pytest.raises(ValueError, match="loopback"):
+        OpenAIAgentsAuthConfig(
+            roles=("agent",),
+            mode="vault",
+            vault_addr="http://vault.example.com",
+            allow_insecure_local_vault=True,
+        )
+
+
+def test_cli_rejects_invalid_scaffold_options(tmp_path: Path) -> None:
+    runner = CliRunner()
+    unsupported = runner.invoke(
+        app,
+        ["init", "--project-root", str(tmp_path), "--framework", "unknown"],
+    )
+    assert unsupported.exit_code != 0
+    empty_roles = runner.invoke(
+        app,
+        ["integrate-openai-agents", "--project-root", str(tmp_path), "--roles", "  "],
+    )
+    assert empty_roles.exit_code != 0
+    invalid_mode = runner.invoke(
+        app,
+        ["integrate-openai-agents", "--project-root", str(tmp_path), "--roles", "agent", "--mode", "bad"],
+    )
+    assert invalid_mode.exit_code != 0
+    invalid_capability = runner.invoke(
+        app,
+        [
+            "integrate-openai-agents",
+            "--project-root",
+            str(tmp_path),
+            "--roles",
+            "agent",
+            "--role-capability",
+            "missing-colon",
+        ],
+    )
+    assert invalid_capability.exit_code != 0

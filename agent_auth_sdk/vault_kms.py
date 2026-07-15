@@ -83,8 +83,9 @@ class VaultTransitPublicKeyResolver:
         if key_type != "ecdsa-p256":
             raise ValueError(f"Unsupported Vault Transit key type: {key_type}. Expected ecdsa-p256.")
         latest_version = int(data.get("latest_version") or 1)
+        selected_version = self._config.key_version or latest_version
         keys = data.get("keys") or {}
-        public_key_pem = _select_public_key(keys, latest_version)
+        public_key_pem = _select_public_key(keys, selected_version)
         public_key = serialization.load_pem_public_key(public_key_pem.encode("utf-8"))
         _validate_p256_public_key(public_key)
         public_key_der = public_key.public_bytes(
@@ -94,7 +95,7 @@ class VaultTransitPublicKeyResolver:
         return VaultKmsKeyDescription(
             key_name=self._config.key_name,
             key_type=key_type,
-            latest_version=latest_version,
+            latest_version=selected_version,
             public_key_pem=public_key_pem,
             public_key_base64url=_to_base64url(public_key_der),
         )
@@ -243,12 +244,12 @@ def _base64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
-def _select_public_key(keys: dict, latest_version: int) -> str:
-    for version in (str(latest_version), latest_version):
+def _select_public_key(keys: dict, key_version: int) -> str:
+    for version in (str(key_version), key_version):
         value = keys.get(version)
         if isinstance(value, dict) and value.get("public_key"):
             return str(value["public_key"])
-    raise ValueError("Vault Transit key metadata does not contain a public key for the latest version.")
+    raise ValueError(f"Vault Transit key metadata does not contain public key version {key_version}.")
 
 
 def _validate_p256_public_key(public_key: Any) -> None:

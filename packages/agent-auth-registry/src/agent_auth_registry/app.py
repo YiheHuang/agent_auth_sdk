@@ -80,13 +80,31 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Agent Registry")
     store = RegistryStore(load_registry_db_path())
 
-    @app.get("/healthz")
-    def healthz() -> JSONResponse:
+    @app.middleware("http")
+    async def legacy_route_headers(request: Request, call_next):  # type: ignore[no-untyped-def]
+        response = await call_next(request)
+        if request.url.path.startswith("/registry/agents/"):
+            successor = request.url.path.replace("/registry/agents/", "/v1/agents/", 1)
+            response.headers["Deprecation"] = "true"
+            response.headers["Sunset"] = "Thu, 01 Jul 2027 00:00:00 GMT"
+            response.headers["Link"] = f'<{successor}>; rel="successor-version"'
+        return response
+
+    @app.get("/health/live")
+    def health_live() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def health_ready() -> JSONResponse:
         ready = store.readiness_check()
         return JSONResponse(
             {"status": "ok" if ready else "not_ready"},
             status_code=200 if ready else 503,
         )
+
+    @app.get("/healthz")
+    def healthz() -> JSONResponse:
+        return health_ready()
 
     @app.get("/.well-known/agent.json")
     def well_known_registry() -> JSONResponse:

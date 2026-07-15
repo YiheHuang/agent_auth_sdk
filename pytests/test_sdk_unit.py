@@ -6,18 +6,20 @@ import json
 import os
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
-from agent_auth_sdk import AgentInstance, InMemoryNonceStore
+from agent_auth_sdk import AgentInstance, AgentVerifier, InMemoryNonceStore
 from agent_auth_sdk.config import STRICT_PROFILE, TEST_PROFILE
-from agent_auth_sdk.crypto import verify_signature
+from agent_auth_sdk.crypto import CallableSigner, verify_signature
 from agent_auth_sdk.errors import MetadataValidationError
 from agent_auth_sdk.http_utils import build_canonical_request
 from agent_auth_sdk.identity import assert_strict_agent_id, build_agent_id, parse_agent_id
 from agent_auth_sdk.metadata import select_verification_key
-from agent_auth_sdk.models import AgentKey, AgentRegistryDocument
+from agent_auth_sdk.models import AgentKey, AgentRegistryDocument, VerificationSuccess
+from agent_auth_sdk.observability import AgentAuthEvent, emit_event
 from agent_auth_sdk.publish import render_agent_metadata
 from agent_auth_sdk.registry_client import RegistryClient
 from agent_auth_sdk.registry_security import hash_api_key, legacy_hash_api_key, verify_api_key
@@ -704,3 +706,119 @@ def test_revoke_key_raises_when_last_active_key() -> None:
                 kid_to_revoke="vault:transit/weather-agent",
             )
         )
+
+
+@pytest.mark.anyio
+async def test_registry_client_lifecycle_methods_and_async_credential(monkeypatch: pytest.MonkeyPatch) -> None:
+    private_pem, public_pem = _generate_es256_pem_pair()
+    signer = _TestEs256Signer(private_pem, kid="key-1")
+    agent = AgentInstance.from_signer(
+        domain="agents.example.com",
+        name="caller",
+        organization="Test",
+        endpoint="https://agents.example.com/invoke",
+        signer=signer,
+        public_key_pem=public_pem,
+        kid="key-1",
+    )
+    calls: list[dict] = []
+
+    async def fake_operation(*args, **kwargs):
+        calls.append(kwargs)
+        return {"ok": True}
+
+    for name in (
+        "publish_to_registry",
+        "rotate_key_in_registry",
+        "add_key_in_registry",
+        "revoke_key_in_registry",
+        "revoke_agent_in_registry",
+    ):
+        monkeypatch.setattr(f"agent_auth_sdk.registry_client.{name}", fake_operation)
+
+    async def credential() -> str:
+        return "secret"
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200)))
+    client = RegistryClient(
+        base_url="https://registry.example.com/v1/agents/publish",
+        client_id="developer",
+        api_key=credential,
+        http_client=http_client,
+    )
+    key = agent.metadata.keys[0]
+    assert await client.publish(agent.metadata, signer=signer) == {"ok": True}
+    assert await client.rotate_key(
+        agent_id=agent.agent_id,
+        new_key=key,
+        current_signer=signer,
+        new_signer=signer,
+    ) == {"ok": True}
+    assert await client.add_key(
+        agent_id=agent.agent_id,
+        new_key=key,
+        current_signer=signer,
+        new_signer=signer,
+    ) == {"ok": True}
+    assert await client.revoke_key(
+        agent_id=agent.agent_id,
+        kid_to_revoke="old-key",
+        current_signer=signer,
+    ) == {"ok": True}
+    assert await client.revoke_agent(agent_id=agent.agent_id, current_signer=signer) == {"ok": True}
+    assert all(call["api_key"] == "secret" for call in calls)
+    await client.__aexit__()
+    assert http_client.is_closed is False
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_verifier_authorization_policy_paths() -> None:
+    verifier = AgentVerifier()
+    success = VerificationSuccess(agent_id="agent://agents.example.com/caller", kid="key-1")
+
+    class Policy:
+        def __init__(self, result: bool | Exception) -> None:
+            self.result = result
+
+        async def authorize(self, result: VerificationSuccess, *, capability: str | None = None) -> bool:
+            if isinstance(self.result, Exception):
+                raise self.result
+            return self.result
+
+    assert await verifier.authorize(success, policy=Policy(True), capability="review") is success
+    assert (await verifier.authorize(success, policy=Policy(False))).code == "POLICY_REJECTED"
+    assert (await verifier.authorize(success, policy=Policy(RuntimeError("failed")))).code == "POLICY_REJECTED"
+    await verifier.__aenter__()
+    assert verifier._http_client is not None
+    await verifier.__aexit__()
+    assert verifier._http_client is None
+
+
+@pytest.mark.anyio
+async def test_callable_signer_and_event_sinks() -> None:
+    async def sign(data: bytes) -> bytes:
+        return b"signed:" + data
+
+    signer = CallableSigner(kid_value="key-1", sign_callable=sign)
+    assert await signer.kid() == "key-1"
+    assert await signer.algorithm() == "ES256"
+    assert await signer.sign(b"data") == b"signed:data"
+
+    event = AgentAuthEvent(
+        operation="test",
+        source_agent_id=None,
+        target_agent_id=None,
+        ok=True,
+        duration_ms=1.0,
+    )
+    received: list[AgentAuthEvent] = []
+
+    async def async_sink(value: AgentAuthEvent) -> None:
+        received.append(value)
+
+    await emit_event(None, event)
+    await emit_event(received.append, event)
+    await emit_event(async_sink, event)
+    assert received == [event, event]
+    assert event.as_dict()["operation"] == "test"

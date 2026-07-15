@@ -1,6 +1,6 @@
 # Registry 部署与运维手册
 
-本文适用于 `verifiable-agent-auth-registry 0.2.0b1`。
+本文适用于 `verifiable-agent-auth-registry 1.0.0rc1`。
 
 ## 1. 支持边界
 
@@ -29,7 +29,7 @@
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install "verifiable-agent-auth-registry==0.2.0b1"
+python -m pip install "verifiable-agent-auth-registry==1.0.0rc1"
 
 export AGENT_REGISTRY_DB_PATH="$PWD/runtime/registry.sqlite3"
 export AGENT_REGISTRY_PATH="$PWD/runtime/.well-known/agent.json"
@@ -60,7 +60,7 @@ sudo install -d -o agent-auth -g agent-auth -m 0700 /opt/agent_auth_sdk/runtime/
 sudo install -d -o root -g root -m 0755 /opt/agent_auth_sdk
 sudo python3 -m venv /opt/agent_auth_sdk/.venv
 sudo /opt/agent_auth_sdk/.venv/bin/pip install --upgrade pip
-sudo /opt/agent_auth_sdk/.venv/bin/pip install "verifiable-agent-auth-registry==0.2.0b1"
+sudo /opt/agent_auth_sdk/.venv/bin/pip install "verifiable-agent-auth-registry==1.0.0rc1"
 sudo install -d -o root -g root -m 0755 /etc/agent-auth
 ```
 
@@ -117,7 +117,7 @@ curl --fail https://registry.example.com/healthz
 脚本适用于已把仓库放到 `/opt/agent_auth_sdk` 的 systemd 主机：
 
 ```bash
-export AGENT_AUTH_VERSION=0.2.0b1
+export AGENT_AUTH_VERSION=1.0.0rc1
 export AGENT_AUTH_INSTALL_MODE=pypi
 export AGENT_REGISTRY_SERVER_NAME=registry.example.com
 export AGENT_REGISTRY_TLS_CERT=/etc/letsencrypt/live/registry.example.com/fullchain.pem
@@ -160,7 +160,9 @@ namespace 使用规范化后的精确 domain 和 path 前缀；有效 namespace 
 
 | 端点 | 成功响应 | 缓存 |
 |---|---|---|
-| `GET /healthz` | `{"status":"ok"}`；数据库不可写时 503 | 无 |
+| `GET /health/live` | 进程存活 | 无 |
+| `GET /health/ready` | schema 与数据库 readiness；失败时 503 | 无 |
+| `GET /healthz` | `/health/ready` 兼容别名 | 无 |
 | `GET /.well-known/agent.json` | `AgentRegistryDocument` | ETag，60 秒 |
 | `GET /v1/agents/resolve?agent_id=...` | `{agent_id, metadata}` | ETag，60 秒 |
 
@@ -190,15 +192,17 @@ resolve 对无效 identity 返回 400，对不存在或已撤销 Agent 返回 40
 
 常见状态：400 输入/证明错误，401 API key 或签名失败，403 namespace/owner 不允许，404 Agent/key 不存在，409 ownership 或并发状态冲突，422 schema 错误。
 
-旧 `/registry/agents/*` 路径仅保留 beta 兼容，新客户端不得使用。
+旧 `/registry/agents/*` 路径仅保留 1.x 兼容，并返回 `Deprecation`、`Sunset` 和 successor
+`Link` header；新客户端只使用 `/v1/agents/*`。
 
 ## 9. 备份与恢复
 
-在线备份使用 SQLite backup command：
+推荐使用 Registry 自带的 schema 检查和 SQLite online backup：
 
 ```bash
-sudo -u agent-auth sqlite3 /opt/agent_auth_sdk/runtime/registry/registry.sqlite3 \
-  ".backup '/opt/agent_auth_sdk/runtime/registry/backup-$(date +%Y%m%d-%H%M%S).sqlite3'"
+sudo -u agent-auth agent-auth-registry-admin db check
+sudo -u agent-auth agent-auth-registry-admin db backup \
+  --output "/secure-backup/registry-$(date +%Y%m%d-%H%M%S).sqlite3"
 ```
 
 或者停服后复制数据库：
@@ -219,7 +223,7 @@ sudo systemctl start agent-auth-registry
 sudo systemctl stop agent-auth-registry
 # 先执行第 9 节备份
 sudo /opt/agent_auth_sdk/.venv/bin/pip install --upgrade \
-  "verifiable-agent-auth-registry==0.2.0b1"
+  "verifiable-agent-auth-registry==1.0.0rc1"
 sudo systemctl start agent-auth-registry
 curl --fail https://registry.example.com/healthz
 ```

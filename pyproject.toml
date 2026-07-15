@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "verifiable-agent-auth-sdk"
-version = "0.2.0b1"
+version = "1.0.0rc1"
 description = "Python SDK for agent identity publishing, signed messaging, and registry-based verification"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,6 +25,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Security :: Cryptography",
   "Topic :: Software Development :: Libraries :: Python Modules"
 ]
@@ -38,12 +39,12 @@ dependencies = [
 [project.optional-dependencies]
 vault = ["hvac>=2.4.0"]
 redis = ["redis>=5.0.0"]
-openai = ["openai-agents>=0.2.0,<=0.18.2"]
-openai-fastapi = ["openai-agents>=0.2.0,<=0.18.2", "fastapi>=0.115.0"]
+openai = ["openai-agents>=0.18.2,<0.19"]
+openai-fastapi = ["openai-agents>=0.18.2,<0.19", "fastapi>=0.115.0"]
 all = [
   "hvac>=2.4.0",
   "redis>=5.0.0",
-  "openai-agents>=0.2.0,<=0.18.2",
+  "openai-agents>=0.18.2,<0.19",
   "fastapi>=0.115.0",
 ]
 dev = [

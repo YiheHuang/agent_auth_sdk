@@ -6,7 +6,7 @@ on:
       version:
         description: Exact SDK and Registry version to verify
         required: true
-        default: 0.2.0b1
+        default: 1.0.0rc1
       upload_packages:
         description: Build and upload packages before verification
         required: true
@@ -24,7 +24,24 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
+      - name: Verify requested and synchronized package versions
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import tomllib
+
+          sdk = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          registry = tomllib.loads(
+              pathlib.Path("packages/agent-auth-registry/pyproject.toml").read_text()
+          )["project"]["version"]
+          requested = os.environ["REQUESTED_VERSION"]
+          if sdk != registry or requested != sdk:
+              raise SystemExit(f"release mismatch: requested={requested}, sdk={sdk}, registry={registry}")
+          PY
       - run: python -m pip install --upgrade build twine
       - run: python -m build --sdist --wheel
       - run: python -m build --sdist --wheel packages/agent-auth-registry
@@ -79,7 +96,7 @@ jobs:
     steps:
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.14"
       - run: python -m pip install --upgrade pip
       - name: Download exact wheels from TestPyPI without third-party dependencies
         shell: bash

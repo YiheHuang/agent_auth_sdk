@@ -7,6 +7,8 @@ import inspect
 import json
 import os
 import time
+import uuid
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -32,6 +34,7 @@ from agent_auth_sdk.models import VerificationFailure, VerificationSuccess
 from agent_auth_sdk.observability import AgentAuthEvent, EventSink, emit_event
 from agent_auth_sdk.registry_client import RegistryClient
 from agent_auth_sdk.remote import RemoteAgentClient
+from agent_auth_sdk.stores import MetadataCache, NonceStore
 from agent_auth_sdk.verifier import AgentVerifier, AuthorizationPolicy
 
 from .openai_agents import LocalEs256Signer, OpenAIAgentsAuthConfig, OpenAIAgentsAuthRuntime, _to_payload
@@ -78,27 +81,36 @@ class OpenAIAgentAuth:
     authorization_policy: AuthorizationPolicy | None = None
     event_sink: EventSink | None = None
     enabled: bool = True
+    public_base_url: str | None = None
     _http_client: httpx.AsyncClient | None = None
     _owns_http_client: bool = False
     _local_runtime: OpenAIAgentsAuthRuntime | None = None
     _bindings: dict[int, str] = field(default_factory=dict)
     _binding_objects: dict[int, Any] = field(default_factory=dict)
-    _events: list[AgentAuthEvent] = field(default_factory=list)
+    _remotes: dict[str, tuple[str, str]] = field(default_factory=dict)
+    _events: deque[AgentAuthEvent] = field(default_factory=lambda: deque(maxlen=1000))
 
     @classmethod
     async def from_env(
         cls,
         *,
-        identity: str,
-        config_path: str | Path = ".agent-auth/agent-auth.toml",
+        identity: str | None = None,
+        config_path: str | Path | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        nonce_store: NonceStore | None = None,
+        cache: MetadataCache | None = None,
         authorization_policy: AuthorizationPolicy | None = None,
         event_sink: EventSink | None = None,
     ) -> OpenAIAgentAuth:
         """从 TOML 与环境变量加载运行身份；不会创建 key 或发布 metadata。"""
 
+        resolved_path = config_path or os.getenv("AGENT_AUTH_CONFIG") or ".agent-auth/agent-auth.toml"
         return await cls.from_config(
-            OpenAIAgentsAuthConfig.from_file(config_path),
+            OpenAIAgentsAuthConfig.from_file(resolved_path),
             identity=identity,
+            http_client=http_client,
+            nonce_store=nonce_store,
+            cache=cache,
             authorization_policy=authorization_policy,
             event_sink=event_sink,
             provision=False,
@@ -113,23 +125,30 @@ class OpenAIAgentAuth:
         cls,
         config: OpenAIAgentsAuthConfig,
         *,
-        identity: str,
+        identity: str | None = None,
+        http_client: httpx.AsyncClient | None = None,
+        nonce_store: NonceStore | None = None,
+        cache: MetadataCache | None = None,
         authorization_policy: AuthorizationPolicy | None = None,
         event_sink: EventSink | None = None,
         provision: bool = False,
     ) -> OpenAIAgentAuth:
-        role = _role_for_identity(config, identity)
+        selected_identity = identity or config.identity or config.default_role()
+        role = _role_for_identity(config, selected_identity)
         profile = get_runtime_profile(config.profile)
         enabled = os.getenv("AGENT_AUTH_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
         if not enabled and profile.name == "strict":
             raise AgentConfigurationError("AGENT_AUTH_ENABLED cannot disable authentication in strict profile")
 
-        client = httpx.AsyncClient(follow_redirects=False)
+        client = http_client or httpx.AsyncClient(follow_redirects=False)
+        owns_client = http_client is None
         resolver_config = MetadataResolverConfig(profile=profile, registry_url=config.registry_document_url())
         verifier = AgentVerifier(
             verification_config=VerificationConfig(profile=profile),
             resolver_config=resolver_config,
             http_client=client,
+            nonce_store=nonce_store,
+            cache=cache,
             event_sink=event_sink,
         )
         registry_client = _registry_client(config, client)
@@ -146,12 +165,15 @@ class OpenAIAgentAuth:
                 authorization_policy=authorization_policy,
                 event_sink=event_sink,
                 enabled=enabled,
+                public_base_url=config.public_base_url,
                 _http_client=client,
-                _owns_http_client=True,
+                _owns_http_client=owns_client,
                 _local_runtime=runtime,
+                _remotes={alias: (remote.agent_id, remote.url) for alias, remote in config.remotes.items()},
             )
         if config.mode != "vault":
-            await client.aclose()
+            if owns_client:
+                await client.aclose()
             raise AgentConfigurationError("mode must be 'local' or 'vault'")
 
         missing = [
@@ -164,31 +186,40 @@ class OpenAIAgentAuth:
             if not value
         ]
         if missing:
-            await client.aclose()
+            if owns_client:
+                await client.aclose()
             raise AgentConfigurationError("Vault identity requires: " + ", ".join(missing))
+        if profile.name == "strict" and role not in config.vault_key_versions and not provision:
+            if owns_client:
+                await client.aclose()
+            raise AgentConfigurationError(
+                "Strict profile requires vault.key_version; run agent-auth provision, then pin the published version",
+                code="VAULT_KEY_VERSION_REQUIRED",
+                agent_id=config.agent_id_for(role),
+            )
         try:
             instance = await asyncio.to_thread(
                 AgentInstance.from_vault,
                 domain=config.domain,
                 name=role,
                 organization=config.organization,
-                endpoint=f"https://{config.domain}/agents/{role}",
+                endpoint=config.endpoint_for(role),
                 vault_addr=config.vault_addr or "",
                 vault_token_file=config.vault_token_file,
                 transit_mount=config.vault_transit_mount,
                 key_name=config.vault_key_names[role],
                 namespace=config.vault_namespace,
                 verify=config.vault_verify,
+                allow_insecure_raw_token=config.allow_insecure_local_vault,
+                key_version=config.vault_key_versions.get(role),
                 capabilities=["sign", "verify", config.capability_for(role)],
                 environment=config.environment,
                 auto_create_key=provision and config.auto_create_vault_keys,
             )
         except Exception as exc:
-            await client.aclose()
-            raise AgentConfigurationError(
-                "Unable to load the configured Vault identity",
-                agent_id=identity if identity.startswith("agent://") else None,
-            ) from exc
+            if owns_client:
+                await client.aclose()
+            raise _vault_configuration_error(exc, selected_identity) from exc
         auth = cls(
             identity=role,
             agent=instance,
@@ -198,8 +229,10 @@ class OpenAIAgentAuth:
             authorization_policy=authorization_policy,
             event_sink=event_sink,
             enabled=enabled,
+            public_base_url=config.public_base_url,
             _http_client=client,
-            _owns_http_client=True,
+            _owns_http_client=owns_client,
+            _remotes={alias: (remote.agent_id, remote.url) for alias, remote in config.remotes.items()},
         )
         if provision:
             await auth.provision()
@@ -384,33 +417,77 @@ class OpenAIAgentAuth:
 
         async def invoke(_: Any, arguments_json: str) -> Any:
             started = time.perf_counter()
+            request_id = str(uuid.uuid4())
             try:
                 request_value = input_adapter.validate_json(arguments_json)
                 payload = input_adapter.dump_python(request_value, mode="json")
                 remote = RemoteAgentClient(sender=self.agent, verifier=self.verifier, http_client=self._http_client)
-                result = await remote.call(
-                    target_url=url,
-                    target_agent_id=target,
-                    payload=payload,
-                    message_type=message_type,
-                )
+                if self._http_client is None:
+                    async with remote:
+                        result = await remote.call(
+                            target_url=url,
+                            target_agent_id=target,
+                            payload=payload,
+                            message_type=message_type,
+                            request_id=request_id,
+                        )
+                else:
+                    result = await remote.call(
+                        target_url=url,
+                        target_agent_id=target,
+                        payload=payload,
+                        message_type=message_type,
+                        request_id=request_id,
+                    )
                 validated = output_adapter.validate_python(result) if output_adapter is not None else result
-                await self._record("openai.remote_tool", target, True, started)
+                await self._record("openai.remote_tool", target, True, started, request_id=request_id)
                 return validated
             except ValidationError as exc:
-                await self._record("openai.remote_tool", target, False, started, code="TOOL_SCHEMA_INVALID")
+                await self._record(
+                    "openai.remote_tool",
+                    target,
+                    False,
+                    started,
+                    code="TOOL_SCHEMA_INVALID",
+                    request_id=request_id,
+                )
                 raise AgentAuthenticationError(
                     "Remote tool input or output did not match its schema", code="TOOL_SCHEMA_INVALID"
                 ) from exc
             except AgentAuthError as exc:
-                await self._record("openai.remote_tool", target, False, started, code=exc.code)
+                await self._record(
+                    "openai.remote_tool",
+                    target,
+                    False,
+                    started,
+                    code=exc.code,
+                    request_id=exc.request_id or request_id,
+                )
                 raise
             except httpx.HTTPError as exc:
-                await self._record("openai.remote_tool", target, False, started, code="TRANSPORT_FAILED")
-                raise AgentTransportError("Remote Agent request failed", agent_id=target) from exc
+                await self._record(
+                    "openai.remote_tool",
+                    target,
+                    False,
+                    started,
+                    code="TRANSPORT_FAILED",
+                    request_id=request_id,
+                )
+                raise AgentTransportError(
+                    "Remote Agent request failed",
+                    agent_id=target,
+                    request_id=request_id,
+                ) from exc
             except PermissionError as exc:
                 error = _permission_error(exc, target)
-                await self._record("openai.remote_tool", target, False, started, code=error.code)
+                await self._record(
+                    "openai.remote_tool",
+                    target,
+                    False,
+                    started,
+                    code=error.code,
+                    request_id=request_id,
+                )
                 raise error from exc
 
         return FunctionTool(
@@ -496,6 +573,59 @@ class OpenAIAgentAuth:
 
     def events(self) -> list[AgentAuthEvent]:
         return list(self._events)
+
+    def drain_events(self) -> list[AgentAuthEvent]:
+        """返回并清空内存事件缓冲；生产日志仍应优先使用 ``event_sink``。"""
+
+        events = list(self._events)
+        self._events.clear()
+        return events
+
+    def router(self, *, prefix: str = "", tags: list[str] | None = None) -> Any:
+        """创建绑定当前身份的 FastAPI Router。"""
+
+        from .openai_fastapi import AgentAuthRouter
+
+        wrapper = AgentAuthRouter(
+            self,
+            prefix=prefix,
+            tags=tags,
+            public_base_url=self.public_base_url,
+        )
+        wrapper.router.endpoint = wrapper.agent_endpoint  # type: ignore[attr-defined]
+        return wrapper.router
+
+    def remote_tool(
+        self,
+        name: str,
+        *,
+        input_type: type[Any],
+        output_type: type[Any] | None = None,
+        target: str | None = None,
+        url: str | None = None,
+        description: str | None = None,
+        is_enabled: Any = True,
+        message_type: str = "agent.call.result",
+    ) -> Any:
+        """通过配置别名或显式 target/url 创建远程 Agent tool。"""
+
+        configured = self._remotes.get(name)
+        resolved_target = target or (configured[0] if configured else None)
+        resolved_url = url or (configured[1] if configured else None)
+        if not resolved_target or not resolved_url:
+            raise AgentConfigurationError(
+                f"Remote {name!r} is not configured; provide target and url or add [remotes.{name}]"
+            )
+        return self.remote_agent_tool(
+            name=name,
+            target=resolved_target,
+            url=resolved_url,
+            input_type=input_type,
+            output_type=output_type,
+            description=description,
+            is_enabled=is_enabled,
+            message_type=message_type,
+        )
 
     async def _local_exchange(
         self,
@@ -623,6 +753,36 @@ def _permission_error(exc: PermissionError, agent_id: str) -> AgentAuthError:
     if code in {VerificationErrorCode.METADATA_FETCH_FAILED.value, VerificationErrorCode.INVALID_METADATA.value}:
         return AgentDiscoveryError("Remote Agent metadata could not be resolved", code=code, agent_id=agent_id)
     return AgentAuthenticationError("Remote Agent response authentication failed", code=code, agent_id=agent_id)
+
+
+def _vault_configuration_error(exc: Exception, identity: str) -> AgentConfigurationError:
+    """把 Vault/requests/hvac 异常收敛为不泄漏凭证的稳定诊断。"""
+
+    class_name = exc.__class__.__name__.lower()
+    message = str(exc).lower()
+    if "must use https" in message:
+        code, safe = "VAULT_TLS_REQUIRED", "Vault must use HTTPS outside explicit local test mode"
+    elif "tls" in message or "ssl" in message or "certificate" in message:
+        code, safe = "VAULT_CA_INVALID", "Vault TLS certificate verification failed"
+    elif "token file permissions" in message or "permissions are too broad" in message:
+        code, safe = "VAULT_TOKEN_PERMISSION_DENIED", "Vault token file permissions are too broad"
+    elif "token file" in message or "vault_token_file" in message:
+        code, safe = "VAULT_TOKEN_FILE_INVALID", "Vault token file is missing, empty, or unreadable"
+    elif "public key version" in message or "key version" in message:
+        code, safe = "VAULT_KEY_VERSION_NOT_FOUND", "Configured Vault key version was not found"
+    elif "invalidpath" in class_name or "key metadata" in message:
+        code, safe = "VAULT_KEY_NOT_FOUND", "Configured Vault Transit key was not found"
+    elif class_name in {"forbidden", "unauthorized"} or "permission denied" in message:
+        code, safe = "VAULT_PERMISSION_DENIED", "Vault token is not authorized for the configured key"
+    elif any(token in class_name for token in ("connection", "timeout")):
+        code, safe = "VAULT_UNAVAILABLE", "Vault is unavailable"
+    else:
+        code, safe = "VAULT_CONFIGURATION_INVALID", "Unable to load the configured Vault identity"
+    return AgentConfigurationError(
+        safe,
+        code=code,
+        agent_id=identity if identity.startswith("agent://") else None,
+    )
 
 
 def _run_sync(awaitable: Any) -> Any:

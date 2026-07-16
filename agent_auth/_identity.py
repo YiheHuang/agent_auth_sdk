@@ -71,6 +71,28 @@ def validate_service_url(value: str, *, strict: bool = True) -> str:
         raise AgentAuthError("INVALID_URL", "Service URL is not allowed") from exc
 
 
+def validate_loopback_url(value: str) -> str:
+    """Validate an HTTP(S) URL that cannot leave the local machine."""
+
+    normalized = validate_service_url(value, strict=False)
+    parsed = urlsplit(normalized)
+    if not parsed.hostname or not _is_loopback_host(parsed.hostname):
+        raise AgentAuthError("INVALID_LOCAL_URL", "local mode only allows loopback service URLs")
+    return normalized
+
+
+def validate_local_identity(agent_id: str, endpoint: str) -> None:
+    """Restrict local-mode identities and endpoints to the localhost boundary."""
+
+    host, _ = parse_agent_id(agent_id, strict=False)
+    if host != "localhost":
+        raise AgentAuthError("INVALID_LOCAL_IDENTITY", "local mode Agent IDs must use agent://localhost/...")
+    validate_endpoint(agent_id, endpoint, strict=False)
+    parsed = urlsplit(endpoint)
+    if not parsed.hostname or not _is_loopback_host(parsed.hostname):
+        raise AgentAuthError("INVALID_LOCAL_ENDPOINT", "local mode endpoints must use a loopback host")
+
+
 def namespace_matches(agent_id: str, domain: str, path_prefix: str) -> bool:
     host, segments = parse_agent_id(agent_id, strict=False)
     normalized = "/" + "/".join(segments)
@@ -90,6 +112,15 @@ def _reject_non_public_host(host: str) -> None:
         return
     else:
         raise ValueError
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def resolve_public_host(host: str) -> set[str]:

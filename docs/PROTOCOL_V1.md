@@ -21,7 +21,7 @@
 
 - envelope 必须恰好包含上述十个字段；`v` 必须为整数 `1`。
 - `issued_at` 必须是 UTC、RFC 3339、秒级 `YYYY-MM-DDTHH:MM:SSZ`。
-- `payload` 是严格 JSON UTF-8 bytes 的无 padding base64url；拒绝 NaN、Infinity、非字符串 object key 和不可序列化值。
+- `payload` 是严格 JSON UTF-8 bytes 的无 padding base64url；拒绝 NaN、Infinity、重复 object key、非字符串 object key 和不可序列化值。
 - 签名输入是移除 `signature` 后的对象，以 UTF-8 JSON 编码：key 排序、无多余空白、`,`/`:` 分隔、Unicode 不转义。
 - 签名算法固定为 P-256 + SHA-256；签名编码为 ASN.1 DER，再做无 padding base64url。
 - 公钥固定为 P-256 SubjectPublicKeyInfo DER，再做无 padding base64url。
@@ -53,6 +53,6 @@ Registry 在一个 `BEGIN IMMEDIATE` 事务内消费 nonce、检查 namespace/ow
 
 ## Agent ID
 
-格式为 `agent://<host>/<one-or-more-segments>`。拒绝 userinfo、query、fragment、空段、百分号编码、反斜杠和非法端口。production 仅接受公共 DNS host，并要求 endpoint 为 HTTPS 且 host/port 与 Agent ID 完全相同。
+格式为 `agent://<host>/<one-or-more-segments>`。拒绝 userinfo、query、fragment、空段、歧义编码、反斜杠和 Agent ID 端口。production 仅接受公共 DNS host，并要求 endpoint 为 HTTPS 且 host 与 Agent ID 完全相同。local 仅接受 `agent://localhost/...` 和 loopback endpoint。
 
 Golden vector 见 [`protocol-v1-vectors.json`](protocol-v1-vectors.json)。任何不兼容变更必须使用新的 `v`，不能静默改变 v1。

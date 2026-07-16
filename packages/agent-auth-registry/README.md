@@ -3,7 +3,7 @@
 `verifiable-agent-auth-registry` 是 Agent Auth 的单节点身份目录：管理员分配 namespace，Agent 用 Vault key 签名发布，调用方按 Agent ID 解析当前公钥。
 
 ```bash
-pip install "verifiable-agent-auth-registry==1.0.0"
+pip install "verifiable-agent-auth-registry==1.1.0"
 export AGENT_REGISTRY_STRICT_IDENTITIES=0
 export AGENT_REGISTRY_URL=http://127.0.0.1:8008
 export AGENT_REGISTRY_DB_PATH=$PWD/registry.sqlite3

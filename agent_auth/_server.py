@@ -97,6 +97,8 @@ def _model_value(value: Any) -> Any:
 def _status(code: str) -> int:
     if code == "NONCE_REPLAYED":
         return 409
+    if code == "CAPABILITY_DENIED":
+        return 403
     if code in {"AGENT_NOT_FOUND", "REGISTRY_UNAVAILABLE"}:
         return 503
     if code in {"REQUEST_TOO_LARGE", "ENVELOPE_INVALID", "PAYLOAD_INVALID"}:

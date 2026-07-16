@@ -13,6 +13,8 @@ from agent_auth._identity import (
     parse_agent_id,
     resolve_public_host,
     validate_endpoint,
+    validate_local_identity,
+    validate_loopback_url,
     validate_service_url,
 )
 
@@ -63,6 +65,71 @@ token_file="token"
     assert settings.registry == "https://registry.example.com"
     assert settings.vault and settings.vault.verify == str(tmp_path / "ca.pem")
     assert settings.agents["a"].token_file == tmp_path / "token"
+
+
+def test_local_mode_requires_persistent_services_and_loopback(tmp_path) -> None:
+    path = tmp_path / "agent-auth.toml"
+    path.write_text(
+        """version=1
+mode="local"
+registry="http://127.0.0.1:8010"
+state="state.sqlite3"
+[vault]
+url="http://127.0.0.1:8200"
+[agents.a]
+id="agent://localhost/demo/a"
+endpoint="http://localhost:8101/invoke"
+key="demo-a"
+key_version=1
+token_file="token"
+[remotes]
+b="agent://localhost/demo/b"
+""",
+        encoding="utf-8",
+    )
+    settings = Settings.load(path)
+    assert settings.mode == "local"
+    assert settings.uses_vault is True
+    assert settings.strict is False
+    assert settings.state == tmp_path / "state.sqlite3"
+
+    validate_local_identity("agent://localhost/demo/a", "http://localhost:8101/invoke")
+    assert validate_loopback_url("http://[::1]:8200/") == "http://[::1]:8200"
+    with pytest.raises(AgentAuthError, match="INVALID_LOCAL_URL"):
+        validate_loopback_url("https://vault.example.com")
+
+
+@pytest.mark.parametrize(
+    "replacement,code",
+    [
+        ('registry="https://registry.example.com"', "INVALID_LOCAL_URL"),
+        ('id="agent://agents.example.com/demo/a"', "INVALID_LOCAL_IDENTITY"),
+        ('endpoint="http://example.com:8101/invoke"', "INVALID_ENDPOINT"),
+    ],
+)
+def test_local_mode_rejects_non_loopback(tmp_path, replacement: str, code: str) -> None:
+    content = """version=1
+mode="local"
+registry="http://127.0.0.1:8010"
+[vault]
+url="http://127.0.0.1:8200"
+[agents.a]
+id="agent://localhost/demo/a"
+endpoint="http://localhost:8101/invoke"
+key="demo-a"
+key_version=1
+token_file="token"
+"""
+    if replacement.startswith("registry"):
+        content = content.replace('registry="http://127.0.0.1:8010"', replacement)
+    elif replacement.startswith("id"):
+        content = content.replace('id="agent://localhost/demo/a"', replacement)
+    else:
+        content = content.replace('endpoint="http://localhost:8101/invoke"', replacement)
+    path = tmp_path / "invalid-local.toml"
+    path.write_text(content, encoding="utf-8")
+    with pytest.raises(AgentAuthError, match=code):
+        Settings.load(path)
 
 
 @pytest.mark.parametrize(

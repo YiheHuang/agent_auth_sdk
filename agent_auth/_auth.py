@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -72,7 +73,7 @@ class AgentAuth:
         await self._registry.start()
         try:
             for alias, identity in self._settings.agents.items():
-                if self._settings.mode == "dev":
+                if not self._settings.uses_vault:
                     signer: Signer = DevSigner(identity.agent_id)
                 else:
                     if self._settings.vault is None:  # pragma: no cover - config enforces this
@@ -86,7 +87,7 @@ class AgentAuth:
                     self._vault_signers.append(vault_signer)
                     signer = vault_signer
                 self._signers[alias] = signer
-                if self._settings.mode == "dev":
+                if not self._settings.uses_vault:
                     self._registry.add_dev_record(
                         AgentRecord(
                             agent_id=identity.agent_id,
@@ -163,6 +164,21 @@ class AgentAuth:
         Runner = _openai_runner()
         return Runner.run_streamed(starting_agent, input, **kwargs)
 
+    async def call(self, source: str, target: str, payload: Any) -> Any:
+        """Call an authenticated Agent endpoint without depending on an Agent framework."""
+
+        if source not in self._settings.agents:
+            raise AgentAuthError("IDENTITY_NOT_CONFIGURED", f"Unknown source identity alias: {source}")
+        if target in self._settings.agents:
+            target_id = self._settings.agents[target].agent_id
+        else:
+            try:
+                target_id = self._settings.remotes[target]
+            except KeyError as exc:
+                raise AgentAuthError("REMOTE_NOT_CONFIGURED", f"Unknown target identity alias: {target}") from exc
+        await self._start()
+        return await self._remote_call(source, target_id, _strict_json_value(payload))
+
     def remote_tool(
         self,
         alias: str,
@@ -185,49 +201,12 @@ class AgentAuth:
         async def invoke(context: Any, arguments: str) -> Any:
             await self._start()
             source_alias = self._alias_for(getattr(context, "agent", None))
-            source = self._settings.agents[source_alias]
             try:
                 payload = input_adapter.validate_json(arguments)
             except (TypeError, ValueError) as exc:
                 raise AgentAuthError("SCHEMA_INVALID", "Remote Agent input does not match the declared schema") from exc
             payload_value = _json_value(payload)
-            target = await self._registry.resolve(target_id)
-            if self._settings.strict:
-                from urllib.parse import urlsplit
-
-                resolve_public_host(urlsplit(target.endpoint).hostname or "")
-            request = await sign_envelope(
-                sender=source.agent_id,
-                audience=target_id,
-                call_type="agent.call",
-                payload=payload_value,
-                signer=self._signers[source_alias],
-            )
-            try:
-                response = await self._http.post(
-                    target.endpoint,
-                    json=request.as_dict(),
-                    headers={"Content-Type": "application/agent-auth+json", "X-Request-ID": request.id},
-                )
-                if response.status_code >= 400:
-                    raise _remote_error(response, request.id)
-                value = response.json()
-                if not isinstance(value, dict):
-                    raise ValueError
-                reply = SignedEnvelope.from_dict(value)
-            except AgentAuthError:
-                raise
-            except (httpx.HTTPError, ValueError) as exc:
-                raise AgentAuthError("REMOTE_CALL_FAILED", "Remote Agent call failed", request_id=request.id) from exc
-            record = await self._registry.resolve(target_id)
-            _, result_payload = verify_envelope(
-                reply,
-                record=record,
-                audience=source.agent_id,
-                nonce_state=self._nonce_state,
-                expected_type="agent.result",
-                expected_reply_to=request.id,
-            )
+            result_payload = await self._remote_call(source_alias, target_id, payload_value)
             try:
                 return output_adapter.validate_python(result_payload)
             except (TypeError, ValueError) as exc:
@@ -244,6 +223,51 @@ class AgentAuth:
         )
         self._auth_tool_ids.add(id(tool))
         return tool
+
+    async def _remote_call(self, source_alias: str, target_id: str, payload: Any) -> Any:
+        source = self._settings.agents[source_alias]
+        target = await self._registry.resolve(target_id)
+        endpoint = target.endpoint
+        headers = {"Content-Type": "application/agent-auth+json"}
+        extensions: dict[str, Any] | None = None
+        if self._settings.strict:
+            endpoint, host_header, sni_hostname = _pin_public_endpoint(endpoint)
+            headers["Host"] = host_header
+            extensions = {"sni_hostname": sni_hostname}
+        request = await sign_envelope(
+            sender=source.agent_id,
+            audience=target_id,
+            call_type="agent.call",
+            payload=payload,
+            signer=self._signers[source_alias],
+        )
+        try:
+            response = await self._http.post(
+                endpoint,
+                json=request.as_dict(),
+                headers={**headers, "X-Request-ID": request.id},
+                extensions=extensions,
+            )
+            if response.status_code >= 400:
+                raise _remote_error(response, request.id)
+            value = response.json()
+            if not isinstance(value, dict):
+                raise ValueError
+            reply = SignedEnvelope.from_dict(value)
+        except AgentAuthError:
+            raise
+        except (httpx.HTTPError, ValueError) as exc:
+            raise AgentAuthError("REMOTE_CALL_FAILED", "Remote Agent call failed", request_id=request.id) from exc
+        record = await self._registry.resolve(target_id)
+        _, result_payload = verify_envelope(
+            reply,
+            record=record,
+            audience=source.agent_id,
+            nonce_state=self._nonce_state,
+            expected_type="agent.result",
+            expected_reply_to=request.id,
+        )
+        return result_payload
 
     def endpoint(
         self,
@@ -447,6 +471,18 @@ def _json_value(value: Any) -> Any:
     return str(value)
 
 
+def _strict_json_value(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        value = value.model_dump(mode="json")
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        value = dataclasses.asdict(value)
+    try:
+        json.dumps(value, allow_nan=False, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise AgentAuthError("PAYLOAD_INVALID", "Agent call payload must be strict JSON data") from exc
+    return value
+
+
 def _remote_error(response: httpx.Response, request_id: str) -> AgentAuthError:
     try:
         value = response.json()
@@ -460,3 +496,14 @@ def _remote_error(response: httpx.Response, request_id: str) -> AgentAuthError:
     except ValueError:
         pass
     return AgentAuthError("REMOTE_REJECTED", "Remote Agent rejected the request", request_id=request_id)
+
+
+def _pin_public_endpoint(endpoint: str) -> tuple[str, str, str]:
+    """Resolve once and connect to that public IP while preserving Host and TLS SNI."""
+
+    parsed = urlsplit(endpoint)
+    hostname = parsed.hostname or ""
+    address = sorted(resolve_public_host(hostname))[0]
+    address_literal = f"[{address}]" if ":" in address else address
+    netloc = address_literal if parsed.port is None else f"{address_literal}:{parsed.port}"
+    return urlunsplit(parsed._replace(netloc=netloc)), parsed.netloc, hostname

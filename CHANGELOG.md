@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0 - 2026-07-16
+
+- 新增框架无关的 `AgentAuth.call()`，与 OpenAI `remote_tool()` 共用 SignedEnvelope 请求/响应路径。
+- 新增只允许 loopback 的 `local` 模式，使用真实 Vault Transit、Registry 和 SQLite nonce。
+- production 远程连接固定到已校验公网 IP 并保留 Host/TLS SNI；接收端拒绝非标准常量和重复 JSON key。
+- 补全配置、API、OpenAI Agents、安全、协议与 Registry 运维文档。
+- 新增三套可运行 WebApp 的契约与端到端验证。
+
 ## 1.0.0 - 2026-07-15
 
 首个最小核心正式版；不兼容 beta API、wire contract 或数据库：

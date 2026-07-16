@@ -1,12 +1,12 @@
 # Quick Start
 
-## 本地模式
+## dev：三分钟体验
 
 ```bash
 python -m venv .venv
 # Linux/macOS: source .venv/bin/activate
 # Windows: .venv\Scripts\activate
-pip install "verifiable-agent-auth-sdk[openai]==1.0.0"
+pip install "verifiable-agent-auth-sdk[openai]==1.1.0"
 agent-auth init
 agent-auth check
 ```
@@ -23,7 +23,41 @@ async with auth:
     result = await auth.run(coordinator, user_input)
 ```
 
-## 生产模式
+## local：本机真实 Registry + Vault
+
+`local` 使用真实 Vault Transit、中心 Registry 和 SQLite nonce，但强制所有服务位于 loopback。最小配置如下：
+
+```toml
+version = 1
+mode = "local"
+registry = "http://127.0.0.1:8010"
+state = ".agent-auth/state.sqlite3"
+client_id = "local-demo"
+
+[vault]
+url = "http://127.0.0.1:8200"
+mount = "transit"
+
+[agents.coordinator]
+id = "agent://localhost/demo/coordinator"
+endpoint = "http://localhost:8101/agents/coordinator/invoke"
+key = "demo-coordinator"
+key_version = 1
+token_file = ".agent-auth/coordinator.token"
+capabilities = ["coordinate"]
+
+[remotes]
+researcher = "agent://localhost/demo/researcher"
+```
+
+```bash
+agent-auth check
+agent-auth publish
+```
+
+local HTTP 只允许 loopback，不能作为 production TLS 替代。
+
+## production
 
 ### 1. Registry 管理员
 

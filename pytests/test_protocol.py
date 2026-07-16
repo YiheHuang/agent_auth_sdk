@@ -15,6 +15,7 @@ from agent_auth._protocol import (
     DevSigner,
     SignedEnvelope,
     b64url_decode,
+    b64url_encode,
     canonical_bytes,
     parse_timestamp,
     public_key_from_pem,
@@ -121,6 +122,28 @@ def test_strict_json_rejects_unsupported_values() -> None:
         strict_json_bytes({1: "bad"})
     with pytest.raises(AgentAuthError, match="PAYLOAD_INVALID"):
         strict_json_bytes(object())
+
+
+@pytest.mark.parametrize("raw_payload", [b'{"value":NaN}', b'{"value":1,"value":2}'])
+def test_verify_rejects_non_strict_json_from_other_implementations(raw_payload: bytes) -> None:
+    signer = DevSigner("agent://127.0.0.1/a")
+    pending = SignedEnvelope(
+        v=1,
+        id=f"strict-{len(raw_payload)}",
+        sender="agent://127.0.0.1/a",
+        audience="agent://127.0.0.1/b",
+        kid=signer.kid,
+        issued_at=datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        type="agent.call",
+        reply_to=None,
+        payload=b64url_encode(raw_payload),
+        signature="pending",
+    )
+    signature = asyncio.run(signer.sign(canonical_bytes(pending.unsigned_dict())))
+    envelope = SignedEnvelope(**{**pending.unsigned_dict(), "signature": b64url_encode(signature)})  # type: ignore[arg-type]
+    record = AgentRecord(envelope.sender, "http://127.0.0.1/a", (), signer.kid, signer.public_key, "now")
+    with pytest.raises(AgentAuthError, match="PAYLOAD_INVALID"):
+        verify_envelope(envelope, record=record, audience=envelope.audience, nonce_state=MemoryNonceState())
 
 
 def test_envelope_requires_exact_fields() -> None:

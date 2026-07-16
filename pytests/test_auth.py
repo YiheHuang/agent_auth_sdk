@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 from agent_auth import AgentAuth, AgentAuthError, AuthContext
+from agent_auth._auth import _pin_public_endpoint
 from agent_auth._protocol import SignedEnvelope, sign_envelope, verify_envelope
 
 
@@ -200,6 +201,8 @@ def test_fastapi_endpoint_and_remote_tool_roundtrip(dev_config) -> None:
         await auth._start()
         await auth._http.aclose()
         auth._http = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://local")
+        direct = await auth.call("coordinator", "researcher", {"text": "direct"})
+        assert direct == {"answer": "DIRECT"}
         tool = auth.remote_tool("researcher", input_type=RequestModel, output_type=ResponseModel)
         context = SimpleNamespace(agent=coordinator)
         result = await tool.on_invoke_tool(context, '{"text":"hello"}')
@@ -234,6 +237,20 @@ def test_fastapi_endpoint_and_remote_tool_roundtrip(dev_config) -> None:
     asyncio.run(scenario())
 
 
+def test_call_rejects_unknown_source_and_target(dev_config) -> None:
+    async def scenario() -> None:
+        auth = AgentAuth(dev_config)
+        with pytest.raises(AgentAuthError, match="IDENTITY_NOT_CONFIGURED"):
+            await auth.call("missing", "researcher", {})
+        with pytest.raises(AgentAuthError, match="REMOTE_NOT_CONFIGURED"):
+            await auth.call("coordinator", "missing", {})
+        with pytest.raises(AgentAuthError, match="PAYLOAD_INVALID"):
+            await auth.call("coordinator", "researcher", {"value": float("nan")})
+        await auth.close()
+
+    asyncio.run(scenario())
+
+
 def test_endpoint_rejects_invalid_schema_and_envelope(dev_config) -> None:
     async def scenario() -> None:
         auth = AgentAuth(dev_config)
@@ -253,6 +270,33 @@ def test_endpoint_rejects_invalid_schema_and_envelope(dev_config) -> None:
     asyncio.run(scenario())
 
 
+def test_endpoint_maps_business_authorization_to_stable_403(dev_config) -> None:
+    async def scenario() -> None:
+        auth = AgentAuth(dev_config)
+        app = FastAPI()
+
+        @auth.endpoint("/invoke", identity="researcher", request=RequestModel, response=ResponseModel)
+        async def invoke(_context: AuthContext, _request: RequestModel) -> ResponseModel:
+            raise AgentAuthError("CAPABILITY_DENIED", "Caller is not authorized")
+
+        app.include_router(auth.router)
+        await auth._start()
+        request = await sign_envelope(
+            sender=auth._settings.agents["coordinator"].agent_id,
+            audience=auth._settings.agents["researcher"].agent_id,
+            call_type="agent.call",
+            payload={"text": "denied"},
+            signer=auth._signers["coordinator"],
+        )
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://local") as client:
+            response = await client.post("/invoke", json=request.as_dict())
+        assert response.status_code == 403
+        assert response.json()["error"]["code"] == "CAPABILITY_DENIED"
+        await auth.close()
+
+    asyncio.run(scenario())
+
+
 def test_auth_context_is_minimal() -> None:
     assert [field.name for field in dataclasses.fields(AuthContext)] == [
         "sender",
@@ -261,3 +305,11 @@ def test_auth_context_is_minimal() -> None:
         "request_id",
         "call_type",
     ]
+
+
+def test_production_endpoint_is_pinned_without_losing_host_or_sni(monkeypatch) -> None:
+    monkeypatch.setattr("agent_auth._auth.resolve_public_host", lambda _host: {"203.0.113.20", "203.0.113.10"})
+    url, host, sni = _pin_public_endpoint("https://agents.example.com:8443/invoke")
+    assert url == "https://203.0.113.10:8443/invoke"
+    assert host == "agents.example.com:8443"
+    assert sni == "agents.example.com"

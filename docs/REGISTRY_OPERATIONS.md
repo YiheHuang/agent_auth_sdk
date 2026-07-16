@@ -1,6 +1,6 @@
 # Registry 部署与运维
 
-适用于 `verifiable-agent-auth-registry==1.0.0`。Registry 只支持单节点、单 worker、本地 SQLite；不要使用 Gunicorn 多 worker、共享文件系统或直接暴露 Uvicorn。
+适用于 `verifiable-agent-auth-registry==1.1.0`。Registry 只支持单节点、单 worker、本地 SQLite；不要使用 Gunicorn 多 worker、共享文件系统或直接暴露 Uvicorn。
 
 ## 配置
 
@@ -16,7 +16,7 @@
 ## 本地开发
 
 ```bash
-pip install "verifiable-agent-auth-registry==1.0.0"
+pip install "verifiable-agent-auth-registry==1.1.0"
 export AGENT_REGISTRY_STRICT_IDENTITIES=0
 export AGENT_REGISTRY_URL=http://127.0.0.1:8008
 export AGENT_REGISTRY_DB_PATH=$PWD/registry.sqlite3
@@ -34,7 +34,7 @@ sudo useradd --system --home-dir /var/lib/agent-auth --shell /usr/sbin/nologin a
 sudo install -d -o agent-auth -g agent-auth -m 0700 /var/lib/agent-auth
 sudo install -d -o root -g root -m 0755 /opt/agent-auth /etc/agent-auth
 sudo python3 -m venv /opt/agent-auth/venv
-sudo /opt/agent-auth/venv/bin/pip install "verifiable-agent-auth-registry==1.0.0"
+sudo /opt/agent-auth/venv/bin/pip install "verifiable-agent-auth-registry==1.1.0"
 ```
 
 将 [`deploy/registry.env.example`](../deploy/registry.env.example) 安装为 `/etc/agent-auth/registry.env`，填入公开 HTTPS URL 后设为 `0600`。将 [`deploy/registry.service`](../deploy/registry.service) 安装到 `/etc/systemd/system/agent-auth-registry.service`：

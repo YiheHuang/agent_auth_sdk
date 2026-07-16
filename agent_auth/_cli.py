@@ -90,7 +90,7 @@ capabilities = []
 async def _check(path: Path | None) -> int:
     settings = Settings.load(path)
     checks: dict[str, object] = {"mode": settings.mode, "identities": list(settings.agents)}
-    if settings.mode == "production":
+    if settings.uses_vault:
         if settings.vault is None:  # pragma: no cover - config already enforces
             raise AgentAuthError("VAULT_CONFIG_INVALID", "Vault is required")
         for alias, identity in settings.agents.items():
@@ -100,7 +100,7 @@ async def _check(path: Path | None) -> int:
                 checks[f"vault:{alias}"] = {"kid": signer.kid, "ok": True}
             finally:
                 await signer.close()
-        registry = Registry(settings.registry, strict=True, client_id=settings.client_id)
+        registry = Registry(settings.registry, strict=settings.strict, client_id=settings.client_id)
         await registry.start()
         try:
             await registry.health()
@@ -145,7 +145,7 @@ async def _rotate(auth: AgentAuth, alias: str) -> dict[str, object]:
     identity = _identity(auth, alias)
     current = auth._signers[alias]
     if not isinstance(current, VaultSigner) or auth._settings.vault is None:
-        raise AgentAuthError("ROTATE_REQUIRES_VAULT", "Key rotation is only available in production Vault mode")
+        raise AgentAuthError("ROTATE_REQUIRES_VAULT", "Key rotation requires local or production Vault mode")
     latest = await current.latest_version()
     configured = identity.key_version or 0
     new_version = latest if latest > configured else await current.rotate()

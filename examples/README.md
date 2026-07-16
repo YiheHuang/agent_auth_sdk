@@ -1,14 +1,15 @@
 # Examples
 
-- `openai_local.py`：无需 Vault、Registry 或 API key，实际运行 direct、FunctionTool、Agent-as-tool 和 handoff。
-- `vault_registry.py`：读取生产 `agent-auth.toml`，检查 Vault/Registry 后发布身份。
-- `remote_server.py` / `remote_client.py`：签名请求、验签 endpoint、签名响应和 remote tool。
-
-运行：
+| 文件 | 展示内容 | 外部服务 |
+|---|---|---|
+| `openai_local.py` | direct、FunctionTool、Agent-as-tool、handoff | 无；确定性 Model |
+| `vault_registry.py` | Vault/Registry 检查与发布 | 按 production 配置 |
+| `remote_server.py` | `AgentAuth.endpoint()` | 按配置 |
+| `remote_client.py` | `remote_tool()` | 按配置 |
 
 ```bash
 pip install -e ".[server]"
 python examples/openai_local.py
 ```
 
-远程示例需要先准备生产配置并分别为调用方和接收方进程提供自己的配置文件。
+框架无关调用使用 `await auth.call("source", "target", payload)`。完整配置见 `QUICKSTART.md` 与 `docs/CONFIGURATION.md`。示例不包含 token、API key 或私钥。

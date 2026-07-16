@@ -203,7 +203,11 @@ def verify_envelope(
     if nonce_state is not None and not nonce_state.consume(envelope.sender, envelope.id, expires):
         raise AgentAuthError("NONCE_REPLAYED", "Envelope has already been consumed", request_id=envelope.id)
     try:
-        payload = json.loads(b64url_decode(envelope.payload))
+        payload = json.loads(
+            b64url_decode(envelope.payload),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_json_object,
+        )
     except (AgentAuthError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise AgentAuthError("PAYLOAD_INVALID", "Envelope payload is not valid JSON", request_id=envelope.id) from exc
     return (
@@ -275,3 +279,16 @@ def _reject_non_finite(value: Any) -> None:
     elif isinstance(value, (list, tuple)):
         for item in value:
             _reject_non_finite(item)
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Unsupported JSON constant: {value}")
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("Duplicate JSON object key")
+        value[key] = item
+    return value

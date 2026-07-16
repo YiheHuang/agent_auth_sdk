@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "verifiable-agent-auth-registry"
-version = "1.0.0"
+version = "1.1.0"
 description = "Hardened single-node registry service for Agent Auth identities"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,7 +24,7 @@ classifiers = [
   "Topic :: Security :: Cryptography",
 ]
 dependencies = [
-  "verifiable-agent-auth-sdk==1.0.0",
+  "verifiable-agent-auth-sdk==1.1.0",
   "fastapi>=0.115.0",
   "uvicorn>=0.30.0",
 ]
@@ -52,4 +52,4 @@ packages = ["src/agent_auth_registry"]
 
 [tool.hatch.build.targets.sdist]
 include = ["/src/agent_auth_registry", "/README.md", "/LICENSE", "/pyproject.toml"]
-exclude = ["/.gitignore", ".gitignore", "/.pkg-audit", "/dist"]
+exclude = ["/.gitignore", ".gitignore", "**/.gitignore", "/.pkg-audit", "/dist"]

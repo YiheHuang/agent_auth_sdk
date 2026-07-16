@@ -4,7 +4,8 @@
 
 | Version | Security fixes |
 |---|---|
-| `1.0.x` | Yes |
+| `1.1.x` | Yes |
+| `1.0.x` | Critical fixes until 2027-01-31 |
 | `0.2.x` beta | Until 2026-10-31 |
 | Earlier snapshots | No |
 
@@ -23,5 +24,6 @@ public issue before coordinated disclosure.
 - Verifiers only use the configured Registry and fail closed.
 - Production receivers use a persistent local SQLite nonce database on a local filesystem.
 - Each production process loads only the Vault tokens required by its own trust boundary.
+- `local` mode is restricted to loopback and is not a substitute for production TLS.
 
 See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for trust boundaries and residual risks.

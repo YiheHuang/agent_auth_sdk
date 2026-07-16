@@ -11,4 +11,4 @@ __all__ = ["AgentAuth", "AuthContext", "AgentAuthError", "__version__"]
 try:
     __version__ = version("verifiable-agent-auth-sdk")
 except PackageNotFoundError:  # pragma: no cover - source checkout
-    __version__ = "1.0.0"
+    __version__ = "1.1.0"

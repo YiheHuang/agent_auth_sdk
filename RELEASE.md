@@ -31,7 +31,7 @@ python -m twine check --strict dist/* packages/agent-auth-registry/dist/*
 - 基础 SDK 直接依赖恰好两个；公开类型不超过三个；SDK CLI 和 Registry 路由各五个。
 - 在干净虚拟环境安装两个 wheel，执行两个 CLI smoke test和离线 OpenAI 示例。
 - 检查 sdist/wheel 不含运行数据库、token、内部笔记或缓存。
-- TestPyPI 安装并完成真实 Vault + HTTPS Registry + OpenAI WebApp 验证。
+- 使用本地 wheel 完成真实 Vault + Registry + OpenAI WebApp 验证；发布后从正式 PyPI 干净安装复验。
 - 确认工作树干净、tag 与版本一致后，使用 PyPI Trusted Publishing 发布。
 
-`1.0.0` 不迁移 beta Registry 数据；创建新数据库、developer/namespace 并重新发布 Agent。
+`1.1.0` 与 `1.0.0` Registry schema/wire protocol 兼容；新增 local mode 和 `AgentAuth.call()` 不要求迁移数据。

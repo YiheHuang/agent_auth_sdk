@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${AGENT_AUTH_VERSION:-1.0.0}"
+VERSION="${AGENT_AUTH_VERSION:-1.1.0}"
 INSTALL_MODE="${AGENT_AUTH_INSTALL_MODE:-pypi}"
 PUBLIC_URL="${AGENT_REGISTRY_URL:-}"
 ROOT="/opt/agent-auth"

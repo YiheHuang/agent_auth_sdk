@@ -15,8 +15,8 @@ def test_distribution_and_public_surface_are_minimal() -> None:
     registry = tomllib.loads((ROOT / "packages/agent-auth-registry/pyproject.toml").read_text(encoding="utf-8"))[
         "project"
     ]
-    assert registry["version"] == project["version"] == "1.0.0"
-    assert registry["dependencies"][0] == "verifiable-agent-auth-sdk==1.0.0"
+    assert registry["version"] == project["version"] == "1.1.0"
+    assert registry["dependencies"][0] == "verifiable-agent-auth-sdk==1.1.0"
 
 
 def test_no_legacy_python_namespace_or_public_symbols() -> None:
@@ -36,6 +36,7 @@ def test_no_legacy_python_namespace_or_public_symbols() -> None:
     public_agent_auth = {name for name in dir(agent_auth.AgentAuth) if not name.startswith("_")}
     assert public_agent_auth == {
         "bind",
+        "call",
         "close",
         "endpoint",
         "remote_tool",
@@ -50,6 +51,7 @@ def test_documentation_links_and_examples_exist() -> None:
     required = [
         ROOT / "README.md",
         ROOT / "QUICKSTART.md",
+        ROOT / "docs/CONFIGURATION.md",
         ROOT / "docs/API_REFERENCE.md",
         ROOT / "docs/OPENAI_AGENTS.md",
         ROOT / "docs/PROTOCOL_V1.md",
@@ -61,13 +63,61 @@ def test_documentation_links_and_examples_exist() -> None:
         ROOT / "examples/remote_client.py",
     ]
     assert all(path.is_file() for path in required)
-    for document in required[:7]:
+    for document in required[:8]:
         text = document.read_text(encoding="utf-8")
         assert "agent_auth_sdk." not in text
         assert "from agent_auth_sdk" not in text
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     links = re.findall(r"\[[^]]+\]\((https://github\.com/YiheHuang/agent_auth_sdk/[^)]+)\)", readme)
     assert len(links) >= 6
+
+    api = (ROOT / "docs/API_REFERENCE.md").read_text(encoding="utf-8")
+    for name in {
+        "bind",
+        "call",
+        "close",
+        "endpoint",
+        "remote_tool",
+        "router",
+        "run",
+        "run_streamed",
+        "run_sync",
+    }:
+        assert name in api
+    configuration = (ROOT / "docs/CONFIGURATION.md").read_text(encoding="utf-8")
+    for command in {"init", "check", "publish", "rotate", "revoke"}:
+        assert f" {command}" in configuration
+    for mode in {"dev", "local", "production"}:
+        assert mode in configuration
+    for field in {
+        "version",
+        "mode",
+        "registry",
+        "state",
+        "client_id",
+        "url",
+        "mount",
+        "verify",
+        "namespace",
+        "id",
+        "endpoint",
+        "key",
+        "key_version",
+        "token_file",
+        "capabilities",
+        "remotes",
+    }:
+        assert f"`{field}`" in configuration or f"[{field}]" in configuration
+
+
+def test_relative_documentation_links_resolve() -> None:
+    documents = [ROOT / "README.md", ROOT / "QUICKSTART.md", *sorted((ROOT / "docs").glob("*.md"))]
+    for document in documents:
+        for target in re.findall(r"\[[^]]*\]\(([^)]+)\)", document.read_text(encoding="utf-8")):
+            target = target.strip("<>").split("#", 1)[0]
+            if not target or "://" in target or target.startswith("mailto:"):
+                continue
+            assert (document.parent / target).resolve().exists(), f"Broken link in {document}: {target}"
 
 
 def test_examples_do_not_embed_secrets_and_import_only_public_root() -> None:

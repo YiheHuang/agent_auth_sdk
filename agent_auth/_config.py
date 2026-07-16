@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ._errors import AgentAuthError
-from ._identity import parse_agent_id, validate_endpoint, validate_service_url
+from ._identity import (
+    parse_agent_id,
+    validate_endpoint,
+    validate_local_identity,
+    validate_loopback_url,
+    validate_service_url,
+)
 
 _ENV = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
@@ -37,7 +43,7 @@ class IdentitySettings:
 @dataclass(slots=True, frozen=True)
 class Settings:
     path: Path
-    mode: Literal["dev", "production"]
+    mode: Literal["dev", "local", "production"]
     registry: str | None
     state: Path
     client_id: str | None
@@ -48,6 +54,10 @@ class Settings:
     @property
     def strict(self) -> bool:
         return self.mode == "production"
+
+    @property
+    def uses_vault(self) -> bool:
+        return self.mode in {"local", "production"}
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> Settings:
@@ -62,13 +72,17 @@ class Settings:
         if raw.get("version") != 1:
             raise AgentAuthError("CONFIG_INVALID", "Configuration version must be 1")
         mode = str(raw.get("mode", "production"))
-        if mode not in {"dev", "production"}:
-            raise AgentAuthError("CONFIG_INVALID", "mode must be dev or production")
+        if mode not in {"dev", "local", "production"}:
+            raise AgentAuthError("CONFIG_INVALID", "mode must be dev, local or production")
         strict = mode == "production"
         registry_value = raw.get("registry")
-        registry = validate_service_url(str(registry_value), strict=strict) if registry_value else None
-        if strict and not registry:
-            raise AgentAuthError("CONFIG_INVALID", "production mode requires registry")
+        registry: str | None
+        if registry_value and mode == "local":
+            registry = validate_loopback_url(str(registry_value))
+        else:
+            registry = validate_service_url(str(registry_value), strict=strict) if registry_value else None
+        if mode in {"local", "production"} and not registry:
+            raise AgentAuthError("CONFIG_INVALID", f"{mode} mode requires registry")
         state_value = Path(str(raw.get("state", ".agent-auth/state.sqlite3")))
         state = state_value if state_value.is_absolute() else config_path.parent / state_value
         vault_raw = raw.get("vault")
@@ -78,14 +92,19 @@ class Settings:
             if isinstance(verify, str):
                 verify_path = Path(verify)
                 verify = str(verify_path if verify_path.is_absolute() else config_path.parent / verify_path)
+            vault_url = str(vault_raw.get("url", ""))
             vault = VaultSettings(
-                url=validate_service_url(str(vault_raw.get("url", "")), strict=strict),
+                url=(
+                    validate_loopback_url(vault_url)
+                    if mode == "local"
+                    else validate_service_url(vault_url, strict=strict)
+                ),
                 mount=str(vault_raw.get("mount", "transit")).strip("/"),
                 verify=verify,
                 namespace=str(vault_raw["namespace"]) if vault_raw.get("namespace") else None,
             )
-        if strict and vault is None:
-            raise AgentAuthError("CONFIG_INVALID", "production mode requires [vault]")
+        if mode in {"local", "production"} and vault is None:
+            raise AgentAuthError("CONFIG_INVALID", f"{mode} mode requires [vault]")
         agents_raw = raw.get("agents")
         if not isinstance(agents_raw, dict) or not agents_raw:
             raise AgentAuthError("CONFIG_INVALID", "At least one [agents.<alias>] entry is required")
@@ -96,7 +115,10 @@ class Settings:
             agent_id = str(item.get("id", ""))
             endpoint = str(item.get("endpoint", ""))
             parse_agent_id(agent_id, strict=strict)
-            validate_endpoint(agent_id, endpoint, strict=strict)
+            if mode == "local":
+                validate_local_identity(agent_id, endpoint)
+            else:
+                validate_endpoint(agent_id, endpoint, strict=strict)
             version = int(item["key_version"]) if item.get("key_version") is not None else None
             key = str(item["key"]) if item.get("key") else None
             token_file = Path(str(item["token_file"])) if item.get("token_file") else None
@@ -105,8 +127,10 @@ class Settings:
             capabilities = item.get("capabilities", [])
             if not isinstance(capabilities, list) or not all(isinstance(value, str) for value in capabilities):
                 raise AgentAuthError("CONFIG_INVALID", f"agents.{alias}.capabilities must be a string list")
-            if strict and (not key or not version or version <= 0):
-                raise AgentAuthError("CONFIG_INVALID", f"agents.{alias} requires key and positive key_version")
+            if mode in {"local", "production"} and (not key or not version or version <= 0):
+                raise AgentAuthError(
+                    "CONFIG_INVALID", f"agents.{alias} requires key and positive key_version in {mode} mode"
+                )
             agents[str(alias)] = IdentitySettings(
                 alias=str(alias),
                 agent_id=agent_id,
@@ -121,8 +145,11 @@ class Settings:
             raise AgentAuthError("CONFIG_INVALID", "remotes must be a table")
         remotes: dict[str, str] = {}
         for alias, agent_id in remotes_raw.items():
-            parse_agent_id(str(agent_id), strict=strict)
-            remotes[str(alias)] = str(agent_id)
+            remote_id = str(agent_id)
+            parse_agent_id(remote_id, strict=strict)
+            if mode == "local" and not remote_id.startswith("agent://localhost/"):
+                raise AgentAuthError("INVALID_LOCAL_IDENTITY", "local mode remotes must use agent://localhost/...")
+            remotes[str(alias)] = remote_id
         return cls(
             path=config_path,
             mode=mode,  # type: ignore[arg-type]
